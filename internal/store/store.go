@@ -37,6 +37,12 @@ var ErrUnsafeRole = errors.New("store: unsafe database role")
 // ErrNotBootstrapped reports a database where the one-time bootstrap script has not been run.
 var ErrNotBootstrapped = errors.New(`store: database is not bootstrapped, run "sluiceway migrate bootstrap" and apply its output as an administrator`)
 
+// ErrSchemaNotOwned reports a schema of the right name that the login role does not own, so it is
+// not the one the bootstrap script creates. It is a sentinel of its own because neither of the
+// others tells the operator the truth: tenant isolation is not at stake, and applying the
+// bootstrap script again does not change who owns a schema that already exists.
+var ErrSchemaNotOwned = errors.New(`store: schema "sluiceway" is not owned by the login role`)
+
 // DB is the connection pool.
 type DB struct {
 	pool *pgxpool.Pool
@@ -72,7 +78,8 @@ func (db *DB) Ping(ctx context.Context) error { return db.pool.Ping(ctx) }
 
 // preflight fails closed on anything that would make tenant isolation silently not apply. Tests
 // that only ever connect as a superuser pass without isolation being real, so this runs on every
-// start, in every environment.
+// start, in every environment. It runs once per process: a membership changed by an administrator
+// afterwards is not seen until the next start.
 func (db *DB) preflight(ctx context.Context) error {
 	var version int
 	if err := db.pool.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
@@ -83,37 +90,112 @@ func (db *DB) preflight(ctx context.Context) error {
 	}
 
 	var (
-		user                     string
-		super, bypass, hasSchema bool
-		unsafeHelpers, memberOf  int
+		user                                string
+		super, bypass, hasSchema, ownSchema bool
 	)
 	err := db.pool.QueryRow(ctx, `
 		SELECT r.rolname, r.rolsuper, r.rolbypassrls,
 		       EXISTS (SELECT FROM pg_namespace WHERE nspname = $1),
-		       (SELECT count(*) FROM pg_roles h
-		         WHERE h.rolname = ANY($2) AND (h.rolsuper OR h.rolbypassrls)),
-		       (SELECT count(*) FROM pg_auth_members m JOIN pg_roles h ON h.oid = m.roleid
-		         WHERE m.member = r.oid AND h.rolname = ANY($2)
-		           AND m.set_option AND NOT m.inherit_option)
+		       EXISTS (SELECT FROM pg_namespace WHERE nspname = $1 AND nspowner = r.oid)
 		  FROM pg_roles r
-		 WHERE r.rolname = current_user`,
-		Schema, []string{string(RoleResolver), string(RoleWorker)},
-	).Scan(&user, &super, &bypass, &hasSchema, &unsafeHelpers, &memberOf)
+		 WHERE r.rolname = current_user`, Schema,
+	).Scan(&user, &super, &bypass, &hasSchema, &ownSchema)
 	if err != nil {
 		return fmt.Errorf("store: preflight: %w", err)
 	}
-
-	switch {
-	case super || bypass:
+	if super || bypass {
 		return fmt.Errorf("%w: %q is SUPERUSER or BYPASSRLS, so row-level security would not apply to it", ErrUnsafeRole, user)
-	case unsafeHelpers > 0:
-		return fmt.Errorf("%w: a helper role is SUPERUSER or BYPASSRLS", ErrUnsafeRole)
-	case !hasSchema:
+	}
+
+	helpers, err := db.helperStates(ctx)
+	if err != nil {
+		return err
+	}
+	for _, h := range helpers {
+		if h.exists && h.unsafe {
+			return fmt.Errorf("%w: helper role %s is SUPERUSER or BYPASSRLS", ErrUnsafeRole, h.name)
+		}
+	}
+	if !hasSchema {
 		return ErrNotBootstrapped
-	case memberOf != 2:
-		return fmt.Errorf("%w: %q must be a member of %s and %s WITH INHERIT FALSE, SET TRUE", ErrUnsafeRole, user, RoleResolver, RoleWorker)
+	}
+	// Ownership itself, not membership in the owner: the bootstrap creates the schema for exactly
+	// this role, and migrations create and alter everything in it as this role.
+	if !ownSchema {
+		return fmt.Errorf("%w %q: it was not created by the bootstrap script; an administrator can hand it over with ALTER SCHEMA %s OWNER TO %s, or use another database",
+			ErrSchemaNotOwned, user, Schema, user)
+	}
+	for _, h := range helpers {
+		switch {
+		case !h.exists:
+			return fmt.Errorf("%w: helper role %s does not exist, apply the bootstrap script again", ErrUnsafeRole, h.name)
+		case h.inherited:
+			return fmt.Errorf("%w: %q inherits %s, directly or through another role, so its cross-tenant policies would apply without SET ROLE; every membership on the path must be WITH INHERIT FALSE",
+				ErrUnsafeRole, user, h.name)
+		case h.administers:
+			return fmt.Errorf("%w: %q holds ADMIN OPTION on %s, directly or through another role, so it could grant itself that role WITH INHERIT TRUE while running; revoke the ADMIN OPTION",
+				ErrUnsafeRole, user, h.name)
+		case !h.canSet:
+			return fmt.Errorf("%w: %q cannot SET ROLE %s, it must be a member WITH INHERIT FALSE, SET TRUE", ErrUnsafeRole, user, h.name)
+		}
 	}
 	return nil
+}
+
+// helperState is what the preflight learns about one helper role.
+type helperState struct {
+	name string
+	// exists is false when the role is missing, and then the other fields are all false.
+	exists bool
+	// unsafe: the role is SUPERUSER or BYPASSRLS.
+	unsafe bool
+	// inherited: the login holds the role's privileges, and is subject to its policies, WITHOUT
+	// SET ROLE. A plain transaction with no tenant bound would then see across tenants.
+	inherited bool
+	// administers: the login may grant the role, to itself included. That is the one membership
+	// state it could turn into inheritance by itself, after this check has run.
+	administers bool
+	// canSet: the login may SET ROLE to it, which RoleTx depends on.
+	canSet bool
+}
+
+// helperStates asks Postgres the question Postgres itself answers when it evaluates a policy or
+// a privilege, instead of reading pg_auth_members. A membership has one row per grantor, and
+// inheritance also arrives through intermediate roles, so no count of rows that look right says
+// what the login can actually do. pg_has_role follows every path: 'USAGE' is "without SET ROLE",
+// 'SET' is "may SET ROLE", and 'MEMBER WITH ADMIN OPTION' is "may grant this role". Postgres
+// answers the last one identically for 'USAGE WITH ADMIN OPTION' and 'SET WITH ADMIN OPTION':
+// all three ask is_admin_of_role, which follows every membership whether or not it is inherited.
+// That is the right reach, because ADMIN OPTION held by a role the login can only SET ROLE to is
+// just as usable. All of these are only meaningful for a login that is not a superuser, which the
+// caller has already established.
+func (db *DB) helperStates(ctx context.Context) ([]helperState, error) {
+	want := []string{string(RoleResolver), string(RoleWorker)}
+	rows, err := db.pool.Query(ctx, `
+		SELECT n.name, h.oid IS NOT NULL,
+		       coalesce(h.rolsuper OR h.rolbypassrls, false),
+		       coalesce(pg_has_role(h.oid, 'USAGE'), false),
+		       coalesce(pg_has_role(h.oid, 'MEMBER WITH ADMIN OPTION'), false),
+		       coalesce(pg_has_role(h.oid, 'SET'), false)
+		  FROM unnest($1::text[]) WITH ORDINALITY AS n(name, ord)
+		  LEFT JOIN pg_roles h ON h.rolname = n.name
+		 ORDER BY n.ord`, want)
+	if err != nil {
+		return nil, fmt.Errorf("store: preflight: %w", err)
+	}
+	states, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (helperState, error) {
+		var h helperState
+		err := row.Scan(&h.name, &h.exists, &h.unsafe, &h.inherited, &h.administers, &h.canSet)
+		return h, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: preflight: %w", err)
+	}
+	// Fail closed: an answer that came back short has verified nothing.
+	if len(states) != len(want) {
+		return nil, fmt.Errorf("%w: preflight saw %d helper roles, want %d", ErrUnsafeRole, len(states), len(want))
+	}
+	return states, nil
 }
 
 // Tx runs fn in a transaction with no tenant bound. Every tenant-scoped table reads as empty and
