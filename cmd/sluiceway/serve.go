@@ -48,6 +48,8 @@ func serveOn(ctx context.Context, ln net.Listener, logger *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
+		// The grace ran out with connections still open. Drop them so nothing outlives serveOn.
+		_ = srv.Close()
 		return err
 	}
 	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {

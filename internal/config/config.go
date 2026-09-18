@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"strings"
 )
@@ -33,8 +34,34 @@ type Config struct {
 	LogFormat   string // "json" or "text"
 }
 
+const redacted = "[redacted]"
+
+// LogValue keeps the database URL, which carries a password, out of structured logs.
+func (c Config) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("env", string(c.Env)),
+		slog.String("database_url", redacted),
+		slog.String("listen_addr", c.ListenAddr),
+		slog.String("log_level", c.LogLevel.String()),
+		slog.String("log_format", c.LogFormat),
+	)
+}
+
+// String covers %v, %+v and %s, so printing a Config cannot leak the database URL either.
+func (c Config) String() string {
+	return fmt.Sprintf("{Env:%s DatabaseURL:%s ListenAddr:%s LogLevel:%s LogFormat:%s}",
+		c.Env, redacted, c.ListenAddr, c.LogLevel, c.LogFormat)
+}
+
+// GoString covers %#v.
+func (c Config) GoString() string { return "config.Config" + c.String() }
+
 // Load builds a Config from getenv (os.Getenv in production, a map lookup in tests). It reports
 // every problem at once so a misconfigured deploy is fixed in one pass.
+//
+// No error echoes a received value, for any variable. Load cannot know which variable a secret was
+// pasted into: a manifest with two entries swapped puts the database URL, password included, into
+// SLUICEWAY_ENV, and the refusal is printed to the container log.
 func Load(getenv func(string) string) (Config, error) {
 	var errs []error
 
@@ -50,7 +77,7 @@ func Load(getenv func(string) string) (Config, error) {
 		cfg.Env = Development
 	default:
 		// An unrecognized value stays production. A typo must never relax anything.
-		errs = append(errs, fmt.Errorf("SLUICEWAY_ENV: %q is not %q or %q", v, Production, Development))
+		errs = append(errs, fmt.Errorf("SLUICEWAY_ENV: must be %q or %q", Production, Development))
 	}
 
 	cfg.DatabaseURL = getenv("SLUICEWAY_DATABASE_URL")
@@ -66,12 +93,18 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 
 	if v := getenv("SLUICEWAY_LISTEN_ADDR"); v != "" {
-		cfg.ListenAddr = v
+		// Checked here because the listener's own error quotes the address it was given.
+		if _, _, err := net.SplitHostPort(v); err != nil {
+			errs = append(errs, errors.New("SLUICEWAY_LISTEN_ADDR: must be host:port or :port"))
+		} else {
+			cfg.ListenAddr = v
+		}
 	}
 
 	if v := getenv("SLUICEWAY_LOG_LEVEL"); v != "" {
+		// slog's parse error quotes its input, so it is deliberately not wrapped.
 		if err := cfg.LogLevel.UnmarshalText([]byte(v)); err != nil {
-			errs = append(errs, fmt.Errorf("SLUICEWAY_LOG_LEVEL: %w", err))
+			errs = append(errs, errors.New("SLUICEWAY_LOG_LEVEL: must be debug, info, warn or error"))
 		}
 	}
 
@@ -81,7 +114,7 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if v := strings.ToLower(getenv("SLUICEWAY_LOG_FORMAT")); v != "" {
 		if v != "json" && v != "text" {
-			errs = append(errs, fmt.Errorf("SLUICEWAY_LOG_FORMAT: %q is not \"json\" or \"text\"", v))
+			errs = append(errs, errors.New(`SLUICEWAY_LOG_FORMAT: must be "json" or "text"`))
 		} else {
 			cfg.LogFormat = v
 		}
@@ -94,7 +127,8 @@ func Load(getenv func(string) string) (Config, error) {
 }
 
 // checkDatabaseURL rejects anything that is not a Postgres URL. The error never echoes the value,
-// because a database URL carries a password.
+// because a database URL carries a password. In particular the url.Parse error is never wrapped or
+// returned: it quotes the whole input.
 func checkDatabaseURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {

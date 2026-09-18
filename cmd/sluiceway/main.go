@@ -32,6 +32,10 @@ var errNotBuilt = errors.New("not built yet, see docs/backlog.md")
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// The first signal starts a graceful shutdown. Handing the signals back to the runtime as soon
+	// as it arrives means a second one ends the process at once instead of being swallowed for the
+	// whole shutdown grace.
+	context.AfterFunc(ctx, stop)
 	code := run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
