@@ -401,6 +401,40 @@ func TestOpenRefusesADatabaseThatIsNotBootstrapped(t *testing.T) {
 	}
 }
 
+// A schema called "sluiceway" that someone else created is not the one the bootstrap makes. The
+// script's CREATE SCHEMA IF NOT EXISTS used to accept it silently, Open passed, and the first sign
+// of trouble was Migrate failing with "no schema has been selected to create in".
+func TestASchemaOwnedByAnotherRoleIsRefused(t *testing.T) {
+	testdb.New(t) // the roles exist cluster-wide once any database is bootstrapped
+	raw := testdb.NewRaw(t)
+	testdb.Exec(t, raw.AdminURL, "CREATE SCHEMA sluiceway")
+
+	db, err := store.Open(testCtx(t), raw.URL)
+	if db != nil {
+		db.Close()
+	}
+	if !errors.Is(err, store.ErrSchemaNotOwned) {
+		t.Errorf("Open: err = %v, want ErrSchemaNotOwned", err)
+	}
+
+	// The script says so as well, instead of leaving the schema as it found it and reporting
+	// success.
+	var pgErr *pgconn.PgError
+	err = testdb.TryBootstrap(t, raw.AdminURL)
+	if !errors.As(err, &pgErr) || pgErr.Code != "55000" || !strings.Contains(pgErr.Message, `owned by "postgres"`) {
+		t.Fatalf("bootstrap over a foreign schema: err = %v, want a refusal (55000) that names the owner", err)
+	}
+
+	// Handing the schema over is the way out, and then both are content.
+	testdb.Exec(t, raw.AdminURL, "ALTER SCHEMA sluiceway OWNER TO sluiceway")
+	testdb.Bootstrap(t, raw.AdminURL)
+	db, err = store.Open(testCtx(t), raw.URL)
+	if err != nil {
+		t.Fatalf("Open once the schema belongs to the application role: %v", err)
+	}
+	db.Close()
+}
+
 func TestOpenNeverEchoesTheURL(t *testing.T) {
 	_, err := store.Open(testCtx(t), "postgres://app:hunter2@db:5432/x?pool_max_conns=banana")
 	if err == nil {

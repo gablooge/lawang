@@ -137,8 +137,9 @@ a one-time bootstrap script (`sluiceway migrate bootstrap` prints it) that creat
 and a `sluiceway` schema owned by the application role. The administrator is a superuser, or a
 non-superuser with `CREATEROLE` and `CREATE` on the database, which is what managed Postgres
 offers. The script is a single statement, so it applies completely or not at all, and it is safe
-to run again, also as a different administrator. Migrations then run as the application role
-itself. Every connection sets `search_path` to that schema explicitly, because the default
+to run again, also as a different administrator. It leaves the administrator's own role
+memberships exactly as it found them, and it refuses a database where a `sluiceway` schema already
+exists under another owner. Migrations then run as the application role itself. Every connection sets `search_path` to that schema explicitly, because the default
 `"$user"` entry follows `SET ROLE`.
 
 On every start, `serve`, `worker` and `migrate` run a preflight and refuse to continue if:
@@ -150,8 +151,18 @@ On every start, `serve`, `worker` and `migrate` run a preflight and refuse to co
   Postgres the effective question, `pg_has_role(helper, 'USAGE')`, which must be false: otherwise
   a plain transaction with no tenant bound would run under the helper role's cross-tenant
   policies;
+- the login holds **`ADMIN OPTION`** on a helper role, by any path, inherited or not
+  (`pg_has_role(helper, 'MEMBER WITH ADMIN OPTION')` must be false). That is the one membership
+  state the application role could turn into inheritance by itself, by granting the helper role
+  to itself `WITH INHERIT TRUE` while the process runs;
 - the login cannot `SET ROLE` to a helper role (`pg_has_role(helper, 'SET')` must be true);
-- the schema is missing (the bootstrap was not applied), or the server is older than Postgres 16.
+- the schema is missing (the bootstrap was not applied), or exists but is not owned by the login
+  role (it is not the one the bootstrap creates, and migrations would fail in it with a misleading
+  error), or the server is older than Postgres 16.
+
+The preflight runs once per process, at start. It guards against misconfiguration, not against an
+administrator: a membership or attribute changed while the process runs is not seen until the next
+start, and anyone able to make that change could read the tables directly anyway.
 
 See [ADR 2](adr/0002-migrations-goose.md).
 

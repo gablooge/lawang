@@ -69,7 +69,7 @@ func TestMigrateBootstrapPrintsTheScriptWithoutConfiguration(t *testing.T) {
 	if code := run(context.Background(), []string{"migrate", "bootstrap"}, noEnv, &out, &errOut); code != 0 {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	for _, want := range []string{"CREATE ROLE sluiceway ", "NOBYPASSRLS", "WITH INHERIT FALSE", "CREATE SCHEMA IF NOT EXISTS sluiceway"} {
+	for _, want := range []string{"CREATE ROLE sluiceway ", "NOBYPASSRLS", "WITH INHERIT FALSE", "CREATE SCHEMA sluiceway AUTHORIZATION sluiceway"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("bootstrap script does not contain %q", want)
 		}

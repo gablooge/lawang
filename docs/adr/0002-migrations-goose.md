@@ -20,9 +20,15 @@ FALSE, SET TRUE`, and creates the `sluiceway` schema owned by the application ro
 The administrator is a superuser, or a non-superuser role with `CREATEROLE` and `CREATE` on the
 database, which is all that most managed Postgres gives out. A `CREATEROLE` role holds the roles it
 creates `WITH ADMIN OPTION` only, and creating a schema for another role requires `SET` on it, so
-the script grants itself `SET` on `sluiceway` for that one step and revokes it again. It only does
-so when it lacks `SET`, and the revoke removes only its own grant, so the administrator ends with
-exactly what it started with. A `CREATEROLE` role can only grant roles it created or administers:
+the script grants itself `SET` on `sluiceway` for that one step and gives it back. Creating the
+schema first and handing it over with `ALTER SCHEMA ... OWNER TO` needs the same `SET` (checked on
+Postgres 16 and 17), so there is no way around borrowing it. The script borrows only when the
+schema does not exist yet and the administrator lacks `SET`. Giving it back is not a plain
+`REVOKE`: Postgres keeps one membership row per grantor, so when the administrator already holds a
+row from the same grantor without `SET` (`createrole_self_grant = 'inherit'` makes one), the grant
+rewrites that row, and a revoke would delete it. The script records the administrator's rows
+before the grant, and afterwards restores the options of whichever row changed, or revokes the
+row that is new, so the administrator ends with exactly what it started with. A `CREATEROLE` role can only grant roles it created or administers:
 if someone else created the roles, that administrator or a superuser runs the script.
 
 The script is a single `DO` statement, so under any client (including `psql`, which carries on
@@ -34,8 +40,22 @@ role it asks `pg_has_role(helper, 'USAGE')`, which must be false, and `pg_has_ro
 which must be true. `USAGE` is Postgres's own answer to "do this role's privileges and policies
 apply without `SET ROLE`", over every grantor's row and every intermediate role, which is the only
 question that matters: an inherited worker role would give a plain transaction, with no tenant
-bound, the worker's cross-tenant policies. It also refuses a helper role that is `SUPERUSER` or
-`BYPASSRLS`, and a database without the schema.
+bound, the worker's cross-tenant policies. It also asks `pg_has_role(helper, 'MEMBER WITH ADMIN
+OPTION')`, which must be false: a login that administers a helper role passes the other two checks
+and can then grant itself that role `WITH INHERIT TRUE` while running. Postgres answers the `USAGE`
+and `SET` spellings of that question identically (all three are `is_admin_of_role`, which follows
+memberships whether or not they are inherited), and that reach is wanted, because `ADMIN OPTION`
+held by a role the login can only `SET ROLE` to is just as usable. It also refuses a helper role
+that is `SUPERUSER` or `BYPASSRLS`, a database without the schema (`ErrNotBootstrapped`), and a
+schema the login role does not own (`ErrSchemaNotOwned`). The last has a sentinel of its own
+because isolation is not at stake, so it is not `ErrUnsafeRole`, and running the bootstrap again
+does not change the owner of a schema that exists, so `ErrNotBootstrapped` would send the operator
+the wrong way. The bootstrap script raises a clear error in the same situation instead of
+accepting the schema silently, which `CREATE SCHEMA IF NOT EXISTS` used to do.
+
+The preflight runs once per process. A grant changed by an administrator afterwards is not seen
+until the next start. That is accepted: it guards against misconfiguration, and an actor who can
+change memberships can already read the tables.
 
 Everything lives in the `sluiceway` schema, and every connection sets `search_path` to it
 explicitly. Postgres 16 is the minimum, for `GRANT ... WITH INHERIT FALSE`.
