@@ -85,35 +85,92 @@ func (db *DB) preflight(ctx context.Context) error {
 	var (
 		user                     string
 		super, bypass, hasSchema bool
-		unsafeHelpers, memberOf  int
 	)
 	err := db.pool.QueryRow(ctx, `
 		SELECT r.rolname, r.rolsuper, r.rolbypassrls,
-		       EXISTS (SELECT FROM pg_namespace WHERE nspname = $1),
-		       (SELECT count(*) FROM pg_roles h
-		         WHERE h.rolname = ANY($2) AND (h.rolsuper OR h.rolbypassrls)),
-		       (SELECT count(*) FROM pg_auth_members m JOIN pg_roles h ON h.oid = m.roleid
-		         WHERE m.member = r.oid AND h.rolname = ANY($2)
-		           AND m.set_option AND NOT m.inherit_option)
+		       EXISTS (SELECT FROM pg_namespace WHERE nspname = $1)
 		  FROM pg_roles r
-		 WHERE r.rolname = current_user`,
-		Schema, []string{string(RoleResolver), string(RoleWorker)},
-	).Scan(&user, &super, &bypass, &hasSchema, &unsafeHelpers, &memberOf)
+		 WHERE r.rolname = current_user`, Schema,
+	).Scan(&user, &super, &bypass, &hasSchema)
 	if err != nil {
 		return fmt.Errorf("store: preflight: %w", err)
 	}
-
-	switch {
-	case super || bypass:
+	if super || bypass {
 		return fmt.Errorf("%w: %q is SUPERUSER or BYPASSRLS, so row-level security would not apply to it", ErrUnsafeRole, user)
-	case unsafeHelpers > 0:
-		return fmt.Errorf("%w: a helper role is SUPERUSER or BYPASSRLS", ErrUnsafeRole)
-	case !hasSchema:
+	}
+
+	helpers, err := db.helperStates(ctx)
+	if err != nil {
+		return err
+	}
+	for _, h := range helpers {
+		if h.exists && h.unsafe {
+			return fmt.Errorf("%w: helper role %s is SUPERUSER or BYPASSRLS", ErrUnsafeRole, h.name)
+		}
+	}
+	if !hasSchema {
 		return ErrNotBootstrapped
-	case memberOf != 2:
-		return fmt.Errorf("%w: %q must be a member of %s and %s WITH INHERIT FALSE, SET TRUE", ErrUnsafeRole, user, RoleResolver, RoleWorker)
+	}
+	for _, h := range helpers {
+		switch {
+		case !h.exists:
+			return fmt.Errorf("%w: helper role %s does not exist, apply the bootstrap script again", ErrUnsafeRole, h.name)
+		case h.inherited:
+			return fmt.Errorf("%w: %q inherits %s, directly or through another role, so its cross-tenant policies would apply without SET ROLE; every membership on the path must be WITH INHERIT FALSE",
+				ErrUnsafeRole, user, h.name)
+		case !h.canSet:
+			return fmt.Errorf("%w: %q cannot SET ROLE %s, it must be a member WITH INHERIT FALSE, SET TRUE", ErrUnsafeRole, user, h.name)
+		}
 	}
 	return nil
+}
+
+// helperState is what the preflight learns about one helper role.
+type helperState struct {
+	name string
+	// exists is false when the role is missing, and then the other fields are all false.
+	exists bool
+	// unsafe: the role is SUPERUSER or BYPASSRLS.
+	unsafe bool
+	// inherited: the login holds the role's privileges, and is subject to its policies, WITHOUT
+	// SET ROLE. A plain transaction with no tenant bound would then see across tenants.
+	inherited bool
+	// canSet: the login may SET ROLE to it, which RoleTx depends on.
+	canSet bool
+}
+
+// helperStates asks Postgres the question Postgres itself answers when it evaluates a policy or
+// a privilege, instead of reading pg_auth_members. A membership has one row per grantor, and
+// inheritance also arrives through intermediate roles, so no count of rows that look right says
+// what the login can actually do. pg_has_role follows every path: 'USAGE' is "without SET ROLE",
+// 'SET' is "may SET ROLE". Both are only meaningful for a login that is not a superuser, which
+// the caller has already established.
+func (db *DB) helperStates(ctx context.Context) ([]helperState, error) {
+	want := []string{string(RoleResolver), string(RoleWorker)}
+	rows, err := db.pool.Query(ctx, `
+		SELECT n.name, h.oid IS NOT NULL,
+		       coalesce(h.rolsuper OR h.rolbypassrls, false),
+		       coalesce(pg_has_role(h.oid, 'USAGE'), false),
+		       coalesce(pg_has_role(h.oid, 'SET'), false)
+		  FROM unnest($1::text[]) WITH ORDINALITY AS n(name, ord)
+		  LEFT JOIN pg_roles h ON h.rolname = n.name
+		 ORDER BY n.ord`, want)
+	if err != nil {
+		return nil, fmt.Errorf("store: preflight: %w", err)
+	}
+	states, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (helperState, error) {
+		var h helperState
+		err := row.Scan(&h.name, &h.exists, &h.unsafe, &h.inherited, &h.canSet)
+		return h, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: preflight: %w", err)
+	}
+	// Fail closed: an answer that came back short has verified nothing.
+	if len(states) != len(want) {
+		return nil, fmt.Errorf("%w: preflight saw %d helper roles, want %d", ErrUnsafeRole, len(states), len(want))
+	}
+	return states, nil
 }
 
 // Tx runs fn in a transaction with no tenant bound. Every tenant-scoped table reads as empty and

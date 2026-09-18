@@ -134,12 +134,26 @@ The resolver and worker roles are granted with `INHERIT FALSE` and entered expli
 
 **Bootstrap and preflight.** The application role cannot create roles, so an administrator applies
 a one-time bootstrap script (`sluiceway migrate bootstrap` prints it) that creates the three roles
-and a `sluiceway` schema owned by the application role. Migrations then run as the application
-role itself. Every connection sets `search_path` to that schema explicitly, because the default
-`"$user"` entry follows `SET ROLE`. On every start, `serve`, `worker` and `migrate` run a preflight
-and refuse to continue if the login is `SUPERUSER` or `BYPASSRLS` (row-level security would
-silently not apply), if a helper role is, if the memberships are not `INHERIT FALSE`, or if the
-server is older than Postgres 16. See [ADR 2](adr/0002-migrations-goose.md).
+and a `sluiceway` schema owned by the application role. The administrator is a superuser, or a
+non-superuser with `CREATEROLE` and `CREATE` on the database, which is what managed Postgres
+offers. The script is a single statement, so it applies completely or not at all, and it is safe
+to run again, also as a different administrator. Migrations then run as the application role
+itself. Every connection sets `search_path` to that schema explicitly, because the default
+`"$user"` entry follows `SET ROLE`.
+
+On every start, `serve`, `worker` and `migrate` run a preflight and refuse to continue if:
+
+- the login is `SUPERUSER` or `BYPASSRLS` (row-level security would silently not apply), or a
+  helper role is;
+- the login **inherits** a helper role, by any path. The preflight does not read membership rows,
+  because there is one per grantor and inheritance also arrives through intermediate roles. It asks
+  Postgres the effective question, `pg_has_role(helper, 'USAGE')`, which must be false: otherwise
+  a plain transaction with no tenant bound would run under the helper role's cross-tenant
+  policies;
+- the login cannot `SET ROLE` to a helper role (`pg_has_role(helper, 'SET')` must be true);
+- the schema is missing (the bootstrap was not applied), or the server is older than Postgres 16.
+
+See [ADR 2](adr/0002-migrations-goose.md).
 
 **Tenant ids** are 1 to 64 characters of `A-Z a-z 0-9 _ -`, enforced in Go and by a `tenant_id`
 domain that every tenant column uses. The policy compares against `current_tenant()`, which maps
