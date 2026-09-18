@@ -1,0 +1,91 @@
+{
+  "_comment": "Test vectors for the id recipes in internal/ids. delivery_id = hex(blake3(provider 0x1F body)). record_id = 'rec_' + hex(blake3(provider 0x1F external_id 0x1F version 0x1F tenant))[:32]. Regenerate with: go test ./internal/ids -run TestGolden -update. A changed value here is a breaking change to every record already delivered.",
+  "delivery_id": [
+    {
+      "provider": "clickup",
+      "body_hex": "7b226576656e74223a227461736b436f6d6d656e74506f73746564222c227461736b5f6964223a223836613178797a222c22776562686f6f6b5f6964223a223462363761633838227d",
+      "want": "0e1ff050905983245ea56a960a47eb4d70c4f0271932cf4e85025af4156cf437"
+    },
+    {
+      "provider": "slack",
+      "body_hex": "7b22746f6b656e223a2278222c2274797065223a226576656e745f63616c6c6261636b222c226576656e74223a7b2274797065223a226d657373616765222c226368616e6e656c223a22433047454e4552414c222c227473223a22313735323036343234352e303030323030227d7d",
+      "want": "b5e9533713ad8df0cd4e629caae8242b8fcf4fdf0d12de756e30ea02667cb8ac"
+    },
+    {
+      "provider": "slack",
+      "body_hex": "7b2261223a317d",
+      "want": "5b7691218fc66d93fad772871813c8e563a8fe150119b3afc912867a7e979c42"
+    },
+    {
+      "provider": "slack",
+      "body_hex": "7b2261223a20317d",
+      "want": "f9b6d73cb0477328dca483b9d81eb4d7843fde70f6edd92a06a633d539c8323f"
+    },
+    {
+      "provider": "outlook",
+      "body_hex": "",
+      "want": "506610101dbad34668a52b2d1982e37f9f04da9c28d44e45b275340fd3950ba6"
+    },
+    {
+      "provider": "hubspot",
+      "body_hex": "fffe001f2062696e617279200a",
+      "want": "4ff7afcdc8c5cb13deb097aaa77ea10816981c09c3fc41a7cc70a166cc2b2b6a"
+    },
+    {
+      "provider": "teams",
+      "body_hex": "7b2274657874223a22636166c3a920e29895227d",
+      "want": "3b8eefede8e26c41817b79a3afe8de72fad5546b7c7998491789dfcecf82df59"
+    }
+  ],
+  "record_id": [
+    {
+      "provider": "slack",
+      "external_id": "slack:C0GENERAL:1752064245.000200",
+      "version": "1752064245.000200",
+      "tenant": "tenant_a",
+      "want": "rec_3d5c0f99e671e1b1633cc02c82aa0133"
+    },
+    {
+      "provider": "slack",
+      "external_id": "slack:C0GENERAL:1752064245.000200",
+      "version": "1752064245.000200",
+      "tenant": "tenant_b",
+      "want": "rec_5e3541c0a8d8918285e23a15f6d1aaf9"
+    },
+    {
+      "provider": "slack",
+      "external_id": "slack:C0GENERAL:1752064245.000200",
+      "version": "1752064300.000100",
+      "tenant": "tenant_a",
+      "want": "rec_e7e92b7560a65954fe9c3e504aa89b16"
+    },
+    {
+      "provider": "clickup",
+      "external_id": "clickup:task:86a1xyz",
+      "version": "1752064245000",
+      "tenant": "01JZXA8Q2KTENANT0000000000",
+      "want": "rec_2e511fbbd957e13f2d41b73ee397a8f1"
+    },
+    {
+      "provider": "x",
+      "external_id": "ab",
+      "version": "c",
+      "tenant": "t",
+      "want": "rec_5ba14dd2b7f1cd101be994685dd6583e"
+    },
+    {
+      "provider": "x",
+      "external_id": "a",
+      "version": "bc",
+      "tenant": "t",
+      "want": "rec_bfafe27719e25ad24099a9759d05e7f1"
+    },
+    {
+      "provider": "outlook",
+      "external_id": "outlook:AAMkAGI2über",
+      "version": "CQAAABYAAAB",
+      "tenant": "tenant_a",
+      "want": "rec_e648329fe7b48764c3f9b28f6e93f679"
+    }
+  ]
+}

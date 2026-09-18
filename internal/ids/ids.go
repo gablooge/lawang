@@ -1,0 +1,105 @@
+// Package ids mints every identifier Sluiceway uses. The hashed key recipes live here and nowhere
+// else, so they cannot drift between the accept path, the worker and reconciliation.
+//
+// The recipes are a compatibility contract: changing one re-keys every record already delivered.
+// testdata/golden.json pins them, and another implementation can verify itself against that file.
+package ids
+
+import (
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/oklog/ulid/v2"
+	"github.com/zeebo/blake3"
+)
+
+// sep joins hashed parts. It is the ASCII unit separator, so ("ab","c") never hashes like
+// ("a","bc").
+const sep = 0x1F
+
+// RecordPrefix starts every record id.
+const RecordPrefix = "rec_"
+
+// recordHexLen is how much of the hash a record id keeps: 32 hex characters, 128 bits.
+const recordHexLen = 32
+
+// ErrEmptyPart reports a missing key part. A missing tenant or provider is a refusal, never a
+// default, because a defaulted part makes unrelated things share an id.
+var ErrEmptyPart = errors.New("ids: empty key part")
+
+// ErrSeparatorInPart reports a part containing the separator byte, which would let two different
+// part lists produce the same hash input.
+var ErrSeparatorInPart = errors.New("ids: key part contains the 0x1F separator")
+
+// New returns a new ULID: unique, and sortable by creation time.
+func New() string {
+	return ulid.Make().String()
+}
+
+// DeliveryID is the accept-path dedupe key: blake3(provider, raw_body), as 64 hex characters. An
+// identical re-send from a provider maps to the same id and becomes an accept no-op.
+//
+// rawBody is hashed exactly as received. It is the last part, so it may contain any byte.
+func DeliveryID(provider string, rawBody []byte) (string, error) {
+	if err := checkPart("provider", provider); err != nil {
+		return "", err
+	}
+	h := blake3.New()
+	_, _ = h.WriteString(provider)
+	_, _ = h.Write([]byte{sep})
+	_, _ = h.Write(rawBody)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// RecordID is the end-to-end idempotency key:
+//
+//	"rec_" + hex(blake3(provider, external_id, version, tenant))[:32]
+//
+// provider is the internal provider key, never a sink's wire name, so renaming a source for a sink
+// does not re-key its records. tenant is part of the hash on purpose: two tenants may connect the
+// same provider workspace, and without it the second tenant's records would dedupe away.
+func RecordID(provider, externalID, version, tenant string) (string, error) {
+	parts := [...]struct{ name, value string }{
+		{"provider", provider},
+		{"external_id", externalID},
+		{"version", version},
+		{"tenant", tenant},
+	}
+	h := blake3.New()
+	for i, p := range parts {
+		if err := checkPart(p.name, p.value); err != nil {
+			return "", err
+		}
+		if i > 0 {
+			_, _ = h.Write([]byte{sep})
+		}
+		_, _ = h.WriteString(p.value)
+	}
+	return RecordPrefix + hex.EncodeToString(h.Sum(nil))[:recordHexLen], nil
+}
+
+// IsRecordID reports whether s has the shape of a record id.
+func IsRecordID(s string) bool {
+	rest, ok := strings.CutPrefix(s, RecordPrefix)
+	if !ok || len(rest) != recordHexLen {
+		return false
+	}
+	for _, c := range []byte(rest) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func checkPart(name, value string) error {
+	if value == "" {
+		return fmt.Errorf("%w: %s", ErrEmptyPart, name)
+	}
+	if strings.IndexByte(value, sep) >= 0 {
+		return fmt.Errorf("%w: %s", ErrSeparatorInPart, name)
+	}
+	return nil
+}

@@ -144,7 +144,11 @@ Three deterministic keys, minted in exactly one package (`internal/ids`) so the 
 | record | `id = "rec_" + blake3(provider, external_id, version, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
 | subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates |
 
-Parts are joined with a `0x1F` separator so `("ab","c")` never collides with `("a","bc")`.
+Parts are joined with a `0x1F` separator so `("ab","c")` never collides with `("a","bc")`. A part
+that is empty or itself contains `0x1F` is refused with an error rather than hashed: an empty tenant
+must never mint an id, and a separator inside a part would bring the collision back. The raw body of
+a delivery is exempt because it is the last part. Test vectors for both recipes are in
+`internal/ids/testdata/golden.json`.
 
 The **tenant** is part of the record id on purpose: two tenants can legitimately connect the same
 provider workspace, and without the salt the second tenant's records would dedupe away as
