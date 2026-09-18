@@ -1,0 +1,25 @@
+# Binaries and build output
+/bin/
+/dist/
+/sluiceway
+*.exe
+*.test
+
+# Coverage and profiling
+coverage.out
+*.coverprofile
+*.pprof
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Local data written by the dev stack
+/data/
+/raw/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

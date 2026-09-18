@@ -1,0 +1,379 @@
+# Architecture
+
+This is the target design for Sluiceway v0.1. It is a Go rewrite and generalization of a Python
+connector service that ran against real Slack, Microsoft Teams, Outlook, ClickUp and HubSpot
+tenants. The shape carries over because it held up; the places where it did not are called out in
+[section 10](#10-design-principles-learned-the-hard-way), and each one changed the design below.
+
+Build order and open decisions live in [roadmap.md](roadmap.md).
+
+---
+
+## 1. Goals and non-goals
+
+**Goals**
+
+1. Ingest changes from SaaS tools with webhooks as the primary path and reconciliation as the
+   safety net.
+2. Stamp every record with its visibility (a scope and the scope's members) from the provider's
+   own sharing signals.
+3. Deliver each change to a sink exactly once, surviving provider re-sends, worker crashes and
+   backfill overlaps.
+4. Isolate tenants at the database level, failing closed.
+5. Run as a single binary against a single Postgres, with no third-party account required for a
+   local setup.
+
+**Non-goals for v0.1**
+
+- Acting on providers (posting messages, creating tasks). The design leaves room for a tool-calling
+  facade later; v0.1 is ingestion only.
+- Bulk analytics replication. That is a different problem with different tools.
+- Hosting OAuth consent screens. Sluiceway can delegate that to Nango.
+
+---
+
+## 2. Shape
+
+One binary, two roles, one database.
+
+| Role | Command | What it does | Scaling |
+|---|---|---|---|
+| **serve** | `sluiceway serve` | Operator API under `/v1` and the webhook edge under `/ingress/{provider}` | Horizontal and stateless: verification and accept need only Postgres |
+| **worker** | `sluiceway worker` | Drains the outbox, renews subscriptions, reconciles, syncs access, sweeps retention | Horizontal: rows are claimed with `FOR UPDATE SKIP LOCKED`; cluster-wide sweeps elect a single runner with an advisory lock |
+
+Other subcommands: `migrate`, `connect <provider>`, `reconcile <tenant> <provider>`, `version`.
+
+There is **no message broker**. The only queue is the `outbox` table. Retries and the dead-letter
+queue are row states, not topics, so replaying a dead letter is an `UPDATE`, not a re-publish.
+
+---
+
+## 3. Data flows
+
+### 3.1 Accept path (inside `serve`, target under 200 ms)
+
+```mermaid
+sequenceDiagram
+  participant P as Provider
+  participant E as /ingress/{provider}
+  participant DB as Postgres
+  P->>E: POST (signed, often a thin body)
+  E->>E: handshake? answer and stop
+  E->>DB: candidate subscriptions for the delivery keys (resolver role)
+  E->>E: verify signature over the EXACT raw bytes, per candidate
+  alt no candidate verifies
+    E-->>P: 401
+  else exactly one owner verifies
+    E->>DB: INSERT outbox row (tenant from the owned row) ON CONFLICT DO NOTHING
+    E-->>P: 202
+  else unknown workspace or ambiguous owner
+    E->>DB: INSERT outbox row parked as dead-letter under a sentinel tenant
+    E-->>P: 200 (never make a provider retry-storm)
+  end
+```
+
+Response codes are part of the contract: **401 only for a signature failure**, 2xx for everything
+else including poison, because providers retry non-2xx responses and a retry storm helps nobody.
+
+### 3.2 Drain path (inside `worker`)
+
+1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so all
+   versions of one entity deliver in arrival order while different entities proceed in parallel.
+2. Re-bind row-level security to the row's own tenant before touching anything.
+3. Parse the stored raw body into changes. One delivery can produce several records (a comment and
+   its parent task, for example).
+4. Hydrate each change into the full object. On failure, degrade to a minimal record built from the
+   webhook body rather than dropping the change.
+5. Normalize, drop automation noise, compute the record id, skip ids already in the ledger, link
+   the supersede chain forward only, mask PII.
+6. Commit the ledger rows and the prepared records together, then deliver to the sink.
+7. Commit the delivered state. A crash between steps 6 and 7 re-drains the prepared records, and
+   the sink's idempotency turns the repeat into a no-op.
+
+### 3.3 Reconciliation
+
+A per-tenant, per-provider cursor records the newest change already seen. A reconcile pass asks the
+provider what changed since the cursor and replays each change **through the same accept path**
+as a trusted synthesized delivery. There is no separate backfill pipeline: overlaps with the live
+feed dedupe on the record id like any other repeat.
+
+Passes commit in chunks and take their rate-limit pauses between chunks, never inside an open
+transaction (see [section 10](#10-design-principles-learned-the-hard-way)).
+
+### 3.4 Access sync
+
+Per provider, a member source lists each container (channel, list, mailbox, portal) and its members.
+Sluiceway maps members to person ids through an identity resolver, diffs against what it last sent,
+and pushes grants and revocations to sinks that accept membership. A failed provider read aborts
+the pass rather than being treated as an empty member list, because an outage must never look like
+everybody leaving.
+
+---
+
+## 4. Trust model
+
+Three roots of trust, and nothing else can establish a tenant:
+
+| Surface | Trust root | Tenant comes from |
+|---|---|---|
+| `/v1` operator API | operator credential | the credential |
+| `/ingress/{provider}` | provider signature over the raw bytes | the owned subscription row that verified it |
+| sink delivery | per-tenant sink credential | Sluiceway, from the outbox row |
+
+**Row-level security.** Every tenant-scoped table has RLS enabled and forced, with the policy keyed
+on a transaction-local setting. If the setting is missing, a query returns zero rows. Three roles:
+
+| Role | Purpose |
+|---|---|
+| `sluiceway` | the application role; `NOSUPERUSER NOBYPASSRLS`, so RLS actually applies |
+| `sluiceway_resolver` | reads only the delivery-resolution columns of subscriptions, because it has to derive the tenant and so cannot be filtered by it |
+| `sluiceway_worker` | claims outbox rows across tenants, then re-binds to each row's tenant for the work itself |
+
+The resolver and worker roles are granted with `INHERIT FALSE` and entered explicitly with
+`SET LOCAL ROLE`, so the application role does not silently pick up their wider policies.
+
+---
+
+## 5. Idempotency
+
+Three deterministic keys, minted in exactly one package (`internal/ids`) so the recipes cannot drift:
+
+| Where | Key | Effect |
+|---|---|---|
+| accept | `delivery_id = blake3(provider, raw_body)`, unique | an identical re-send is an accept no-op |
+| record | `id = "rec_" + blake3(provider, external_id, version, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
+| subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates |
+
+Parts are joined with a `0x1F` separator so `("ab","c")` never collides with `("a","bc")`.
+
+The **tenant** is part of the record id on purpose: two tenants can legitimately connect the same
+provider workspace, and without the salt the second tenant's records would dedupe away as
+duplicates of the first. The tenant participates only in the hash.
+
+A **new version is a new record.** Edits never overwrite; the new record carries `supersedes`, the
+id of the version it replaces. Supersede links only point forward, so a late-arriving old version
+can never claim to replace a newer one.
+
+---
+
+## 6. The record format (proposed)
+
+This is the envelope a sink receives. Naming is not final; see the roadmap's open decisions.
+
+```jsonc
+{
+  "id": "rec_4be29c01d7f3a8e64f0d2b91c6e75a30",
+  "op": "upsert",                          // upsert | delete (delete reserved, ships later)
+  "source": "slack",                       // wire name, configurable per sink
+  "kind": "message",                       // task | message | ticket | document | page
+  "external_id": "slack:C0GENERAL:1752064245.000200",
+  "version": "1752064245.000200",          // monotonic per external_id
+  "supersedes": null,                      // id of the replaced version, or null
+  "occurred_at": "2026-07-09T12:30:45Z",   // source event time, never ingest time
+  "title": "",
+  "text": "Numbers are in, call me at [PHONE]",   // already PII-masked
+  "author": { "id": "U0BEN", "display": "ben" },
+  "container": { "kind": "channel", "id": "C0GENERAL" },
+  "visibility": {
+    "scope": "slack:channel:C0GENERAL",    // the ONE thing access is decided on
+    "audience": "group"                    // direct | group; informational only
+  },
+  "origin": {
+    "automation": false,                   // bot or integration author
+    "untrusted": false                     // authored outside the tenant (inbound mail, guests)
+  },
+  "edges": { "reply_parent": null },       // relations from fields, never from NLP
+  "meta": { "raw_ref": "fs://raw/slack/4be29c01...", "delivery": "01JZXA8Q2K..." }
+}
+```
+
+**The visibility rule is uniform: a person may see a record if they are a member of its scope.**
+There is deliberately no `private` flag. A DM is a scope whose members are its participants; a
+mailbox is a scope whose only member is its owner; a channel is a scope whose members are the
+channel's members. One rule, applied the same way for every provider, is far harder to get wrong
+than a per-container flag whose meaning a sink can interpret differently from the connector
+(see principle 9).
+
+Sluiceway **never** stamps anything as public. Content from a connector reaches exactly the people
+who could see it in the source tool, and no further.
+
+`origin.untrusted` exists from day one because records authored by people outside the tenant, such
+as inbound email or external Slack guests, can carry text written to steer a downstream AI agent.
+Marking them at the connector boundary, the only place that knows, lets the sink treat them with
+suspicion.
+
+---
+
+## 7. Extension points
+
+Each is a small Go interface wired once at startup. Optional capabilities are separate interfaces a
+provider implements only if it has them, discovered with a type assertion rather than stubbed out.
+
+```go
+// Provider is one SaaS integration. Everything provider-specific lives in its own package.
+type Provider interface {
+	Key() string                                                   // "slack"
+	Hydrate(ctx context.Context, t Tenant, c Change) (Hydrated, error)
+	Normalize(h Hydrated, c Change) ([]Record, error)
+}
+
+// Optional capabilities.
+type WebhookSource interface {
+	Handshake(r *http.Request, body []byte) (Reply, bool)          // challenge echoes
+	DeliveryKeys(body []byte, h http.Header) (DeliveryKeys, error) // what resolves the owner
+	Verify(body []byte, h http.Header, secret []byte) bool         // never errors, never panics
+	Parse(body []byte) ([]Change, error)
+}
+type Registrar interface {
+	Register(ctx context.Context, t Tenant, cred Credential) ([]Subscription, error)
+	Renew(ctx context.Context, s Subscription) (Subscription, error)
+	Deregister(ctx context.Context, s Subscription) error
+}
+type Reconciler interface {
+	ChangesSince(ctx context.Context, s Subscription, cursor Cursor, limit int) ([]Change, error)
+}
+type MemberSource interface {
+	Scopes(ctx context.Context, s Subscription) ([]ScopeMembers, error) // fails loudly, never empty-on-error
+}
+
+// Vault holds provider credentials. Raw tokens never reach a plain table.
+type Vault interface {
+	Store(ctx context.Context, t Tenant, provider string, c Credential) error
+	Fetch(ctx context.Context, t Tenant, provider string) (Credential, error)
+	Revoke(ctx context.Context, t Tenant, provider string) error
+}
+
+// Sink receives records. It must be idempotent on Record.ID.
+type Sink interface {
+	Deliver(ctx context.Context, t Tenant, recs []Record) (DeliveryResult, error)
+}
+type AccessSink interface {
+	SyncMembership(ctx context.Context, t Tenant, grants []Membership) (SyncResult, error)
+}
+```
+
+Built-in implementations planned for v0.1:
+
+| Seam | Implementations |
+|---|---|
+| Vault | `local` (AES-GCM, key from the environment), `nango` (self-hosted), `azureapp` (client-credentials for Microsoft Graph) |
+| Sink | `http` (the format above), `stub` (strict test double), `jsonl` (files, for development) |
+| Hydration | direct provider API clients; an MCP-backed hydrator is on the roadmap as an alternative |
+| Identity | email join (normalized, domain-restricted); replaceable |
+| Masking | conservative regex baseline (emails, phone numbers, IBANs); replaceable |
+
+---
+
+## 8. Package layout
+
+```text
+cmd/sluiceway/        main: serve | worker | migrate | connect | reconcile | version
+internal/
+  config/             environment config, fail-closed defaults
+  ids/                ULIDs and the blake3 key recipes, golden-tested
+  tenancy/            tenant context and RLS binding
+  store/              pgx pool, transaction helpers, embedded migrations
+  outbox/             accept insert, FIFO-head claim, retry ladder, dead letters
+  ingress/            the /ingress/{provider} HTTP edge
+  hub/                handshake, verify, resolve owner, accept
+  pipeline/           normalize, gate, ledger, supersede, mask, deliver
+  worker/             drain and sweeps as independent goroutines
+  reconcile/          cursors and chunked replay
+  access/             membership diff, identity resolution
+  api/                the /v1 operator API
+  vault/              Vault interface and implementations
+  sink/               Sink interface and implementations
+  provider/           Provider interfaces and the registry
+    clickup/  slack/  teams/  outlook/  hubspot/
+migrations/           SQL, embedded into the binary
+docs/
+```
+
+Code stays under `internal/` until the extension interfaces have been exercised by more than the
+built-in providers. Promoting them to a public package is a compatibility promise, so it waits
+until the shape has stopped moving.
+
+---
+
+## 9. Worker concurrency
+
+The worker runs each concern as its own goroutine under one cancellable context:
+
+- **Drain:** a small pool of goroutines, each claiming a batch with `SKIP LOCKED`. Adding worker
+  replicas adds drain capacity with no coordination.
+- **Sweeps** (renewal, reconcile, access sync, retention, dead-letter re-resolution): each on its
+  own ticker. A sweep that must run once per cluster takes a Postgres advisory lock for its
+  duration, so exactly one replica runs it and a crashed holder releases it automatically.
+- **Shutdown:** cancel the context, stop claiming new rows, let in-flight rows finish their
+  current transaction, then exit.
+
+Because the drain and the sweeps are independent, a slow reconciliation pass cannot hold up live
+delivery.
+
+---
+
+## 10. Design principles learned the hard way
+
+Each of these came from a real defect or a near miss in the Python predecessor.
+
+1. **Verify signatures over the exact raw bytes.** Re-serialized JSON never matches the provider's
+   HMAC. Compare in constant time, and treat a missing secret or signature as a plain `false`.
+2. **The tenant comes from an owned row, never from the payload.** When more than one tenant's
+   secret verifies the same delivery, refuse it. Routing to the first match is how data crosses
+   tenants.
+3. **Salt the record id with the tenant.** Two tenants sharing one provider workspace otherwise
+   collapse into one id and the second tenant silently loses records.
+4. **The wire name is not the internal key.** What a sink calls a source is sink configuration.
+   Hashing the internal key keeps record ids stable if the wire name ever changes.
+5. **A test double must reject whatever the real system rejects.** A lenient stub let a whole class
+   of silently mis-routed records pass every end-to-end test. The stub sink is strict on purpose.
+6. **Never sleep inside a transaction, and never let a sweep block the drain.** A reconciliation
+   pass that paced itself inside one long transaction held a write transaction open for minutes
+   and stopped live delivery for its whole duration.
+7. **A rate limiter must refuse a request it can never satisfy.** A token bucket asked for more
+   tokens than its capacity spins forever instead of failing.
+8. **Missing identity is a denial, not a default.** Falling back to a shared "default" namespace
+   when a per-user key is absent mixes users' data without an error anywhere.
+9. **Define visibility semantics in the format, not in the receiver.** A "private" flag that the
+   connector meant as "only these participants" and the receiver read as "only the author" made
+   records invisible to everyone while every system reported success. Hence the single uniform
+   scope-membership rule in section 6.
+10. **Webhooks drop; reconciliation is not optional.** Some providers never redeliver an event
+    missed during an outage. A backfill path that shares the live pipeline is the only reliable fix.
+11. **Verify each provider's tooling before depending on it.** Of five providers, three needed a
+    direct API client because the off-the-shelf MCP server either required delegated user tokens
+    or exposed no read tools. Direct clients are therefore the default here.
+12. **Test migrations as the role that will run them in production.** A guard that only fired for a
+    non-superuser passed every test run as superuser and blocked the first real deploy.
+
+---
+
+## 11. Failure handling
+
+| Failure | Class | Action |
+|---|---|---|
+| Signature invalid | untrusted | 401, nothing stored |
+| Unknown workspace or ambiguous owner | unattributable | parked under a sentinel tenant, re-resolved periodically, deleted after retention |
+| Hydration fails | degradable | deliver a minimal record, the change is still tracked |
+| Normalizer fails | non-retryable | dead-letter with the reason; fix and replay |
+| Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands |
+| Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered; ops is alerted |
+| Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; replay is always safe |
+| Vault unreachable | fail closed | retry on the ladder; nothing is delivered unverified |
+
+---
+
+## 12. Key dependencies
+
+| Need | Choice |
+|---|---|
+| Postgres driver | `github.com/jackc/pgx/v5` |
+| Migrations | `github.com/pressly/goose/v3`, SQL files embedded in the binary |
+| Hashing | `github.com/zeebo/blake3` |
+| IDs | `github.com/oklog/ulid/v2` |
+| HTTP | standard library `net/http` with method and path patterns |
+| Logging | standard library `log/slog` |
+| Crypto | standard library `crypto/hmac`, `crypto/aes`, `crypto/cipher` |
+| Metrics | `github.com/prometheus/client_golang` |
+| Tests | standard `testing`, `testcontainers-go` for Postgres, a JSON Schema validator for the record format |
+| MCP (later) | `github.com/modelcontextprotocol/go-sdk` |
