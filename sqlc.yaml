@@ -1,0 +1,21 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema: migrations
+    queries: internal/outbox/queries.sql
+    gen:
+      go:
+        package: outboxdb
+        out: internal/outbox/outboxdb
+        sql_package: pgx/v5
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: tenant_id
+            go_type: string
+          - db_type: timestamptz
+            go_type: time.Time
+          - db_type: timestamptz
+            nullable: true
+            go_type:
+              type: time.Time
+              pointer: true

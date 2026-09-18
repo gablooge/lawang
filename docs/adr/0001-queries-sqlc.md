@@ -29,6 +29,7 @@ plain SQL by someone reviewing isolation, not assembled by a query builder.
 ## Cost
 
 - One more tool in the build. It is only needed when a query changes, because the output is
-  checked in; `go build` alone never needs it.
+  checked in; `go build` alone never needs it. `make sqlc` and `make sqlc-check` run it from its
+  pinned Docker image, so there is nothing to install and CI uses the same version.
 - Dynamic queries (optional filters in the operator API) do not fit sqlc well. Those few may be
   hand-written with pgx, each with a test that runs it.

@@ -22,6 +22,8 @@ jobs:
           go-version-file: go.mod
       - name: go mod tidy
         run: make tidy
+      - name: generated queries are current
+        run: make sqlc-check
       - name: vet
         run: make vet
       - name: lint

@@ -90,6 +90,18 @@ else including poison, because providers retry non-2xx responses and a retry sto
 7. Commit the delivered state. A crash between steps 6 and 7 re-drains the prepared records, and
    the sink's idempotency turns the repeat into a no-op.
 
+**Outbox row states.** `pending` to `prepared` (step 6) to `delivered` (step 7), or to `dead`. A
+claim is a **lease** (`lease_until` plus a `lease_token`), not a held lock, because the work spans
+two transactions and a sink call; a worker that dies lets its lease run out and another takes
+over. Every transition is guarded by the lease token, so a slow worker that comes back after a
+takeover changes nothing. The head of an ordering key is its earliest row that is `pending` or
+`prepared`: while the head is leased or waiting out a backoff, nothing behind it is claimable. A
+`dead` row is finished and does not hold back newer versions of its entity.
+
+The claim runs as `sluiceway_worker`, which is granted only the scheduling columns and may update
+only the lease. It cannot read `raw_body`. Payloads are read afterwards, as the application role
+bound to the claimed row's tenant.
+
 ### 3.3 Reconciliation
 
 A per-tenant, per-provider cursor records the newest change already seen. A reconcile pass asks the
@@ -154,7 +166,7 @@ Three deterministic keys, minted in exactly one package (`internal/ids`) so the 
 
 | Where | Key | Effect |
 |---|---|---|
-| accept | `delivery_id = blake3(provider, raw_body)`, unique | an identical re-send is an accept no-op |
+| accept | `delivery_id = blake3(provider, raw_body)`, unique per tenant | an identical re-send is an accept no-op |
 | record | `id = "rec_" + blake3(provider, external_id, version, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
 | subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates |
 
@@ -163,6 +175,10 @@ that is empty or itself contains `0x1F` is refused with an error rather than has
 must never mint an id, and a separator inside a part would bring the collision back. The raw body of
 a delivery is exempt because it is the last part. Test vectors for both recipes are in
 `internal/ids/testdata/golden.json`.
+
+The delivery id is unique **per tenant**, not globally, for the same reason the record id is salted
+(below): two tenants may connect one provider workspace, and reconciliation then synthesizes
+byte-identical deliveries for both. A global constraint would drop the second tenant's.
 
 The **tenant** is part of the record id on purpose: two tenants can legitimately connect the same
 provider workspace, and without the salt the second tenant's records would dedupe away as
