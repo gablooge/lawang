@@ -2,7 +2,8 @@
 
 This is **sequence, not schedule**: the order milestones land in and what "done" means for each.
 Dates are deliberately absent, because a design document that carries dates starts lying the week
-they slip. The design itself is in [architecture.md](architecture.md).
+they slip. The design itself is in [architecture.md](architecture.md). The dated, item-by-item
+working plan is kept apart in [backlog.md](backlog.md), where slipping is cheap.
 
 The repository stays private until **M6**, so the first thing anyone sees is something that runs.
 

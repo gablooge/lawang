@@ -88,6 +88,7 @@ where a long reconciliation pass in a single sequential loop blocked live delive
 - [Architecture](docs/architecture.md): the target design, trust model, record format, and
   extension points
 - [Roadmap](docs/roadmap.md): milestones, acceptance criteria, and open decisions
+- [Backlog](docs/backlog.md): the milestones cut into work items, with the current 30-day plan
 
 ## License
 
