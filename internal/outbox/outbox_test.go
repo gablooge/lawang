@@ -35,11 +35,18 @@ type env struct {
 	tdb testdb.Database
 }
 
-func setup(t *testing.T) *env {
+// setup gives a test its own migrated database. plannerOff names planner settings (enable_nestloop
+// and the like) to turn off for every session of that database, for the tests that must hold
+// whatever plan the claim gets.
+func setup(t *testing.T, plannerOff ...string) *env {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	t.Cleanup(cancel)
 	tdb := testdb.New(t)
+	for _, setting := range plannerOff { // before the pool opens: a session reads these when it starts
+		testdb.Exec(t, tdb.AdminURL, fmt.Sprintf(
+			`DO $$ BEGIN EXECUTE format('ALTER DATABASE %%I SET %s = off', current_database()); END $$`, setting))
+	}
 	db, err := store.Open(ctx, tdb.URL)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
