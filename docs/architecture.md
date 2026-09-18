@@ -77,8 +77,9 @@ else including poison, because providers retry non-2xx responses and a retry sto
 
 ### 3.2 Drain path (inside `worker`)
 
-1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so all
-   versions of one entity deliver in arrival order while different entities proceed in parallel.
+1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so the
+   versions of one entity deliver one at a time, in queue order, while different entities proceed
+   in parallel.
 2. Re-bind row-level security to the row's own tenant before touching anything.
 3. Parse the stored raw body into changes. One delivery can produce several records (a comment and
    its parent task, for example).
@@ -94,12 +95,37 @@ else including poison, because providers retry non-2xx responses and a retry sto
 claim is a **lease** (`lease_until` plus a `lease_token`), not a held lock, because the work spans
 two transactions and a sink call; a worker that dies lets its lease run out and another takes
 over. Every transition is guarded by the lease token, so a slow worker that comes back after a
-takeover changes nothing. The head of an ordering key is its earliest row that is `pending` or
-`prepared`: while the head is leased or waiting out a backoff, nothing behind it is claimable. A
-`dead` row is finished and does not hold back newer versions of its entity.
+takeover changes nothing. The head of an ordering key is its row with the lowest `seq` that is
+`pending` or `prepared`: while the head is leased or waiting out a backoff, nothing behind it is
+claimable, so two versions of one entity are never in flight together. A `dead` row is finished
+and does not hold back newer versions of its entity.
+
+**Queue order.** `seq` is assigned when a row is inserted, not when its transaction commits. Left
+alone, version 1 could be inserted first and commit last, and a claim in between would lease
+version 2 and then version 1 alongside it. So every statement that assigns a `seq` first takes a
+transaction-scoped advisory lock on a hash of (tenant, ordering key): within one key, accepts
+commit in `seq` order, and a second accept of the same entity waits for the first to commit.
+Different entities do not wait for each other (two keys that hash alike do, harmlessly). A
+transaction that accepts several deliveries holds several of these locks until it commits, so it
+should accept in a stable key order or be ready to retry a deadlock.
+
+**Replay goes to the back.** Replaying a dead letter gives the row a fresh `seq`, under the same
+lock, as if it had just been accepted. While it was dead, newer versions of its entity were free
+to move, and one may be in flight at the moment of the replay: a row that kept its old `seq`
+would become the head again and be leased alongside it. The replayed version is therefore
+delivered after every version accepted before the replay, and the forward-only supersede chain
+treats it like any other late arrival of an old version. A row that died after step 6 remembers
+it (`prepared_at`) and is replayed as `prepared`, so it is delivered again but never prepared
+again.
+
+The claim picks heads on its statement snapshot and leases each row on its latest version, so it
+re-checks on the locked row everything that can change in between: the state, the lease and the
+`seq`. As a second line of defense, a key is not eligible while any other unfinished row of it
+holds a live lease.
 
 The claim runs as `sluiceway_worker`, which is granted only the scheduling columns and may update
-only the lease. It cannot read `raw_body`. Payloads are read afterwards, as the application role
+only the lease. It cannot read `raw_body`, and it writes `lease_token` without being able to read
+one back. Payloads are read afterwards, as the application role
 bound to the claimed row's tenant.
 
 ### 3.3 Reconciliation

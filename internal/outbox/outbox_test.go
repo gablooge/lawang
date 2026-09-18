@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -292,6 +294,7 @@ func TestTheWorkerRoleNeverReadsAPayload(t *testing.T) {
 		"SELECT raw_body FROM outbox",
 		"SELECT * FROM outbox",
 		"SELECT provider, delivery_id FROM outbox",
+		"SELECT lease_token FROM outbox", // it writes the token, and never reads one back
 		"UPDATE outbox SET state = 'delivered'",
 		"UPDATE outbox SET tenant_id = 'tenant_b'",
 		"DELETE FROM outbox",
@@ -490,5 +493,115 @@ func TestConcurrentWorkersDeliverEachEntityInOrder(t *testing.T) {
 
 	if delivered != entities*versions {
 		t.Errorf("delivered %d rows, want %d", delivered, entities*versions)
+	}
+}
+
+// TestReplayNeverOvertakesAVersionInFlight: v1 is a dead letter, v2 is being delivered, and the
+// operator replays v1. The replayed row joins the back of its entity's queue, so it is claimable
+// only once v2 has finished.
+func TestReplayNeverOvertakesAVersionInFlight(t *testing.T) {
+	e := setup(t)
+	v1 := e.accept(tenantA, "task:1", 1)
+	v2 := e.accept(tenantA, "task:1", 2)
+
+	c1 := e.claimOne(v1)
+	if err := e.ob.MarkDead(e.ctx, c1, "normalizer", "bad shape"); err != nil {
+		t.Fatal(err)
+	}
+	c2 := e.claimOne(v2)
+
+	if err := e.ob.Replay(e.ctx, tenantA, v1); err != nil {
+		t.Fatal(err)
+	}
+	e.claimNone("v2 is in flight, so the replayed v1 must wait behind it")
+
+	// Not merely held back while v2 is leased: it is behind v2 in the queue, so no claim that
+	// races v2's can ever see it as the head.
+	first, err := e.ob.Get(e.ctx, tenantA, v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := e.ob.Get(e.ctx, tenantA, v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Seq <= second.Seq {
+		t.Errorf("replayed v1 has seq %d, v2 has %d: a replay must go to the back of its queue", first.Seq, second.Seq)
+	}
+
+	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+		t.Fatal(err)
+	}
+	e.claimOne(v1)
+}
+
+func TestReplayRestoresThePreparedState(t *testing.T) {
+	e := setup(t)
+	v1 := e.accept(tenantA, "task:1", 1)
+	c := e.claimOne(v1)
+	if err := e.ob.MarkPrepared(e.ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	// The sink stays down until the ladder is used up: the commonest dead letter there is.
+	if err := e.ob.Fail(e.ctx, c, outbox.Ladder{}, "sink 503"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ob.Replay(e.ctx, tenantA, v1); err != nil {
+		t.Fatal(err)
+	}
+	row, err := e.ob.Get(e.ctx, tenantA, v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != outbox.StatePrepared {
+		t.Errorf("state after replaying a row that died prepared = %q, want prepared (it must not prepare twice)", row.State)
+	}
+	c = e.claimOne(v1)
+	if err := e.ob.MarkPrepared(e.ctx, c); !errors.Is(err, outbox.ErrLeaseLost) {
+		t.Errorf("preparing the replayed row again: err = %v, want ErrLeaseLost", err)
+	}
+	if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestAnyCauseCanBeRecorded: a cause comes from a sink's or a provider's response, so it can be
+// long, cut mid-rune, not UTF-8 at all, or hold a NUL. Postgres rejects such text, and a failure
+// that cannot be recorded is a row that loops at lease cadence with no backoff and no dead letter.
+func TestAnyCauseCanBeRecorded(t *testing.T) {
+	e := setup(t)
+	causes := map[string]string{
+		"long multi-byte": "a" + strings.Repeat("é", 600),
+		"invalid UTF-8":   "sink said \xff\xfe\xc3",
+		"NUL":             "bad\x00byte",
+		"long 4-byte":     "ab" + strings.Repeat("\U0001F600", 400),
+	}
+	for name, cause := range causes {
+		for _, how := range []string{"Fail", "MarkDead"} {
+			id := e.accept(tenantA, name+"/"+how, 1)
+			c := e.claimOne(id)
+			var err error
+			if how == "Fail" {
+				err = e.ob.Fail(e.ctx, c, outbox.Ladder{time.Hour}, cause)
+			} else {
+				err = e.ob.MarkDead(e.ctx, c, cause, cause)
+			}
+			if err != nil {
+				t.Errorf("%s with a %s cause: %v", how, name, err)
+				continue
+			}
+			row, err := e.ob.Get(e.ctx, tenantA, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for field, got := range map[string]string{"last_error": row.LastError, "dead_reason": row.DeadReason} {
+				if len(got) > 1000 || !utf8.ValidString(got) || strings.ContainsRune(got, 0) {
+					t.Errorf("%s with a %s cause: stored %s is %d bytes, valid UTF-8 %v", how, name, field, len(got), utf8.ValidString(got))
+				}
+			}
+			if row.LastError == "" {
+				t.Errorf("%s with a %s cause: nothing recorded", how, name)
+			}
+		}
 	}
 }

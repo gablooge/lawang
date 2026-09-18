@@ -24,6 +24,7 @@ type Outbox struct {
 	LastError     string
 	DeadReason    string
 	AcceptedAt    time.Time
+	PreparedAt    *time.Time
 	FinishedAt    *time.Time
 }
 

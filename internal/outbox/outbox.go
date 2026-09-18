@@ -2,15 +2,22 @@
 // dead-letter machinery.
 //
 // A row moves pending -> prepared -> delivered, or to dead. A claim is a lease on the HEAD of an
-// ordering key (the earliest unfinished row for one source entity), so every version of an entity
-// delivers in arrival order while different entities proceed in parallel.
+// ordering key (the unfinished row with the lowest seq for one source entity), so the versions of
+// an entity deliver one at a time, in queue order, while different entities proceed in parallel.
+//
+// Queue order is arrival order, with one exception: a replayed dead letter goes to the back. Every
+// writer that gives a row its place (Accept, Replay) first takes a transaction-scoped advisory
+// lock on the ordering key, so within one key a lower seq always commits first and a claim can
+// never see a row before the rows ahead of it.
 package outbox
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -70,7 +77,22 @@ type Row = outboxdb.GetRow
 
 // Accept stores a delivery for the tenant that owns the verified subscription. fresh is false for
 // a delivery this tenant already has, which makes a provider's re-send a no-op.
+//
+// Two Accepts for one ordering key run one after the other: the second waits until the first has
+// committed. See LockOrderingKey in queries.sql.
 func (o *Outbox) Accept(ctx context.Context, tenant tenancy.ID, d Delivery) (id string, fresh bool, err error) {
+	err = o.db.TenantTx(ctx, tenant, func(tx pgx.Tx) (err error) {
+		id, fresh, err = acceptIn(ctx, tx, tenant, d)
+		return err
+	})
+	if err != nil {
+		return "", false, err
+	}
+	return id, fresh, nil
+}
+
+// acceptIn is Accept inside a transaction already bound to tenant.
+func acceptIn(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, d Delivery) (id string, fresh bool, err error) {
 	if d.OrderingKey == "" {
 		return "", false, errors.New("outbox: empty ordering key")
 	}
@@ -78,17 +100,20 @@ func (o *Outbox) Accept(ctx context.Context, tenant tenancy.ID, d Delivery) (id 
 	if err != nil {
 		return "", false, err
 	}
+	q := outboxdb.New(tx)
+	// Before the INSERT, which is what assigns seq, and as a statement of its own.
+	err = q.LockOrderingKey(ctx, outboxdb.LockOrderingKeyParams{TenantID: tenant.String(), OrderingKey: d.OrderingKey})
+	if err != nil {
+		return "", false, fmt.Errorf("outbox: accept: %w", err)
+	}
 	id = ids.New()
-	err = o.db.TenantTx(ctx, tenant, func(tx pgx.Tx) error {
-		_, err := outboxdb.New(tx).Accept(ctx, outboxdb.AcceptParams{
-			ID:          id,
-			TenantID:    tenant.String(),
-			Provider:    d.Provider,
-			DeliveryID:  deliveryID,
-			OrderingKey: d.OrderingKey,
-			RawBody:     d.RawBody,
-		})
-		return err
+	_, err = q.Accept(ctx, outboxdb.AcceptParams{
+		ID:          id,
+		TenantID:    tenant.String(),
+		Provider:    d.Provider,
+		DeliveryID:  deliveryID,
+		OrderingKey: d.OrderingKey,
+		RawBody:     d.RawBody,
 	})
 	switch {
 	case errors.Is(err, pgx.ErrNoRows): // ON CONFLICT DO NOTHING returned nothing
@@ -184,11 +209,19 @@ func (o *Outbox) MarkDead(ctx context.Context, c Claimed, reason, cause string) 
 	})
 }
 
-// Replay makes a dead letter claimable again.
+// Replay makes a dead letter claimable again, at the BACK of its entity's queue: a newer version
+// may be in flight right now, and the replayed row must not be leased alongside it. It is
+// delivered after every version accepted before the replay, as a late arrival of an old version.
+// A row that died after it was prepared comes back prepared, and is not prepared again.
 func (o *Outbox) Replay(ctx context.Context, tenant tenancy.ID, id string) error {
 	var n int64
 	err := o.db.TenantTx(ctx, tenant, func(tx pgx.Tx) (err error) {
-		n, err = outboxdb.New(tx).Replay(ctx, id)
+		q := outboxdb.New(tx)
+		// Before the UPDATE, which is what assigns the new seq, and as a statement of its own.
+		if err := q.LockOrderingKeyOf(ctx, id); err != nil {
+			return err
+		}
+		n, err = q.Replay(ctx, id)
 		return err
 	})
 	if err != nil {
@@ -219,9 +252,18 @@ func (o *Outbox) transition(ctx context.Context, c Claimed, change func(*outboxd
 	return nil
 }
 
+// clip makes s storable and bounded: valid UTF-8 with no NUL (Postgres rejects both in text, and a
+// failure that cannot be recorded is never backed off or parked), and at most maxErrorLen bytes,
+// cut between runes.
 func clip(s string) string {
-	if len(s) > maxErrorLen {
-		return s[:maxErrorLen]
+	s = strings.ToValidUTF8(s, "�")
+	s = strings.ReplaceAll(s, "\x00", "�")
+	if len(s) <= maxErrorLen {
+		return s
 	}
-	return s
+	cut := maxErrorLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
