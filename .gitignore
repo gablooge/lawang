@@ -23,3 +23,6 @@ coverage.out
 .idea/
 .vscode/
 .DS_Store
+
+# Isolated worktrees the agents work in
+/.claude/worktrees/

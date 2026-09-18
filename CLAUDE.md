@@ -35,15 +35,23 @@ The cycle for one item:
    `pr-reviewer` again. At most **three rounds**. If the third still has blocking findings, or the
    two agents disagree on the same point twice, label it `review:needs-maintainer` and stop: that
    is a decision, not a bug.
-5. On `review:approved`, report to the maintainer and move to the next item. **Never merge a pull
+5. On `review:approved` with should-fix findings left: if one touches isolation, secrets,
+   ordering, or a test that survives a mutation, run `implementer` on it once more before moving
+   on (the label stays `review:approved`, no further review round is needed for a small, tested
+   fix). Notes that belong to a later item are copied onto that item's issue, so they are not lost.
+6. On `review:approved`, report to the maintainer and move to the next item. **Never merge a pull
    request or push to `main`**: merging is the maintainer's step.
 
 Both agents act as `gablooge` on GitHub, and GitHub does not allow an account to approve its own
 pull request. Reviews are therefore posted as comment reviews, and the `review:*` label is the
 verdict.
 
-Reviewers for different pull requests may run in parallel. Two implementers never run at once in
-the same working tree.
+Reviewers for different pull requests may run in parallel, and so may implementers, as long as
+each runs with `isolation: "worktree"` and touches only its own branch. While stacked pull requests
+are being reviewed or fixed at the same time, the orchestrator does the merge-forward itself, in
+stack order, once the fixes below a branch are final: merge the parent in, run `make check`, push.
+Finished agents leave worktrees under `.claude/worktrees/`; remove them with `git worktree remove`
+when their agent is done.
 
 ## Rules for the code
 

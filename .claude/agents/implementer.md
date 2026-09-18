@@ -50,16 +50,35 @@ You are given a pull request number that carries the `review:changes-requested` 
 4. `make check` green, commit (no `Closes` line needed again), push. Never force-push and never
    rewrite history on a branch under review: the reviewer reads the new commits.
 5. If other pull requests are stacked on this branch, merge this branch forward into each of them
-   in order (`git checkout child && git merge parent`), run `make check`, and push.
+   in order (`git checkout child && git merge parent`), run `make check`, and push. **Skip this
+   step when the orchestrator says it will merge forward itself**, which it does whenever the
+   stacked pull requests are being reviewed or fixed at the same time.
 6. Reply to each inline comment with what you did and the commit hash:
    `gh api repos/gablooge/sluiceway/pulls/NN/comments/COMMENT_ID/replies -f body=...`
-7. Remove the `review:changes-requested` label. Your final message says the pull request is ready
-   for re-review.
+7. If the design changed, bring the pull request description up to date with
+   `gh pr edit NN --body-file`. A description that still describes the first submission misleads
+   the maintainer who merges it.
+8. Remove the `review:changes-requested` label. Your final message says the pull request is ready
+   for re-review. (When you are fixing should-fix findings on a pull request that is already
+   `review:approved`, leave that label alone.)
+
+## Working in a worktree
+
+You usually run in an isolated git worktree while other agents run in theirs.
+
+- If `git checkout <branch>` is refused because the branch is checked out in another worktree,
+  work on a detached HEAD at `origin/<branch>` and push with
+  `git push origin HEAD:refs/heads/<branch>`.
+- Keep temporary files (mutation helpers, probes, backups) inside your own worktree and delete
+  them before you commit. The session scratchpad directory is shared with other running agents,
+  who may overwrite what you put there.
+- A test that is expected to fail must fail fast. If a mutation makes a test hang instead, that is
+  a defect in the test: give it a deadline and release whatever it holds in `t.Cleanup`.
 
 ## Rules
 
 - Never merge a pull request, never push to `main`, never close an issue by hand.
-- Never edit the reviewer's comments or the `review:*` labels other than as step 7 says.
+- Never edit the reviewer's comments or the `review:*` labels other than as step 8 says.
 - Standard library first. New dependencies stay close to architecture section 12.
 - Never log or return token material, secrets, or a database URL.
 - Fail closed: a missing tenant, secret, key or identity is a refusal, never a default.
