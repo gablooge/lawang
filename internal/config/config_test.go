@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -64,15 +66,148 @@ func TestLoadUnknownEnvironmentIsAnError(t *testing.T) {
 	}
 }
 
-func TestLoadDatabaseURLErrorsNeverEchoTheValue(t *testing.T) {
-	_, err := Load(env(map[string]string{
-		"SLUICEWAY_DATABASE_URL": "mysql://app:hunter2@db:3306/sluiceway",
-	}))
-	if err == nil {
-		t.Fatal("Load accepted a non-Postgres URL")
+// secretFragments are the distinctive pieces of the URLs below. None may appear in any error.
+var secretFragments = []string{"hunter2", "leakuser", "leakhost", "leakdb"}
+
+func assertNoSecret(t *testing.T, what, got string) {
+	t.Helper()
+	for _, frag := range secretFragments {
+		if strings.Contains(got, frag) {
+			t.Errorf("%s leaks %q: %s", what, frag, got)
+		}
 	}
-	if strings.Contains(err.Error(), "hunter2") {
-		t.Errorf("error leaks the password: %v", err)
+}
+
+func TestLoadDatabaseURLErrorsNeverEchoTheValue(t *testing.T) {
+	// One case per return in checkDatabaseURL. The unparseable one matters most: url.Parse quotes
+	// its whole input in the error, and a password with a bare "%" is the ordinary way a Postgres
+	// URL fails to parse.
+	for name, raw := range map[string]string{
+		"unparseable":  "postgres://leakuser:hunter2%zz@leakhost:5432/leakdb",
+		"wrong scheme": "mysql://leakuser:hunter2@leakhost:3306/leakdb",
+		"missing host": "postgres://leakuser:hunter2@/leakdb",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(env(map[string]string{"SLUICEWAY_DATABASE_URL": raw}))
+			if err == nil {
+				t.Fatal("Load accepted a bad database URL")
+			}
+			if !strings.Contains(err.Error(), "SLUICEWAY_DATABASE_URL") {
+				t.Errorf("error does not name the variable: %v", err)
+			}
+			assertNoSecret(t, "error", err.Error())
+		})
+	}
+}
+
+func TestLoadErrorsNeverEchoAnyValue(t *testing.T) {
+	// A manifest with two entries swapped puts the database URL into some other variable. Load
+	// cannot know which, so no variable's error may repeat what it received.
+	const secret = "postgres://leakuser:hunter2@leakhost:5432/leakdb"
+	validated := []string{
+		"SLUICEWAY_ENV",
+		"SLUICEWAY_LISTEN_ADDR",
+		"SLUICEWAY_LOG_LEVEL",
+		"SLUICEWAY_LOG_FORMAT",
+	}
+
+	for _, name := range validated {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(env(map[string]string{
+				"SLUICEWAY_DATABASE_URL": "postgres://app@db:5432/sluiceway",
+				name:                     secret,
+			}))
+			if err == nil {
+				t.Fatalf("Load accepted a database URL as %s", name)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("error does not name %s: %v", name, err)
+			}
+			assertNoSecret(t, "error", err.Error())
+		})
+	}
+
+	t.Run("all at once", func(t *testing.T) {
+		all := map[string]string{"SLUICEWAY_DATABASE_URL": "mysql://leakuser:hunter2@leakhost:3306/leakdb"}
+		for _, name := range validated {
+			all[name] = secret
+		}
+		_, err := Load(env(all))
+		if err == nil {
+			t.Fatal("Load accepted an invalid environment")
+		}
+		assertNoSecret(t, "joined error", err.Error())
+	})
+}
+
+func TestLoadRefusesABadListenAddress(t *testing.T) {
+	for _, addr := range []string{
+		// The wrong shape: no colon, or too many.
+		"8080", "localhost", "http://localhost:8080",
+		// Exactly one colon, so net.SplitHostPort alone is satisfied. Each of these used to reach
+		// the listener, whose error then quoted it: a user:password pair in the wrong variable,
+		// and a database URL with no password and no port.
+		"leakuser:hunter2",
+		"postgres://leakuser@leakhost/leakdb",
+		// A port that is not a number from 0 to 65535. Service names are refused on purpose.
+		"leakhost:99999", "leakhost:65536", ":http", "localhost:http", "leakhost:",
+		":-1", ":+80", ": 80", ":80 ", ":0x50", ":8_0",
+	} {
+		_, err := Load(env(map[string]string{
+			"SLUICEWAY_DATABASE_URL": "postgres://app@db:5432/sluiceway",
+			"SLUICEWAY_LISTEN_ADDR":  addr,
+		}))
+		if err == nil || !strings.Contains(err.Error(), "SLUICEWAY_LISTEN_ADDR") {
+			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: err = %v, want a SLUICEWAY_LISTEN_ADDR error", addr, err)
+			continue
+		}
+		assertNoSecret(t, "error", err.Error())
+		// The port half is just as likely to be the pasted secret as the host half.
+		if _, port, ok := strings.Cut(addr, ":"); ok && len(port) > 1 && strings.Contains(err.Error(), port) {
+			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: error repeats the port %q: %v", addr, port, err)
+		}
+	}
+}
+
+func TestLoadAcceptsEveryOrdinaryListenAddress(t *testing.T) {
+	// The numeric port rule must not cost any address a deployment would really use.
+	for _, addr := range []string{
+		":8080", ":0", ":65535", "[::1]:8080", "localhost:8080", "0.0.0.0:0", "[::1%lo0]:0",
+		"127.0.0.1:9000", "[::]:8080",
+	} {
+		cfg, err := Load(env(map[string]string{
+			"SLUICEWAY_DATABASE_URL": "postgres://app@db:5432/sluiceway",
+			"SLUICEWAY_LISTEN_ADDR":  addr,
+		}))
+		if err != nil {
+			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: %v", addr, err)
+			continue
+		}
+		if cfg.ListenAddr != addr {
+			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: ListenAddr = %q", addr, cfg.ListenAddr)
+		}
+	}
+}
+
+func TestConfigNeverPrintsTheDatabaseURL(t *testing.T) {
+	cfg, err := Load(env(map[string]string{
+		"SLUICEWAY_DATABASE_URL": "postgres://leakuser:hunter2@leakhost:5432/leakdb",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	for _, verb := range []string{"%v", "%+v", "%s", "%#v"} {
+		assertNoSecret(t, verb, fmt.Sprintf(verb, cfg))
+		assertNoSecret(t, verb+" of a pointer", fmt.Sprintf(verb, &cfg))
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	logger.Info("config", "cfg", cfg, "ptr", &cfg)
+	assertNoSecret(t, "slog output", buf.String())
+	if !strings.Contains(buf.String(), `"listen_addr":":8080"`) {
+		t.Errorf("slog output lost the fields that are safe to print: %s", buf.String())
 	}
 }
 

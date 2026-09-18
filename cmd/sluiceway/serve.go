@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"syscall"
 	"time"
 
 	"github.com/gablooge/sluiceway/internal/appversion"
@@ -20,9 +22,45 @@ func serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)
 	if err != nil {
-		return err
+		return listenError(ctx, err)
 	}
 	return serveOn(ctx, ln, logger)
+}
+
+// listenError turns a listen failure into an error that is safe to log.
+//
+// The error from net quotes the address it was given ("listen tcp 10.0.0.5:8080: bind: ...",
+// "lookup some-host: no such host"), and config.Load only vouches for the port half of that
+// address. A value pasted into the wrong variable can still sit in the host half. So the original
+// error is never returned, wrapped or formatted: only the parts of it that cannot carry the address
+// are kept, which is enough to tell "in use" from "not permitted" from "does not resolve".
+func listenError(ctx context.Context, err error) error {
+	const prefix = "SLUICEWAY_LISTEN_ADDR: cannot listen"
+
+	// An errno's text comes from the operating system's table ("address already in use",
+	// "permission denied", "can't assign requested address"), never from the input. Wrapping it
+	// alone keeps errors.Is(err, syscall.EADDRINUSE) working for callers.
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return fmt.Errorf("%s: %w", prefix, errno)
+	}
+	// Cancelled or out of time before the socket was bound, for example during a slow lookup.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("%s: %w", prefix, ctxErr)
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		// DNSError.Error() quotes the name, so only its classification is used.
+		switch {
+		case dnsErr.IsNotFound:
+			return errors.New(prefix + ": the host name does not resolve")
+		case dnsErr.IsTimeout:
+			return errors.New(prefix + ": the host name lookup timed out")
+		default:
+			return errors.New(prefix + ": the host name lookup failed")
+		}
+	}
+	return errors.New(prefix + ": the address is not valid for a TCP listener")
 }
 
 func serveOn(ctx context.Context, ln net.Listener, logger *slog.Logger) error {
@@ -48,6 +86,8 @@ func serveOn(ctx context.Context, ln net.Listener, logger *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
+		// The grace ran out with connections still open. Drop them so nothing outlives serveOn.
+		_ = srv.Close()
 		return err
 	}
 	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
