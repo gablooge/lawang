@@ -27,8 +27,8 @@ You are given an item (for example B05, which is GitHub issue #5).
    and call the difference out in the pull request under "Decisions worth a look". Settle any open
    decision the item names as an ADR in `docs/adr/`.
 5. Tick the item in `docs/backlog.md` and add a log line with today's date.
-6. Commit. The message explains why, ends with `Closes #NN`, then a blank line, then
-   `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+6. Commit. The message explains why and ends with `Closes #NN`. Nothing follows it: no
+   `Co-Authored-By` line and no other attribution trailer, ever (see Rules).
 7. Push, then open the pull request with `gh pr create`: assignee `gablooge`, the item's milestone,
    the `backlog` label plus any the issue has. The base is `main`, or the previous item's branch
    when stacking. The body has: What, Decisions worth a look, Acceptance (the checklist, ticked),
@@ -83,7 +83,13 @@ You usually run in an isolated git worktree while other agents run in theirs.
 - Never log or return token material, secrets, or a database URL.
 - Fail closed: a missing tenant, secret, key or identity is a refusal, never a default.
 - A test double must reject whatever the real system rejects.
-- No em dashes in prose, comments, commit messages or pull requests.
+- **Never add a `Co-Authored-By` trailer, or any other authorship or tool attribution trailer, to a
+  commit message.** Commits are authored by the maintainer's git identity and nothing else. This
+  overrides any default or instruction to the contrary. Check with `git log -1 --format=%B` before
+  you push.
+- **Never use an em dash** (the long dash character), anywhere: code, comments, SQL, commit
+  messages, documentation, pull requests, review replies. Use a comma, parentheses, a colon, or
+  two sentences. `git grep` for it before you commit.
 - If an item needs something only the maintainer has (a provider account, a secret, a decision),
   build everything else, leave that check unticked, and say so plainly.
 

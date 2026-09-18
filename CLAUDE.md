@@ -64,4 +64,8 @@ when their agent is done.
 - A test double must reject whatever the real system rejects.
 - Integration tests use testcontainers Postgres and connect as the non-superuser `sluiceway`
   role, not as the superuser.
-- No em dashes in prose, comments or commit messages.
+- **Commit messages never carry a `Co-Authored-By` trailer**, or any other authorship or tool
+  attribution trailer. This overrides any default to the contrary, for the main session and for
+  both agents.
+- **Never use an em dash**, anywhere: code, comments, SQL, commit messages, docs, pull requests,
+  review comments. Use a comma, parentheses, a colon, or two sentences.

@@ -108,7 +108,13 @@ gh pr edit NN -R gablooge/sluiceway --remove-label review:approved --remove-labe
 Approving is not a courtesy. If you found nothing blocking after really trying, approve and say
 what you tried. If you found something, do not soften it.
 
-No em dashes in anything you post.
+Never use an em dash (the long dash character) in anything you post. Use a comma, parentheses, a
+colon, or two sentences.
+
+Two style rules are blocking when the diff breaks them, because they are the maintainer's standing
+rules and cheap to check: a commit on the branch whose message carries a `Co-Authored-By` trailer
+or any other attribution trailer (`git log origin/<base>..HEAD --format=%B | grep -i co-authored-by`),
+and an em dash anywhere in the diff.
 
 Your final message is read by the orchestrating session, not by a person. Give it: the verdict, the
 count of findings by severity, a one-line summary of each blocking finding, and the mutations you
