@@ -4,7 +4,11 @@
 -- so replaying a dead letter is an UPDATE.
 CREATE TABLE outbox (
   id              text        PRIMARY KEY,                       -- ULID
-  seq             bigint      NOT NULL GENERATED ALWAYS AS IDENTITY, -- arrival order
+  -- The place in the queue: arrival order, except that a replayed dead letter takes a fresh value
+  -- and so goes to the back. Every statement that assigns one first takes the advisory lock of the
+  -- row's ordering key (LockOrderingKey in internal/outbox/queries.sql), so that within one key a
+  -- lower seq always commits first.
+  seq             bigint      NOT NULL GENERATED ALWAYS AS IDENTITY,
   tenant_id       tenant_id   NOT NULL,
   provider        text        NOT NULL CHECK (provider <> ''),
   -- blake3(provider, raw_body). Unique per tenant, not globally: two tenants may connect the same
@@ -24,6 +28,9 @@ CREATE TABLE outbox (
   last_error      text        NOT NULL DEFAULT '',
   dead_reason     text        NOT NULL DEFAULT '',
   accepted_at     timestamptz NOT NULL DEFAULT now(),
+  -- Set once the ledger rows and prepared records are committed. It outlives the state, so that a
+  -- replayed dead letter knows whether it goes back to pending or to prepared.
+  prepared_at     timestamptz,
   finished_at     timestamptz,
   UNIQUE (tenant_id, delivery_id),
   CHECK ((lease_until IS NULL) = (lease_token IS NULL))
@@ -43,10 +50,11 @@ CREATE POLICY tenant_isolation ON outbox
 -- The worker role claims across tenants, because it cannot know which tenants have work. It sees
 -- only what a scheduler needs, and may change only the lease. It can never read a payload: the
 -- work itself happens afterwards, as the application role bound to the claimed row's own tenant.
+-- It writes lease_token but cannot read it back: the token guards every transition.
 CREATE POLICY worker_claim_select ON outbox FOR SELECT TO sluiceway_worker USING (true);
 CREATE POLICY worker_claim_update ON outbox FOR UPDATE TO sluiceway_worker USING (true) WITH CHECK (true);
 
-GRANT SELECT (id, seq, tenant_id, ordering_key, state, attempts, next_attempt_at, lease_until, lease_token)
+GRANT SELECT (id, seq, tenant_id, ordering_key, state, attempts, next_attempt_at, lease_until)
   ON outbox TO sluiceway_worker;
 GRANT UPDATE (attempts, lease_until, lease_token) ON outbox TO sluiceway_worker;
 

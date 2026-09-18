@@ -401,6 +401,40 @@ func TestOpenRefusesADatabaseThatIsNotBootstrapped(t *testing.T) {
 	}
 }
 
+// A schema called "sluiceway" that someone else created is not the one the bootstrap makes. The
+// script's CREATE SCHEMA IF NOT EXISTS used to accept it silently, Open passed, and the first sign
+// of trouble was Migrate failing with "no schema has been selected to create in".
+func TestASchemaOwnedByAnotherRoleIsRefused(t *testing.T) {
+	testdb.New(t) // the roles exist cluster-wide once any database is bootstrapped
+	raw := testdb.NewRaw(t)
+	testdb.Exec(t, raw.AdminURL, "CREATE SCHEMA sluiceway")
+
+	db, err := store.Open(testCtx(t), raw.URL)
+	if db != nil {
+		db.Close()
+	}
+	if !errors.Is(err, store.ErrSchemaNotOwned) {
+		t.Errorf("Open: err = %v, want ErrSchemaNotOwned", err)
+	}
+
+	// The script says so as well, instead of leaving the schema as it found it and reporting
+	// success.
+	var pgErr *pgconn.PgError
+	err = testdb.TryBootstrap(t, raw.AdminURL)
+	if !errors.As(err, &pgErr) || pgErr.Code != "55000" || !strings.Contains(pgErr.Message, `owned by "postgres"`) {
+		t.Fatalf("bootstrap over a foreign schema: err = %v, want a refusal (55000) that names the owner", err)
+	}
+
+	// Handing the schema over is the way out, and then both are content.
+	testdb.Exec(t, raw.AdminURL, "ALTER SCHEMA sluiceway OWNER TO sluiceway")
+	testdb.Bootstrap(t, raw.AdminURL)
+	db, err = store.Open(testCtx(t), raw.URL)
+	if err != nil {
+		t.Fatalf("Open once the schema belongs to the application role: %v", err)
+	}
+	db.Close()
+}
+
 func TestOpenNeverEchoesTheURL(t *testing.T) {
 	_, err := store.Open(testCtx(t), "postgres://app:hunter2@db:5432/x?pool_max_conns=banana")
 	if err == nil {
@@ -413,7 +447,7 @@ func TestOpenNeverEchoesTheURL(t *testing.T) {
 
 func TestBootstrapIsRerunnable(t *testing.T) {
 	tdb := testdb.New(t) // first run
-	testdb.Exec(t, tdb.AdminURL, migrations.Bootstrap)
+	testdb.Bootstrap(t, tdb.AdminURL)
 	db, err := store.Open(testCtx(t), tdb.URL)
 	if err != nil {
 		t.Fatalf("Open after a second bootstrap: %v", err)
@@ -441,7 +475,10 @@ func TestTenantIDDomainRejectsMalformedIDs(t *testing.T) {
 }
 
 // TestEveryTableForcesRowLevelSecurity guards every future migration: a new table either forces
-// row-level security or is named here with a reason.
+// row-level security or is named here with a reason. A relation that holds rows but cannot have
+// row-level security at all (a materialized view, a foreign table) is refused outright unless it
+// is named here: a materialized view over a tenant table would hand every tenant's rows to
+// whoever may read it.
 func TestEveryTableForcesRowLevelSecurity(t *testing.T) {
 	notTenantScoped := map[string]string{
 		"goose_db_version": "migration bookkeeping, no tenant data",
@@ -450,25 +487,33 @@ func TestEveryTableForcesRowLevelSecurity(t *testing.T) {
 	db := open(t, "")
 	ctx := testCtx(t)
 	err := db.Tx(ctx, func(tx pgx.Tx) error {
+		// Every kind of relation that stores or serves rows of its own: tables, partitioned
+		// tables, materialized views, foreign tables. Views are left out: they hold nothing, and
+		// one owned by the application role reads its tables under that role's forced policies.
 		rows, err := tx.Query(ctx, `
-			SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+			SELECT c.relname, c.relkind::text, c.relrowsecurity, c.relforcerowsecurity,
 			       (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid)
 			  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-			 WHERE n.nspname = $1 AND c.relkind IN ('r', 'p')`, store.Schema)
+			 WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'm', 'f')`, store.Schema)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		seen := 0
 		for rows.Next() {
-			var name string
+			var name, kind string
 			var enabled, forced bool
 			var policies int
-			if err := rows.Scan(&name, &enabled, &forced, &policies); err != nil {
+			if err := rows.Scan(&name, &kind, &enabled, &forced, &policies); err != nil {
 				return err
 			}
 			seen++
 			if _, ok := notTenantScoped[name]; ok {
+				continue
+			}
+			if kind != "r" && kind != "p" {
+				t.Errorf("%s (relkind %q) holds rows but cannot have row-level security: keep tenant data in tables, or name it in notTenantScoped with a reason",
+					name, kind)
 				continue
 			}
 			if !enabled || !forced || policies == 0 {

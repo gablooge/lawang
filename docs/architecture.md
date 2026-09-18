@@ -77,8 +77,9 @@ else including poison, because providers retry non-2xx responses and a retry sto
 
 ### 3.2 Drain path (inside `worker`)
 
-1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so all
-   versions of one entity deliver in arrival order while different entities proceed in parallel.
+1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so the
+   versions of one entity deliver one at a time, in queue order, while different entities proceed
+   in parallel.
 2. Re-bind row-level security to the row's own tenant before touching anything.
 3. Parse the stored raw body into changes. One delivery can produce several records (a comment and
    its parent task, for example).
@@ -94,12 +95,37 @@ else including poison, because providers retry non-2xx responses and a retry sto
 claim is a **lease** (`lease_until` plus a `lease_token`), not a held lock, because the work spans
 two transactions and a sink call; a worker that dies lets its lease run out and another takes
 over. Every transition is guarded by the lease token, so a slow worker that comes back after a
-takeover changes nothing. The head of an ordering key is its earliest row that is `pending` or
-`prepared`: while the head is leased or waiting out a backoff, nothing behind it is claimable. A
-`dead` row is finished and does not hold back newer versions of its entity.
+takeover changes nothing. The head of an ordering key is its row with the lowest `seq` that is
+`pending` or `prepared`: while the head is leased or waiting out a backoff, nothing behind it is
+claimable, so two versions of one entity are never in flight together. A `dead` row is finished
+and does not hold back newer versions of its entity.
+
+**Queue order.** `seq` is assigned when a row is inserted, not when its transaction commits. Left
+alone, version 1 could be inserted first and commit last, and a claim in between would lease
+version 2 and then version 1 alongside it. So every statement that assigns a `seq` first takes a
+transaction-scoped advisory lock on a hash of (tenant, ordering key): within one key, accepts
+commit in `seq` order, and a second accept of the same entity waits for the first to commit.
+Different entities do not wait for each other (two keys that hash alike do, harmlessly). A
+transaction that accepts several deliveries holds several of these locks until it commits, so it
+should accept in a stable key order or be ready to retry a deadlock.
+
+**Replay goes to the back.** Replaying a dead letter gives the row a fresh `seq`, under the same
+lock, as if it had just been accepted. While it was dead, newer versions of its entity were free
+to move, and one may be in flight at the moment of the replay: a row that kept its old `seq`
+would become the head again and be leased alongside it. The replayed version is therefore
+delivered after every version accepted before the replay, and the forward-only supersede chain
+treats it like any other late arrival of an old version. A row that died after step 6 remembers
+it (`prepared_at`) and is replayed as `prepared`, so it is delivered again but never prepared
+again.
+
+The claim picks heads on its statement snapshot and leases each row on its latest version, so it
+re-checks on the locked row everything that can change in between: the state, the lease and the
+`seq`. As a second line of defense, a key is not eligible while any other unfinished row of it
+holds a live lease.
 
 The claim runs as `sluiceway_worker`, which is granted only the scheduling columns and may update
-only the lease. It cannot read `raw_body`. Payloads are read afterwards, as the application role
+only the lease. It cannot read `raw_body`, and it writes `lease_token` without being able to read
+one back. Payloads are read afterwards, as the application role
 bound to the claimed row's tenant.
 
 ### 3.3 Reconciliation
@@ -146,12 +172,37 @@ The resolver and worker roles are granted with `INHERIT FALSE` and entered expli
 
 **Bootstrap and preflight.** The application role cannot create roles, so an administrator applies
 a one-time bootstrap script (`sluiceway migrate bootstrap` prints it) that creates the three roles
-and a `sluiceway` schema owned by the application role. Migrations then run as the application
-role itself. Every connection sets `search_path` to that schema explicitly, because the default
-`"$user"` entry follows `SET ROLE`. On every start, `serve`, `worker` and `migrate` run a preflight
-and refuse to continue if the login is `SUPERUSER` or `BYPASSRLS` (row-level security would
-silently not apply), if a helper role is, if the memberships are not `INHERIT FALSE`, or if the
-server is older than Postgres 16. See [ADR 2](adr/0002-migrations-goose.md).
+and a `sluiceway` schema owned by the application role. The administrator is a superuser, or a
+non-superuser with `CREATEROLE` and `CREATE` on the database, which is what managed Postgres
+offers. The script is a single statement, so it applies completely or not at all, and it is safe
+to run again, also as a different administrator. It leaves the administrator's own role
+memberships exactly as it found them, and it refuses a database where a `sluiceway` schema already
+exists under another owner. Migrations then run as the application role itself. Every connection sets `search_path` to that schema explicitly, because the default
+`"$user"` entry follows `SET ROLE`.
+
+On every start, `serve`, `worker` and `migrate` run a preflight and refuse to continue if:
+
+- the login is `SUPERUSER` or `BYPASSRLS` (row-level security would silently not apply), or a
+  helper role is;
+- the login **inherits** a helper role, by any path. The preflight does not read membership rows,
+  because there is one per grantor and inheritance also arrives through intermediate roles. It asks
+  Postgres the effective question, `pg_has_role(helper, 'USAGE')`, which must be false: otherwise
+  a plain transaction with no tenant bound would run under the helper role's cross-tenant
+  policies;
+- the login holds **`ADMIN OPTION`** on a helper role, by any path, inherited or not
+  (`pg_has_role(helper, 'MEMBER WITH ADMIN OPTION')` must be false). That is the one membership
+  state the application role could turn into inheritance by itself, by granting the helper role
+  to itself `WITH INHERIT TRUE` while the process runs;
+- the login cannot `SET ROLE` to a helper role (`pg_has_role(helper, 'SET')` must be true);
+- the schema is missing (the bootstrap was not applied), or exists but is not owned by the login
+  role (it is not the one the bootstrap creates, and migrations would fail in it with a misleading
+  error), or the server is older than Postgres 16.
+
+The preflight runs once per process, at start. It guards against misconfiguration, not against an
+administrator: a membership or attribute changed while the process runs is not seen until the next
+start, and anyone able to make that change could read the tables directly anyway.
+
+See [ADR 2](adr/0002-migrations-goose.md).
 
 **Tenant ids** are 1 to 64 characters of `A-Z a-z 0-9 _ -`, enforced in Go and by a `tenant_id`
 domain that every tenant column uses. The policy compares against `current_tenant()`, which maps
