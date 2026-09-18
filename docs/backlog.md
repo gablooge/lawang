@@ -58,7 +58,7 @@ project's whole claim.
 
 ## M0 · Foundations
 
-- [ ] **B01 Skeleton, config, CI.** `cmd/sluiceway` with `serve`, `worker`, `migrate`, `version`
+- [x] **B01 Skeleton, config, CI.** `cmd/sluiceway` with `serve`, `worker`, `migrate`, `version`
   (stubs where the role does not exist yet); `internal/config` from the environment with
   fail-closed defaults; `Makefile` with `check`; `.golangci.yml`; GitHub Actions running vet, lint
   and `go test -race`.
@@ -231,5 +231,5 @@ One line per finished item: date, item, anything worth remembering.
 
 | Date | Item | Notes |
 |---|---|---|
-| 2026-09-18 | B01 (open) | Code done and `make check` green locally. Box stays unticked until the first push shows CI green. The build-info package is `internal/appversion`, because revive rejects package names that shadow the standard library (`version`, `buildinfo`). |
+| 2026-09-19 | B01 | Code written 2026-09-18, first CI run green on PR #30 the next day. The build-info package is `internal/appversion`, because revive rejects package names that shadow the standard library (`version`, `buildinfo`). |
 | 2026-09-18 | B02 | All 14 golden vectors cross-checked against the Python `blake3` package, so the recipes are reproducible outside Go. `RecordID` and `DeliveryID` return an error for an empty part or a part containing `0x1F`; architecture section 5 updated to say so. |
