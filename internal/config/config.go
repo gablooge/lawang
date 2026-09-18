@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -93,9 +94,8 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 
 	if v := getenv("SLUICEWAY_LISTEN_ADDR"); v != "" {
-		// Checked here because the listener's own error quotes the address it was given.
-		if _, _, err := net.SplitHostPort(v); err != nil {
-			errs = append(errs, errors.New("SLUICEWAY_LISTEN_ADDR: must be host:port or :port"))
+		if err := checkListenAddr(v); err != nil {
+			errs = append(errs, fmt.Errorf("SLUICEWAY_LISTEN_ADDR: %w", err))
 		} else {
 			cfg.ListenAddr = v
 		}
@@ -124,6 +124,30 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, errors.Join(errs...)
 	}
 	return cfg, nil
+}
+
+// checkListenAddr requires host:port or :port with a numeric port. It is checked in Load because
+// the listener's own error quotes the address it was given, and that error ends up in the log.
+//
+// net.SplitHostPort only checks the shape, so on its own it lets through anything with exactly one
+// colon: a user:password pair, or a database URL with no password and no port. Either would then
+// be looked up as a service name and quoted by the lookup error. Requiring a numeric port closes
+// that, and deliberately stops accepting service names such as ":http", which nothing here needs.
+//
+// The host half is not checked: "localhost" is legitimate, and so is any name the deployment
+// resolves. serve keeps the listener's error text out of the log for that half.
+func checkListenAddr(raw string) error {
+	_, port, err := net.SplitHostPort(raw)
+	if err != nil {
+		// Not wrapped: the net.AddrError quotes its input.
+		return errors.New("must be host:port or :port")
+	}
+	// ParseUint takes ASCII digits only (no sign, no spaces), and 16 bits is exactly 0 to 65535.
+	// Its error quotes the input too, so it is not wrapped either.
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return errors.New("port must be a number from 0 to 65535 (service names are not accepted)")
+	}
+	return nil
 }
 
 // checkDatabaseURL rejects anything that is not a Postgres URL. The error never echoes the value,

@@ -141,13 +141,50 @@ func TestLoadErrorsNeverEchoAnyValue(t *testing.T) {
 }
 
 func TestLoadRefusesABadListenAddress(t *testing.T) {
-	for _, addr := range []string{"8080", "localhost", "http://localhost:8080"} {
+	for _, addr := range []string{
+		// The wrong shape: no colon, or too many.
+		"8080", "localhost", "http://localhost:8080",
+		// Exactly one colon, so net.SplitHostPort alone is satisfied. Each of these used to reach
+		// the listener, whose error then quoted it: a user:password pair in the wrong variable,
+		// and a database URL with no password and no port.
+		"leakuser:hunter2",
+		"postgres://leakuser@leakhost/leakdb",
+		// A port that is not a number from 0 to 65535. Service names are refused on purpose.
+		"leakhost:99999", "leakhost:65536", ":http", "localhost:http", "leakhost:",
+		":-1", ":+80", ": 80", ":80 ", ":0x50", ":8_0",
+	} {
 		_, err := Load(env(map[string]string{
 			"SLUICEWAY_DATABASE_URL": "postgres://app@db:5432/sluiceway",
 			"SLUICEWAY_LISTEN_ADDR":  addr,
 		}))
 		if err == nil || !strings.Contains(err.Error(), "SLUICEWAY_LISTEN_ADDR") {
 			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: err = %v, want a SLUICEWAY_LISTEN_ADDR error", addr, err)
+			continue
+		}
+		assertNoSecret(t, "error", err.Error())
+		// The port half is just as likely to be the pasted secret as the host half.
+		if _, port, ok := strings.Cut(addr, ":"); ok && len(port) > 1 && strings.Contains(err.Error(), port) {
+			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: error repeats the port %q: %v", addr, port, err)
+		}
+	}
+}
+
+func TestLoadAcceptsEveryOrdinaryListenAddress(t *testing.T) {
+	// The numeric port rule must not cost any address a deployment would really use.
+	for _, addr := range []string{
+		":8080", ":0", ":65535", "[::1]:8080", "localhost:8080", "0.0.0.0:0", "[::1%lo0]:0",
+		"127.0.0.1:9000", "[::]:8080",
+	} {
+		cfg, err := Load(env(map[string]string{
+			"SLUICEWAY_DATABASE_URL": "postgres://app@db:5432/sluiceway",
+			"SLUICEWAY_LISTEN_ADDR":  addr,
+		}))
+		if err != nil {
+			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: %v", addr, err)
+			continue
+		}
+		if cfg.ListenAddr != addr {
+			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: ListenAddr = %q", addr, cfg.ListenAddr)
 		}
 	}
 }
