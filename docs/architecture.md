@@ -132,6 +132,20 @@ on a transaction-local setting. If the setting is missing, a query returns zero 
 The resolver and worker roles are granted with `INHERIT FALSE` and entered explicitly with
 `SET LOCAL ROLE`, so the application role does not silently pick up their wider policies.
 
+**Bootstrap and preflight.** The application role cannot create roles, so an administrator applies
+a one-time bootstrap script (`sluiceway migrate bootstrap` prints it) that creates the three roles
+and a `sluiceway` schema owned by the application role. Migrations then run as the application
+role itself. Every connection sets `search_path` to that schema explicitly, because the default
+`"$user"` entry follows `SET ROLE`. On every start, `serve`, `worker` and `migrate` run a preflight
+and refuse to continue if the login is `SUPERUSER` or `BYPASSRLS` (row-level security would
+silently not apply), if a helper role is, if the memberships are not `INHERIT FALSE`, or if the
+server is older than Postgres 16. See [ADR 2](adr/0002-migrations-goose.md).
+
+**Tenant ids** are 1 to 64 characters of `A-Z a-z 0-9 _ -`, enforced in Go and by a `tenant_id`
+domain that every tenant column uses. The policy compares against `current_tenant()`, which maps
+both an unset setting and the empty string to `NULL`: a transaction-local setting reads back as
+`''` on a pooled connection after its transaction ends, and neither may match a row.
+
 ---
 
 ## 5. Idempotency
@@ -276,7 +290,8 @@ internal/
   config/             environment config, fail-closed defaults
   ids/                ULIDs and the blake3 key recipes, golden-tested
   tenancy/            tenant context and RLS binding
-  store/              pgx pool, transaction helpers, embedded migrations
+  store/              pgx pool, preflight, transaction helpers, migrate
+  testdb/             a real Postgres for integration tests, as the application role
   outbox/             accept insert, FIFO-head claim, retry ladder, dead letters
   ingress/            the /ingress/{provider} HTTP edge
   hub/                handshake, verify, resolve owner, accept
@@ -289,7 +304,7 @@ internal/
   sink/               Sink interface and implementations
   provider/           Provider interfaces and the registry
     clickup/  slack/  teams/  outlook/  hubspot/
-migrations/           SQL, embedded into the binary
+migrations/           SQL, embedded into the binary; bootstrap/ is the one-time admin script
 docs/
 ```
 
@@ -373,6 +388,7 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 |---|---|
 | Postgres driver | `github.com/jackc/pgx/v5` |
 | Migrations | `github.com/pressly/goose/v3`, SQL files embedded in the binary |
+| Queries | `sqlc` generating `pgx/v5` code, checked in ([ADR 1](adr/0001-queries-sqlc.md)) |
 | Hashing | `github.com/zeebo/blake3` |
 | IDs | `github.com/oklog/ulid/v2` |
 | HTTP | standard library `net/http` with method and path patterns |

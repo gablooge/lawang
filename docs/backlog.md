@@ -69,7 +69,7 @@ project's whole claim.
   against them.
   **Done when:** golden tests pass; a test proves `("ab","c")` and `("a","bc")` differ; a test
   proves the same change under two tenants yields two ids.
-- [ ] **B03 Store, migrations, roles, RLS.** pgx pool and transaction helpers; goose migrations
+- [x] **B03 Store, migrations, roles, RLS.** pgx pool and transaction helpers; goose migrations
   embedded; the three roles with `INHERIT FALSE`; `internal/tenancy` binding the transaction-local
   setting; integration tests on testcontainers Postgres. Settles open decisions 1 and 2 as ADRs.
   **Done when:** a query with no tenant bound returns zero rows; tenant A cannot read tenant B's
@@ -233,3 +233,4 @@ One line per finished item: date, item, anything worth remembering.
 |---|---|---|
 | 2026-09-19 | B01 | Code written 2026-09-18, first CI run green on PR #30 the next day. The build-info package is `internal/appversion`, because revive rejects package names that shadow the standard library (`version`, `buildinfo`). |
 | 2026-09-18 | B02 | All 14 golden vectors cross-checked against the Python `blake3` package, so the recipes are reproducible outside Go. `RecordID` and `DeliveryID` return an error for an empty part or a part containing `0x1F`; architecture section 5 updated to say so. |
+| 2026-09-19 | B03 | Roles and schema come from a one-time admin bootstrap script (`sluiceway migrate bootstrap`); migrations run as the application role, and `store.Open` refuses a superuser or BYPASSRLS login everywhere. Postgres 16 is the minimum. Found on the way: a transaction-local setting reads back as `''` on a pooled connection, so policies go through `current_tenant()`. Mutation-checked: dropping FORCE RLS fails six tests. ADRs 1 and 2 written; sqlc itself arrives with B04. |
