@@ -35,6 +35,52 @@ type Config struct {
 	LogFormat   string // "json" or "text"
 }
 
+// defaultListenAddr is where serve listens when SLUICEWAY_LISTEN_ADDR is unset.
+const defaultListenAddr = ":8080"
+
+// Variable documents one environment variable that Load reads.
+type Variable struct {
+	Name    string
+	Doc     string
+	Default string // what Load uses when the variable is unset, in words an operator can act on
+}
+
+// Variables lists every variable Load reads, in the order an operator should think about them.
+// The command's usage text is built from it, so the binary documents its own configuration, and a
+// test holds it to what Load really reads and to the defaults Load really applies.
+//
+// The development database URL is described, not printed: it is a URL with a password in it, and
+// usage text ends up in logs and tickets.
+func Variables() []Variable {
+	return []Variable{
+		{
+			Name:    "SLUICEWAY_ENV",
+			Doc:     `"production" or "development". Anything else is refused, never treated as development.`,
+			Default: string(Production),
+		},
+		{
+			Name:    "SLUICEWAY_DATABASE_URL",
+			Doc:     "Postgres URL (postgres:// or postgresql://) of the non-superuser application role.",
+			Default: "none, it is required in production. Development falls back to the local compose database.",
+		},
+		{
+			Name:    "SLUICEWAY_LISTEN_ADDR",
+			Doc:     "host:port or :port for serve. The port is a number from 0 to 65535, not a service name.",
+			Default: defaultListenAddr,
+		},
+		{
+			Name:    "SLUICEWAY_LOG_LEVEL",
+			Doc:     "debug, info, warn or error.",
+			Default: strings.ToLower(slog.LevelInfo.String()),
+		},
+		{
+			Name:    "SLUICEWAY_LOG_FORMAT",
+			Doc:     `"json" or "text".`,
+			Default: "json in production, text in development",
+		},
+	}
+}
+
 const redacted = "[redacted]"
 
 // LogValue keeps the database URL, which carries a password, out of structured logs.
@@ -68,7 +114,7 @@ func Load(getenv func(string) string) (Config, error) {
 
 	cfg := Config{
 		Env:        Production,
-		ListenAddr: ":8080",
+		ListenAddr: defaultListenAddr,
 		LogLevel:   slog.LevelInfo,
 	}
 

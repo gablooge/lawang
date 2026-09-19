@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -38,6 +40,222 @@ func TestRunUsageErrors(t *testing.T) {
 		if !strings.Contains(errOut.String(), "Usage:") {
 			t.Errorf("args %v: stderr has no usage: %s", args, errOut.String())
 		}
+	}
+}
+
+func TestRunRefusesExtraArguments(t *testing.T) {
+	// No command takes an argument, and none may ignore one: "serve --listen :9090" would otherwise
+	// start on the default port with no warning.
+	//
+	// The environment is a valid development one, so that the only thing wrong is the argument.
+	// A role that wrongly starts must fail this test, not hang it: serve gets a loopback address
+	// with an ephemeral port and is stopped by the deadline, which shows up as exit 0.
+	getenv := func(k string) string {
+		switch k {
+		case "SLUICEWAY_ENV":
+			return "development"
+		case "SLUICEWAY_LISTEN_ADDR":
+			return "127.0.0.1:0"
+		}
+		return ""
+	}
+	const extra = "--hunter2-marker"
+	for _, tc := range []struct {
+		args []string
+		want string // what the first line of stderr must say
+	}{
+		{[]string{"serve", extra}, "serve takes no arguments"},
+		{[]string{"serve", "--listen", ":9090"}, "serve takes no arguments"},
+		{[]string{"worker", extra}, "worker takes no arguments"},
+		// A command that grows a subcommand keeps its row and changes only what it says.
+		{[]string{"migrate", extra}, "migrate takes no arguments"},
+		{[]string{"version", extra}, "version takes no arguments"},
+		{[]string{"help", extra}, "help takes no arguments"},
+		{[]string{"-h", extra}, "-h takes no arguments"},
+		{[]string{"--help", extra}, "--help takes no arguments"},
+	} {
+		args := tc.args
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+
+			var out, errOut bytes.Buffer
+			if code := run(ctx, args, getenv, &out, &errOut); code != 2 {
+				t.Errorf("exit = %d, want 2", code)
+			}
+			// The usage text is long, so a failure shows the first line only.
+			firstLine := func(s string) string { line, _, _ := strings.Cut(s, "\n"); return line }
+			if got := firstLine(errOut.String()); !strings.Contains(got, tc.want) {
+				t.Errorf("stderr starts %q, want it to say %q", got, tc.want)
+			}
+			if !strings.Contains(strings.ToLower(errOut.String()), "usage:") {
+				t.Errorf("stderr does not show how the command is used: %s", firstLine(errOut.String()))
+			}
+			if out.Len() != 0 {
+				t.Errorf("stdout is not empty: %s", firstLine(out.String()))
+			}
+			// An argument can be a pasted secret as easily as a variable can.
+			if strings.Contains(errOut.String(), "hunter2") || strings.Contains(errOut.String(), "9090") {
+				t.Errorf("stderr repeats the argument: %s", firstLine(errOut.String()))
+			}
+			if ctx.Err() != nil {
+				t.Error("run was still going at the deadline: the role started instead of refusing")
+			}
+		})
+	}
+}
+
+func TestRunHelp(t *testing.T) {
+	for _, spelling := range []string{"help", "-h", "--help"} {
+		t.Run(spelling, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			if code := run(context.Background(), []string{spelling}, noEnv, &out, &errOut); code != 0 {
+				t.Errorf("exit = %d, want 0", code)
+			}
+			if out.String() != usage {
+				t.Errorf("stdout is not the usage text: %s", out.String())
+			}
+			if errOut.Len() != 0 {
+				t.Errorf("asking for help is not an error, but stderr has: %s", errOut.String())
+			}
+		})
+	}
+}
+
+func TestUsageDocumentsTheConfigurationAndTheExitCodes(t *testing.T) {
+	// The usage text is the only documentation an operator is sure to have. Every variable
+	// config.Load reads has to be in it, found here by watching what Load asks for and not by
+	// trusting a list. Load runs in both environments so a read behind a branch is seen.
+	read := make(map[string]bool)
+	for _, envName := range []string{"", "development"} {
+		_, _ = config.Load(func(k string) string {
+			read[k] = true
+			if k == "SLUICEWAY_ENV" {
+				return envName
+			}
+			return ""
+		})
+	}
+	if len(read) == 0 {
+		t.Fatal("config.Load read nothing, so this test proves nothing")
+	}
+	for name := range read {
+		if !strings.Contains(usage, name) {
+			t.Errorf("config.Load reads %s, which the usage text does not mention", name)
+		}
+	}
+	for _, v := range config.Variables() {
+		if !strings.Contains(usage, v.Doc) || !strings.Contains(usage, "default: "+v.Default) {
+			t.Errorf("the usage text does not carry the description and default of %s", v.Name)
+		}
+	}
+
+	for _, line := range []string{
+		"Exit codes:",
+		"  0   ",
+		"  1   ",
+		"  2   ",
+	} {
+		if !strings.Contains(usage, "\n"+line) {
+			t.Errorf("the usage text has no line starting %q", line)
+		}
+	}
+	// Still one screen, and still the commands first.
+	if !strings.HasPrefix(usage, "Usage: sluiceway <command>") {
+		t.Errorf("the usage text does not start with the synopsis: %.40s", usage)
+	}
+	if strings.Contains(usage, "@") || strings.Contains(usage, "sluiceway:sluiceway") {
+		t.Error("the usage text prints a URL with credentials")
+	}
+}
+
+// lockedBuffer is a bytes.Buffer that a running role can log to while the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestRunServeExitsZeroAfterACleanShutdown(t *testing.T) {
+	// The whole path an operator sees: run serve, answer a request, take the signal (here the
+	// cancel that main wires to SIGINT and SIGTERM), exit 0. Nothing else proves that a clean
+	// shutdown is not reported as a failure.
+	//
+	// It cannot collide (loopback, ephemeral port) and it cannot hang: every wait below is bounded,
+	// and the cleanup cancels the role whatever happened.
+	getenv := func(k string) string {
+		switch k {
+		case "SLUICEWAY_ENV":
+			return "development"
+		case "SLUICEWAY_LISTEN_ADDR":
+			return "127.0.0.1:0"
+		case "SLUICEWAY_LOG_FORMAT":
+			return "json"
+		}
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+
+	var out, errOut lockedBuffer
+	exit := make(chan int, 1)
+	go func() { exit <- run(ctx, []string{"serve"}, getenv, &out, &errOut) }()
+
+	// The port is ephemeral, so the only place to learn it is the "listening" log line.
+	var addr string
+	for deadline := time.Now().Add(5 * time.Second); addr == "" && time.Now().Before(deadline); {
+		for line := range strings.SplitSeq(errOut.String(), "\n") {
+			var entry struct{ Msg, Addr string }
+			if json.Unmarshal([]byte(line), &entry) == nil && entry.Msg == "listening" {
+				addr = entry.Addr
+			}
+		}
+		select {
+		case code := <-exit:
+			t.Fatalf("run serve returned %d before it was asked to stop: %s", code, errOut.String())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if addr == "" {
+		t.Fatalf("serve never logged that it was listening: %s", errOut.String())
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://" + addr + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /healthz = %d, want 200", resp.StatusCode)
+	}
+	client.CloseIdleConnections()
+
+	cancel()
+	select {
+	case code := <-exit:
+		if code != 0 {
+			t.Errorf("exit = %d after a clean shutdown, want 0: %s", code, errOut.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("run serve did not return after the cancel: %s", errOut.String())
+	}
+	if strings.Contains(errOut.String(), `"level":"ERROR"`) {
+		t.Errorf("a clean shutdown logged an error: %s", errOut.String())
+	}
+	if out.String() != "" {
+		t.Errorf("serve wrote to stdout: %s", out.String())
 	}
 }
 

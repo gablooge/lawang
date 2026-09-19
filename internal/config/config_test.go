@@ -246,3 +246,92 @@ func TestLoadOverrides(t *testing.T) {
 		t.Errorf("LogFormat = %q, want text", cfg.LogFormat)
 	}
 }
+
+// readBy records every name Load asks getenv for, under base.
+func readBy(base map[string]string) map[string]bool {
+	read := make(map[string]bool)
+	_, _ = Load(func(k string) string {
+		read[k] = true
+		return base[k]
+	})
+	return read
+}
+
+func TestVariablesAreExactlyWhatLoadReads(t *testing.T) {
+	// Variables is the operator's documentation, by way of the usage text. A variable Load reads
+	// and Variables omits is undocumented; one Variables lists and Load ignores is a promise the
+	// binary does not keep. Load is driven in both environments, and once with every value bad, so
+	// that a read behind a branch is seen too.
+	read := make(map[string]bool)
+	for _, base := range []map[string]string{
+		nil,
+		{"SLUICEWAY_ENV": "development"},
+		{"SLUICEWAY_DATABASE_URL": "postgres://app@db/sluiceway"},
+		{"SLUICEWAY_ENV": "x", "SLUICEWAY_DATABASE_URL": "x", "SLUICEWAY_LISTEN_ADDR": "x", "SLUICEWAY_LOG_LEVEL": "x", "SLUICEWAY_LOG_FORMAT": "x"},
+	} {
+		for k := range readBy(base) {
+			read[k] = true
+		}
+	}
+
+	documented := make(map[string]bool)
+	for _, v := range Variables() {
+		if documented[v.Name] {
+			t.Errorf("%s is listed twice", v.Name)
+		}
+		documented[v.Name] = true
+		if !read[v.Name] {
+			t.Errorf("%s is documented, but Load never reads it", v.Name)
+		}
+		if v.Doc == "" || v.Default == "" {
+			t.Errorf("%s has no description or no default: %+v", v.Name, v)
+		}
+	}
+	for k := range read {
+		if !documented[k] {
+			t.Errorf("Load reads %s, but Variables does not document it", k)
+		}
+	}
+}
+
+func TestVariablesStateTheDefaultsLoadApplies(t *testing.T) {
+	// The documented default is compared with what Load does with the variable unset, so the two
+	// cannot drift. The database URL is the only thing set, because production has no default for it.
+	doc := make(map[string]string)
+	for _, v := range Variables() {
+		doc[v.Name] = v.Default
+	}
+
+	prod, err := Load(env(map[string]string{"SLUICEWAY_DATABASE_URL": "postgres://app@db/sluiceway"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	dev, err := Load(env(map[string]string{"SLUICEWAY_ENV": "development"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if got := doc["SLUICEWAY_ENV"]; got != string(prod.Env) {
+		t.Errorf("SLUICEWAY_ENV: documented default %q, Load applies %q", got, prod.Env)
+	}
+	if got := doc["SLUICEWAY_LISTEN_ADDR"]; got != prod.ListenAddr {
+		t.Errorf("SLUICEWAY_LISTEN_ADDR: documented default %q, Load applies %q", got, prod.ListenAddr)
+	}
+	if got, want := doc["SLUICEWAY_LOG_LEVEL"], strings.ToLower(prod.LogLevel.String()); got != want {
+		t.Errorf("SLUICEWAY_LOG_LEVEL: documented default %q, Load applies %q", got, want)
+	}
+	wantFormat := prod.LogFormat + " in production, " + dev.LogFormat + " in development"
+	if got := doc["SLUICEWAY_LOG_FORMAT"]; got != wantFormat {
+		t.Errorf("SLUICEWAY_LOG_FORMAT: documented default %q, Load applies %q", got, wantFormat)
+	}
+	if got := doc["SLUICEWAY_DATABASE_URL"]; !strings.Contains(got, "required in production") {
+		t.Errorf("SLUICEWAY_DATABASE_URL: the documented default %q does not say production has none", got)
+	}
+
+	// The development fallback is a URL with a password in it. It is described, never printed.
+	for _, v := range Variables() {
+		if strings.Contains(v.Doc+v.Default, dev.DatabaseURL) || strings.Contains(v.Doc+v.Default, "@") {
+			t.Errorf("%s: the documentation prints a URL with credentials: %+v", v.Name, v)
+		}
+	}
+}

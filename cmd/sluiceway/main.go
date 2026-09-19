@@ -9,13 +9,14 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/gablooge/sluiceway/internal/appversion"
 	"github.com/gablooge/sluiceway/internal/config"
 )
 
-const usage = `Usage: sluiceway <command>
+const usageHead = `Usage: sluiceway <command>
 
 Commands:
   serve     run the operator API and the webhook edge
@@ -26,9 +27,47 @@ Commands:
 Configuration comes from SLUICEWAY_* environment variables only.
 `
 
+const usageExitCodes = `
+Exit codes:
+  0   success, including a clean shutdown after SIGINT or SIGTERM
+  1   the configuration was refused, or the command failed
+  2   usage error: no command, an unknown command, or an argument the command does not take
+`
+
+// usage is what "sluiceway help" prints. The variables come from config.Variables, the same
+// package that reads them, so the text cannot drift from what Load does: an operator should never
+// have to read Go source to configure the service.
+var usage = buildUsage(config.Variables())
+
+func buildUsage(vars []config.Variable) string {
+	var b strings.Builder
+	b.WriteString(usageHead)
+	b.WriteString("\nVariables:\n")
+	for _, v := range vars {
+		fmt.Fprintf(&b, "  %s\n      %s\n      default: %s\n", v.Name, v.Doc, v.Default)
+	}
+	b.WriteString(usageExitCodes)
+	return b.String()
+}
+
 // errNotBuilt marks a role whose backlog item has not landed yet. It exits non-zero so nothing can
 // mistake a stub for a running role.
 var errNotBuilt = errors.New("not built yet, see docs/backlog.md")
+
+// refuseArguments reports anything after the command name as a usage error, and says whether it
+// did. No command takes an argument, and ignoring one is worse than refusing it: "serve --listen
+// :9090" would start on the default port without a word.
+//
+// It is called once the command is known to exist, so args[0] is one of our own words. The
+// arguments themselves are not printed: stderr is the container log, and an argument can be a
+// pasted secret as easily as a variable can.
+func refuseArguments(stderr io.Writer, args []string) bool {
+	if len(args) == 1 {
+		return false
+	}
+	fmt.Fprintf(stderr, "sluiceway: %s takes no arguments\n\n%s", args[0], usage) //nolint:gosec // G705: a terminal, not a browser
+	return true
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -50,9 +89,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	// Commands that need no configuration.
 	switch args[0] {
 	case "version":
+		if refuseArguments(stderr, args) {
+			return 2
+		}
 		fmt.Fprintln(stdout, appversion.String())
 		return 0
 	case "help", "-h", "--help":
+		if refuseArguments(stderr, args) {
+			return 2
+		}
 		fmt.Fprint(stdout, usage)
 		return 0
 	}
@@ -67,6 +112,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		cmd = func(context.Context, config.Config, *slog.Logger) error { return errNotBuilt }
 	default:
 		fmt.Fprintf(stderr, "sluiceway: unknown command %q\n\n%s", args[0], usage) //nolint:gosec // G705: a terminal, not a browser
+		return 2
+	}
+	if refuseArguments(stderr, args) {
 		return 2
 	}
 
