@@ -3,6 +3,7 @@ package record
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -75,10 +76,10 @@ func (r Record) Validate() error {
 	default:
 		return invalid("kind", "is not one of task, message, ticket, document, page")
 	}
-	if err := checkString("external_id", r.ExternalID, 1, MaxExternalID, noControl); err != nil {
+	if err := checkExternalID("external_id", r.ExternalID); err != nil {
 		return err
 	}
-	if err := checkString("version", r.Version, 1, MaxVersion, noControl); err != nil {
+	if err := checkString("version", r.Version, 1, MaxVersion, identifierChars); err != nil {
 		return err
 	}
 	if r.Supersedes != "" {
@@ -92,25 +93,25 @@ func (r Record) Validate() error {
 	if err := checkTime(r.OccurredAt); err != nil {
 		return err
 	}
-	if err := checkString("title", r.Title, 0, MaxTitle, noNUL); err != nil {
+	if err := checkString("title", r.Title, 0, MaxTitle, oneLineChars); err != nil {
 		return err
 	}
-	if err := checkString("text", r.Text, 0, MaxText, noNUL); err != nil {
+	if err := checkString("text", r.Text, 0, MaxText, contentChars); err != nil {
 		return err
 	}
 	if r.Op == OpDelete && (r.Title != "" || r.Text != "") {
 		return invalid("title and text", "are empty on a delete")
 	}
-	if err := checkString("author.id", r.Author.ID, 0, MaxAuthor, noControl); err != nil {
+	if err := checkString("author.id", r.Author.ID, 0, MaxAuthor, identifierChars); err != nil {
 		return err
 	}
-	if err := checkString("author.display", r.Author.Display, 0, MaxAuthor, noControl); err != nil {
+	if err := checkString("author.display", r.Author.Display, 0, MaxAuthor, displayChars); err != nil {
 		return err
 	}
 	if !validName(r.Container.Kind, maxKind, false) {
 		return invalid("container.kind", "is not a container kind")
 	}
-	if err := checkString("container.id", r.Container.ID, 1, MaxContainerID, noControl); err != nil {
+	if err := checkString("container.id", r.Container.ID, 1, MaxContainerID, identifierChars); err != nil {
 		return err
 	}
 	if err := checkScopeID(r.Visibility.Scope); err != nil {
@@ -120,23 +121,62 @@ func (r Record) Validate() error {
 		return invalid("visibility.audience", "is not one of direct, group")
 	}
 	if r.Edges.ReplyParent != "" {
-		if err := checkString("edges.reply_parent", string(r.Edges.ReplyParent), 1, MaxExternalID, noControl); err != nil {
+		if err := checkExternalID("edges.reply_parent", string(r.Edges.ReplyParent)); err != nil {
 			return err
 		}
 	}
-	return checkString("meta.delivery", r.Meta.Delivery, 0, MaxDelivery, noControl)
+	return checkString("meta.delivery", r.Meta.Delivery, 0, MaxDelivery, identifierChars)
 }
 
-// charRule says which bytes a string may not contain.
+// charRule says which characters a string may not contain. The four rules are the same four in
+// the schema ($defs identifier, displayName and oneLine, and the pattern of text), and ADR 4 has
+// the reasons ("Which characters a field may hold"). Each is a fixed list of code points and
+// never a Unicode category, because a category grows with every Unicode version and the format
+// may not.
 type charRule int
 
 const (
-	// noControl refuses the C0 control characters and DEL: identifiers and names have no use
-	// for them, and they are what log forging and a NUL-terminated consumer are made of.
-	noControl charRule = iota
-	// noNUL refuses only NUL. Content keeps its newlines and tabs.
-	noNUL
+	// identifierChars is for what a program compares and an operator reads in a log:
+	// ExternalID, Version, Author.ID, Container.ID, Edges.ReplyParent, Meta.Delivery. Refused:
+	// every control character (C0, DEL, C1), the line and paragraph separators, every
+	// bidirectional formatting character, and the zero-width and invisible format characters
+	// listed at invisible.
+	identifierChars charRule = iota
+	// displayChars is for Author.Display: identifierChars, less the zero-width non-joiner and
+	// joiner (U+200C, U+200D), which Persian and Indic names are spelled with and emoji are built
+	// with.
+	displayChars
+	// oneLineChars is for Title, which is content in any language, on a single line: every
+	// control character and the line and paragraph separators are refused. Bidirectional
+	// formatting stays, because right-to-left titles use it.
+	oneLineChars
+	// contentChars is for Text: only NUL is refused, which a Postgres text column cannot hold.
+	// Newlines, tabs and everything else are content.
+	contentChars
 )
+
+// refuses reports whether the rule forbids c. It is for the three rules that read characters:
+// contentChars refuses one byte, and checkString looks for that byte without decoding the text.
+func (rule charRule) refuses(c rune) bool {
+	switch {
+	case c < 0x20, c >= 0x7F && c <= 0x9F, c == 0x2028, c == 0x2029:
+		return true
+	case rule == oneLineChars:
+		return false
+	case rule == displayChars && (c == 0x200C || c == 0x200D):
+		return false
+	}
+	return invisible(c)
+}
+
+// invisible is the soft hyphen, the Arabic letter mark, U+200B to U+200F (the zero-width space,
+// non-joiner and joiner, and the left-to-right and right-to-left marks), U+202A to U+202E (the
+// embeddings and overrides), U+2060 to U+206F (the word joiner, the invisible operators, the
+// isolates and the deprecated format characters) and the byte order mark.
+func invisible(c rune) bool {
+	return c == 0x00AD || c == 0x061C || c >= 0x200B && c <= 0x200F || c >= 0x202A && c <= 0x202E ||
+		c >= 0x2060 && c <= 0x206F || c == 0xFEFF
+}
 
 func checkString(field, s string, minChars, maxChars int, rule charRule) error {
 	if len(s) < minChars {
@@ -147,14 +187,34 @@ func checkString(field, s string, minChars, maxChars int, rule charRule) error {
 	if len(s) > maxChars && utf8.RuneCountInString(s) > maxChars {
 		return invalid(field, fmt.Sprintf("is longer than %d characters", maxChars))
 	}
-	for i := range len(s) {
-		c := s[i]
-		if c == 0 || rule == noControl && (c < 0x20 || c == 0x7F) {
-			return invalid(field, "contains a control character")
+	if rule == contentChars {
+		// A text may be a megabyte, and in UTF-8 a zero byte is always NUL.
+		if strings.IndexByte(s, 0) >= 0 {
+			return invalid(field, "contains a NUL")
+		}
+	} else {
+		for _, c := range s {
+			if rule.refuses(c) {
+				return invalid(field, "contains a character this field does not allow")
+			}
 		}
 	}
 	if !utf8.ValidString(s) {
 		return invalid(field, "is not valid UTF-8")
+	}
+	return nil
+}
+
+// checkExternalID is for ExternalID and for Edges.ReplyParent, which is one: an identifier of 1
+// to MaxExternalID characters that begins with a provider key and a colon, with something after
+// the colon. Seal checks that the key is the sealing provider's.
+func checkExternalID(field, s string) error {
+	if err := checkString(field, s, 1, MaxExternalID, identifierChars); err != nil {
+		return err
+	}
+	colon := strings.IndexByte(s, ':')
+	if colon < 0 || colon == len(s)-1 || !validName(s[:colon], maxKind, false) {
+		return invalid(field, "does not begin with a provider key and a colon")
 	}
 	return nil
 }

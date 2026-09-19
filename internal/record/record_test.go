@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gablooge/sluiceway/internal/ids"
 	"github.com/gablooge/sluiceway/internal/tenancy"
@@ -126,6 +127,13 @@ func TestSealRefuses(t *testing.T) {
 		{name: "a scope built by hand", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.Visibility.Scope = "slack:channel:C0 GENERAL" }},
 		{name: "a source set by the normalizer", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.Source = "chat" }},
 		{name: "no external id", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.ExternalID = "" }},
+		{name: "the source's bare id as the external id", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.ExternalID = "C0GENERAL:1752064245.000200" }},
+		{name: "an external id of another provider", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.ExternalID = "clickup:task:86a1xyz" }},
+		{name: "an external id of a provider whose key the sealing one is a prefix of", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.ExternalID = "slack_eu:C0GENERAL:1" }},
+		{name: "an external id that is the provider key alone", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.ExternalID = "slack" }},
+		{name: "an external id with nothing after the colon", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.ExternalID = "slack:" }},
+		{name: "a reply parent of another provider", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.Edges.ReplyParent = "clickup:task:86a1xyz" }},
+		{name: "the source's bare id as the reply parent", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.Edges.ReplyParent = "1752064000.000100" }},
 		{name: "no version", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.Version = "" }},
 		{name: "the hash separator in the version", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.Version = "1\x1f2" }},
 		{name: "a record that fails validation", provider: "slack", tenant: "tenant_a", edit: func(r *Record) { r.Kind = "email" }},
@@ -371,7 +379,22 @@ func randomDraft(t *testing.T, rng *rand.Rand) (string, Record) {
 		}
 		return string(out)
 	}
-	// Identifiers are anything without control characters.
+	// A title is content on one line: no line break of any kind, and bidirectional formatting
+	// stays (the last two are a right-to-left override and a right-to-left mark).
+	var lineRunes []rune
+	for _, c := range append(content, 0x202E, 0x200F) {
+		if c != '\n' && c != '\r' && c != '\t' && c != 0x2028 {
+			lineRunes = append(lineRunes, c)
+		}
+	}
+	line := func(maxLen int) string {
+		out := make([]rune, rng.IntN(maxLen+1))
+		for i := range out {
+			out[i] = lineRunes[rng.IntN(len(lineRunes))]
+		}
+		return string(out)
+	}
+	// Identifiers are anything visible.
 	idRunes := []rune("abcXYZ019:/=+@._~- %é☕#?&\"\\")
 	id := func(minLen, maxLen int) string {
 		out := make([]rune, minLen+rng.IntN(maxLen-minLen+1))
@@ -396,10 +419,10 @@ func randomDraft(t *testing.T, rng *rand.Rand) (string, Record) {
 	d := Record{
 		Op:         OpUpsert,
 		Kind:       Kind(pick("task", "message", "ticket", "document", "page")),
-		ExternalID: id(1, 80),
+		ExternalID: provider + ":" + id(1, 80),
 		Version:    id(1, 30),
 		OccurredAt: at,
-		Title:      text(40),
+		Title:      line(40),
 		Text:       text(400),
 		Author:     Author{ID: id(0, 20), Display: id(0, 20)},
 		Container:  Container{Kind: containerKind, ID: id(1, 60)},
@@ -408,7 +431,7 @@ func randomDraft(t *testing.T, rng *rand.Rand) (string, Record) {
 		Meta:       Meta{Delivery: pick("", ids.New())},
 	}
 	if rng.IntN(2) == 0 {
-		d.Edges.ReplyParent = Ref(id(1, 80))
+		d.Edges.ReplyParent = Ref(provider + ":" + id(1, 80))
 	}
 	if rng.IntN(10) == 0 {
 		d.Op, d.Title, d.Text = OpDelete, "", ""
@@ -417,8 +440,8 @@ func randomDraft(t *testing.T, rng *rand.Rand) (string, Record) {
 }
 
 // For any JSON document at all, the Go decoder and the schema give the same answer. The two
-// rules only Go has are recognised and set aside: a record that supersedes itself, and a field
-// name used twice.
+// rules only Go has are recognised and set aside: a record that supersedes itself, a field name
+// used twice, and the byte rule.
 func FuzzDecodeAgreesWithSchema(f *testing.F) {
 	example := exampleBytes(f)
 	f.Add(example)
@@ -434,6 +457,9 @@ func FuzzDecodeAgreesWithSchema(f *testing.F) {
 		}
 		f.Add(data)
 	}
+	for _, c := range rawCases() {
+		f.Add([]byte(strings.Replace(string(example), c.old, c.new, 1)))
+	}
 	f.Add([]byte(`{"id":1,"id":2}`))
 	f.Add([]byte(`[]`))
 	f.Add([]byte(`null`))
@@ -443,9 +469,18 @@ func FuzzDecodeAgreesWithSchema(f *testing.F) {
 		if !json.Valid(data) {
 			return
 		}
-		schemaErr := schemaError(t, with, data)
 		var r Record
 		goErr := json.Unmarshal(data, &r)
+		// The byte rule comes before any schema (see rawCases): the validator parses with
+		// encoding/json and would judge a rewritten document. It is recognised here with the
+		// oracle, not with the code under test.
+		if !utf8.Valid(data) || oracleUnpaired(data) {
+			if goErr == nil {
+				t.Fatalf("Go accepted a document that breaks the byte rule\n%q", data)
+			}
+			return
+		}
+		schemaErr := schemaError(t, with, data)
 		if (schemaErr == nil) == (goErr == nil) {
 			return
 		}

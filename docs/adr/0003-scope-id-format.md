@@ -58,7 +58,14 @@ The escaping rule has no choices in it: a byte is either in the unreserved set a
 itself, or it is not and is written as `%XX` in uppercase. Together with the three refusals
 above, that makes the form **canonical**: two different strings never name the same scope, and a
 string never parses two ways. `ParseScopeID` accepts exactly the strings `ScopeID` produces, so
-`ScopeID(ParseScopeID(s)) == s` for every `s` that parses (a fuzz test holds this).
+`ScopeID(ParseScopeID(s)) == s` for every `s` that parses (a fuzz test holds this). The escape
+space is small enough to test in full, and it is: all 256 bytes as `%XX`, in uppercase, in
+lowercase and in both mixtures, go through the Go parser **and** through the schema's pattern,
+and each must give the verdict the rule above gives (157 accepted: 256 bytes, less the 66
+unreserved ones, less the 33 control bytes, and only in uppercase). The same is done for every
+character in the first and in a later position of the `provider` and `container_kind` segments.
+Examples alone did not hold this: the parser and the pattern could drift together on a byte no
+example named (`%61`), and an agreement test then sees two halves that agree.
 
 This matters because a sink compares scope ids as opaque strings. If `a%3Ab` and `a%3ab` were
 both valid, a record stamped with one and a membership pushed with the other would never meet,
@@ -70,11 +77,47 @@ and not the other.
 of the string?** Slack and ClickUp ids are plain alphanumerics, but Microsoft Graph ids contain
 almost anything: a Teams channel is `19:abc123@thread.tacv2`, and mail and folder ids are base64
 with `/`, `+` and `=`. Left raw, the string would still parse (split on the first two colons),
-but it would hold characters that need quoting in a URL path, a query string, a log line, a CSV
-file and a shell, and every one of those is a place a scope id ends up at a sink. Escaped, a
-scope id is safe in all of them as it stands, has exactly two colons, and no Unicode
-normalization or look-alike character can make two scopes look the same. The cost is length:
-each escaped byte takes three.
+but it would hold spaces, quotes, commas, non-ASCII characters and whatever else a provider puts
+into an id, and a scope id ends up in log lines, database columns, CSV files and metric labels at
+a sink. Escaped, it is printable ASCII from a small alphabet, has exactly two colons, and no
+Unicode normalization or look-alike character can make two scopes look the same. The cost is
+length: each escaped byte takes three. What the escaping does **not** buy is safety inside a
+URL, which the next section is about.
+
+### Where a scope id is safe as it stands, and where it is not
+
+**Safe as it stands:** a JSON string, a database text column, a log line, a CSV field, a metric
+label, a word of a POSIX shell. Its alphabet is `A-Z a-z 0-9 . _ ~ - % :`, which none of those
+gives a meaning to.
+
+**Not safe as it stands: a URL path or a query string.** A scope id holds percent signs, and
+every HTTP server decodes a path and a query **once**. A client that splices
+`teams:channel:19%3Aabc%40thread.tacv2` into `GET /scopes/{scope}/members` reaches a handler
+that sees `teams:channel:19:abc@thread.tacv2` (in Go, `r.URL.Path` and `r.PathValue`), a string
+that equals no stored scope id. Every lookup misses: fail closed, and broken, which is the
+"never meet" failure this ADR exists to prevent, by another road. With an escaped slash it is
+worse. `..%2F..%2Fadmin` is a valid escaped container id, and a proxy or a router that decodes
+`%2F` turns it into path segments.
+
+So **in a URL a scope id is percent-encoded again, as one opaque value, like any other string
+that holds a percent sign** (`%3A` becomes `%253A`; `url.PathEscape` and `url.QueryEscape` in
+Go, `encodeURIComponent` in JavaScript), it is never spliced into a path by hand, and the
+receiving side compares after **exactly one** decoding, which is the one its HTTP library has
+already done. `TestAScopeIDInAURLIsEncodedOnceMore` documents the round trip against a real
+server, both ways: encoded once more the scope id arrives byte for byte, as it stands it
+arrives as something else.
+
+**Not safe as it stands either:**
+
+- **a file path.** It holds colons, which Windows and classic macOS refuse, and `..%2F` becomes
+  `../` in any layer that decodes. A sink that needs a file per scope names it by a hash of the
+  scope id.
+- **where a percent sign means something:** a Windows batch file (`%3A` there starts a
+  parameter expansion), a crontab line (where `%` is a line break), a `printf` format string.
+  Pass it as data, never as a format or a script.
+
+The schema's description of `scopeId` says the same in short, because that is what a sink
+author reads.
 
 The container id is treated as bytes. Non-ASCII ids are escaped byte by byte, and bytes that are
 not valid UTF-8 are carried like any other, because an id is opaque and a scope id must never be
@@ -144,9 +187,18 @@ let tenant B's members of `slack:channel:C0GENERAL` see tenant A's records.
   only of bytes that need escaping, about 160 bytes fit in the 512. Base64 ids are mostly letters
   and digits, so a Graph id grows by a few bytes, not threefold. If an id ever does not fit, the
   record is refused with a clear error, which is the right failure for an access key. The limit
-  was not measured against real Graph tenants: B16 and B17 should check it against recorded ids.
-- The `provider` and `container_kind` grammar has no hyphen. Provider keys are ours to choose, so
-  this costs nothing today.
+  was not measured against real Graph tenants. B16 and B17 must check it against recorded ids,
+  **and they come before v0.1.0 for that reason**: after the release a longer scope id is a
+  wider pattern, and by [ADR 4](0004-record-format-v1.md) (decision 1) that is a new format
+  version.
+- The `provider` and `container_kind` grammar has no hyphen. Provider keys and container kinds
+  are ours to choose, so living without one costs nothing. **Adding one later is not free:** it
+  widens the pattern of the scope id (and of `external_id` and `container.kind`), a sink that
+  validates with the earlier schema would refuse every such record, and so it is a new format
+  version (ADR 4, decision 1). The grammar of this ADR is final when v0.1.0 ships, in both
+  directions.
+- A scope id has to be encoded once more wherever it enters a URL, and sink authors will forget.
+  The schema says so where they read it, and a test documents the round trip.
 - A scope is one container. A record visible through two containers at once (a file shared into
   two channels) is not expressible as one scope id. v1 does not try: such a provider has to pick
   the scope that matches where the record lives, or emit the record once per scope under

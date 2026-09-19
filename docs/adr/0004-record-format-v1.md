@@ -10,7 +10,8 @@ binary by `internal/record`, whose Go types produce and read it. It becomes a pu
 when v0.1.0 ships. Until then this record can still be superseded cheaply; afterwards every
 change below the line "what forces a new version" costs every sink author a migration.
 
-Seven things are decided here that the proposal left open or did not have:
+Ten things are decided here that the proposal left open or did not have (8 to 10 were added in
+review, because each of them is something that cannot be tightened or redefined after v0.1.0):
 
 1. The format carries its own version, in a `format` field.
 2. The field names of the proposal are kept, with one field dropped (`meta.raw_ref`) and one
@@ -21,6 +22,9 @@ Seven things are decided here that the proposal left open or did not have:
 6. A record carries its scope and never the scope's members.
 7. **The scope is part of the record id**, so a record that moves to another scope is a new
    record. This changes the id recipe of architecture section 5 and `internal/ids`.
+8. A record document is UTF-8 and escapes no half of a surrogate pair.
+9. Which characters each string field may hold, field by field.
+10. What `origin.untrusted: false` and `origin.automation: false` mean: no signal, never "safe".
 
 ### 1. The format version
 
@@ -42,20 +46,47 @@ under a host name the maintainer controls, so that nobody else can ever serve a 
 at the address a validator might fetch. **The maintainer should confirm or replace it before
 v0.1.0**, because it freezes with the release.
 
+**The promise, in the reader's terms: within v1, every record Sluiceway produces validates
+against every earlier v1 schema.** A sink author takes the schema file once, validates with it,
+sizes columns by its limits, and keeps working for as long as the records say
+`sluiceway.record/v1`. Sluiceway is the only writer, so the promise is about what it writes, and
+everything below is derived from it.
+
 **What may change within v1:** fields that a reader may safely ignore are added, at the top
-level and inside `author`, `container`, `origin`, `edges` and `meta`. A sink written against
-today's schema keeps working, because it ignores what it does not know and the schema allows
-additional properties there.
+level and inside `author`, `container`, `origin`, `edges` and `meta`. An earlier schema allows
+additional properties there, so it still accepts the record, and a sink written against it
+ignores what it does not know. A new field comes with its own limits, and those freeze with the
+release that adds it.
 
-**What forces a new version** (`sluiceway.record/v2`, a new schema file, a new `$id`):
+**What forces a new version** (`sluiceway.record/v2`, a new schema file, a new `$id`) is
+whatever could make an earlier v1 schema refuse a record, or a sink built on it misread one:
 
-- a field removed, renamed, or changed in type or meaning;
-- a limit tightened, or a required field made optional;
+- a field removed or renamed, or a required field made optional or nullable: the earlier schema
+  demands it;
+- a field changed in type;
+- **a limit raised, or a pattern or a character set widened.** `text` allowed to reach 2,097,152
+  characters, a hyphen allowed in a provider key or a container kind, a character taken off the
+  lists of decision 9, a new spelling of `occurred_at`, a longer scope id: every sink that
+  validates refuses the new records, and one that sized a column by the documented maximum
+  overflows. This is the direction that is easy to mistake for harmless, because it breaks no
+  producer, and the only producer is Sluiceway;
 - a new value of `op`, `kind` or `visibility.audience`. These are closed sets, and a sink that
   validates would refuse the new value, so adding one is not additive;
 - **anything at all inside `visibility`.** A sink that ignored a new field there (a deny list,
   say) would grant access it should not. That is why `visibility` is the one closed object: an
-  unknown field in it is a reason to refuse the record, not to ignore the field.
+  unknown field in it is a reason to refuse the record, not to ignore the field;
+- **a changed meaning**, which no schema sees and which the promise therefore names on its own:
+  what `origin.untrusted: false` says, what an `external_id` is unique within, what `delete`
+  asks of a sink, the recipe behind `id`.
+
+**The schema file's constraints on what exists do not move in the other direction either.** A
+limit lowered or a pattern narrowed would keep the promise above (new records still pass every
+earlier schema), but records a sink has already stored would stop validating against the newer
+file, and two v1 schema files that disagree about one record are a trap. If Sluiceway ever needs
+to produce less than the schema allows (shorter texts, say), it produces less and the schema
+stays as it is. So within v1 the schema changes by added optional properties and by wording,
+and by nothing else, and every limit and pattern in it is final on the day v0.1.0 ships.
+[ADR 3](0003-scope-id-format.md) says the same of the scope id grammar.
 
 Field names are lowercase `a-z 0-9 _`, starting with a letter, now and in every addition, and a
 record with any other field name is refused by the schema (`propertyNames`) and by the Go
@@ -73,19 +104,42 @@ an unknown extra. With lowercase-only names there is no second spelling to smugg
 | `op` | keep, `delete` defined now | See decision 5. |
 | `source` | keep | The wire name, which is sink configuration (principle 4). Lowercase letter, then up to 63 of `a-z 0-9 _ -`. It is in no id and is not the first segment of the scope (ADR 3), so it is for display and filtering only. `Record.Seal` sets it to the provider key, and a sink with a configured wire name replaces it on the way out (B09). |
 | `kind` | keep, closed | `task`, `message`, `ticket`, `document`, `page`. Closed because a sink switches on it. The set freezes with v0.1.0: **B18 (HubSpot) is the last item that can add a kind without a new format version**, if CRM objects turn out not to fit these five. |
-| `external_id` | keep | Opaque, 1 to 1,024 characters, no control characters. The same for every version of the entity. Built from the provider key, since it is hashed into the id. |
-| `version` | keep, meaning made exact | Opaque, 1 to 256 characters, no control characters. "Monotonic per `external_id`" is a promise **the provider's normalizer makes to the pipeline** (B08 uses it to keep the supersede chain forward only). The format cannot check it, and says so. To a sink a version is only equal or not equal: a sink never orders records by comparing versions, it follows `supersedes`. |
+| `external_id` | keep, domain made exact | 1 to 1,024 characters of an identifier (decision 9). The same for every version of the entity, and **unique within one tenant, across all of the tenant's sources**, because it begins with the internal provider key and a colon. See "The external id" below. |
+| `version` | keep, meaning made exact | Opaque, 1 to 256 characters of an identifier. "Monotonic per `external_id`" is a promise **the provider's normalizer makes to the pipeline** (B08 uses it to keep the supersede chain forward only). The format cannot check it, and says so. To a sink a version is only equal or not equal: a sink never orders records by comparing versions, it follows `supersedes`. |
 | `supersedes` | keep, nullable | A record id or `null`. Never the record's own id. |
 | `occurred_at` | keep, spelling pinned | RFC 3339, always UTC, always the `Z` suffix (never an offset, not even `+00:00`), second precision or 1 to 9 fractional digits, years 1000 to 9999, never a leap second. One instant then has few spellings, and the zero time of Go (year 1) is refused as "not set". |
-| `title`, `text` | keep | Always present, may be empty, at most 1,024 and 1,048,576 characters. No NUL, which a Postgres `text` column cannot store. Newlines and tabs are content. Cutting a longer text down is the normalizer's job: the format refuses, it does not truncate. |
+| `title`, `text` | keep | Always present, may be empty, at most 1,024 and 1,048,576 characters (Unicode code points, which is what `maxLength` counts: not bytes, not UTF-16 units, not what a reader sees as one character). `text` holds anything but NUL, which a Postgres `text` column cannot store. `title` is one line (decision 9). Cutting a longer text down is the normalizer's job: the format refuses, it does not truncate. |
 | `author.id`, `author.display` | keep, meaning made exact | See "The author" below. |
 | `container.kind`, `container.id` | keep | Where the entity lives at the source. `kind` follows the container kind grammar of ADR 3. `id` is the provider's id **as the provider spells it**, not escaped (the scope id holds the escaped form). Informational: often the container the scope is made of, and not always (a comment lives in a task, and is decided on the task's list). |
 | `visibility.scope` | keep | ADR 3. The one thing access is decided on. |
 | `visibility.audience` | keep | `direct` or `group`. It stays inside `visibility` because it describes the scope (a DM is `direct`), and it stays **informational: it grants and denies nothing**. The schema and the Go type both say so, because a sink that reads `direct` as "private to the author" repeats the defect behind principle 9. |
-| `origin.automation`, `origin.untrusted` | keep | Both required. A missing `untrusted` must never read as "trusted", which is what a lenient decoder would make of it. |
-| `edges.reply_parent` | keep, meaning made exact | The **`external_id`** of the entity this one replies to, or `null`. Not a record id: the parent has many records, one per version, and a reply hangs under the entity. Further edges are additive (B11 may add one for a comment's task). |
+| `origin.automation`, `origin.untrusted` | keep, meaning made exact | Both required. A missing `untrusted` must never read as "trusted", which is what a lenient decoder would make of it, and neither must `false`: see decision 10. |
+| `edges.reply_parent` | keep, meaning made exact | The **`external_id`** of the entity this one replies to, or `null`, with the same grammar as `external_id`. Not a record id: the parent has many records, one per version, and a reply hangs under the entity. Further edges are additive (B11 may add one for a comment's task). |
 | `meta.raw_ref` | **dropped** | It pointed into a raw payload store (`fs://raw/...`) that the design does not have: raw bodies live in the outbox table and are deleted by retention. A reference a sink cannot resolve is noise, and an internal storage path is not something to publish. |
 | `meta.delivery` | keep, optional | Sluiceway's id of the accepted delivery, for support. |
+
+#### The external id
+
+`delete` removes "every stored version of the `external_id`", and `edges.reply_parent` points at
+one, so the format has to say within what an external id is unique. It is:
+
+- **An `external_id` is unique within one tenant, across all of that tenant's sources.** It
+  begins with the **internal provider key** and a colon (`slack:C0GENERAL:1752064245.000200`,
+  `clickup:task:86a1xyz`), and what follows is the provider's to define. The prefix is what keeps
+  ClickUp's task `12345` and HubSpot's ticket `12345` from being one entity at a sink, where a
+  tombstone for one would delete the other.
+- **A sink keys an entity by tenant and `external_id` together, and never by `source`.**
+  `source` is the wire name, which is sink configuration and may change: a sink keyed by it
+  would find nothing under the new name when a tombstone arrives after a rename, and the deleted
+  entity would stay retrievable. The provider key inside the external id is not the wire name
+  and never changes, for the reason the scope id uses it (ADR 3).
+- It is enforced, not a convention. The schema and `Record.Validate` require the shape (a
+  provider key, a colon, at least one more character), for `external_id` and for
+  `edges.reply_parent`. `Record.Seal` requires the key to be the sealing provider's, for both, as
+  it does for the scope. So a normalizer that hands over the source's bare id fails on its first
+  record.
+- Beyond the prefix an external id is opaque: a sink compares it for equality and does not take
+  it apart, not even to read the provider out of it.
 
 ### 3. Required, empty, null, absent
 
@@ -127,7 +181,8 @@ version by this document's own rule. So it is in the enum now, and its shape is 
 - `version` differs from every upsert version of the entity, so the tombstone has its own `id`;
 - `supersedes` names the last record of the entity, where Sluiceway knows it;
 - `visibility.scope` is the scope the entity was last in;
-- the sink removes or hides **every** stored version of the `external_id`, for that tenant.
+- the sink removes or hides **every** stored version of the `external_id`, for that tenant: what
+  it holds under the key (tenant, `external_id`), whatever `source` those records carried.
 
 Sluiceway v0.1 never sends one (deletions are "After v0.1" in the roadmap). A sink written today
 knows that one can come. A sink that cannot honour a delete **refuses the record** (which
@@ -213,20 +268,196 @@ construction:
   checks exactly that when it refuses the same id with different content.
 
 `Record.Seal` is the only way to an id. It hashes the scope the record carries and no other, and
-it refuses a scope outside the sealing provider's namespace.
+it refuses a scope outside the sealing provider's namespace. Because a promise to sinks rests on
+it, this is enforced and not only said:
+
+- `ids.RecordID` has to be exported for `Seal` to call it, so a test in `internal/ids` parses
+  every Go file of the repository and fails when anything outside `internal/record` refers to it
+  (a call, a function value, an aliased or a dot import).
+- The fields the id stands for (`ID`, `ExternalID`, `Version`, `Visibility.Scope`) stay
+  assignable after `Seal`, because a `Record` is a plain value and `Supersedes` and `Source` are
+  meant to be set afterwards. So `Seal` also keeps a private copy of the four, and **`Marshal`
+  refuses a record in which they no longer say what was sealed**, or that was never sealed. A
+  pipeline stage that reassigns the scope after sealing fails at once, where the mistake is, and
+  not as a dead letter at a strict sink. Decoding pins what it read in the same way. The
+  alternative, hashing again in `Marshal`, would need the provider key and the tenant, which are
+  deliberately not in the envelope, and would cost a BLAKE3 per record. The comparison costs
+  four string compares: `Marshal` measured 2.5 microseconds per record before and after.
 
 Nothing has been delivered yet, so re-keying costs nothing today. After v0.1.0 it would re-key
 every record at every sink. That is why it is decided here and not when the first provider with
 movable entities arrives.
 
-**What remains.** An entity that moves from A to B **and back to A**, with a provider version
-that changed at neither move, produces the first id again, and the ledger skips it. Only state
-can tell that apart from a late re-send. The format does not need another field for it: what it
-needs is that `version` moves, so the normalizer contract (B11 and every provider after it) says
-that a version must change with every change the provider reports, a move included, and where
-the provider's own version does not, the normalizer derives one from something that does (the
-move event's time). Hashing the scope makes the common case safe when that contract is broken.
-It does not make the contract optional.
+**What remains: A, B, and back to A.** An entity that moves from scope A to B **and back to A**,
+with a provider version that changed at neither move, produces the first record's id again. A
+ledger that only asks "have I delivered this id" skips it, and the sink keeps the record in B:
+B's members go on reading what they lost access to, A's members never get it back, and nothing
+reports an error. Undoing a move made by mistake is the most likely reason for a second move, so
+this is not a corner. The sink cannot repair it either. It is idempotent on `id`, and the first
+record would have to supersede the second, which supersedes the first.
+
+> **Decided by default, the maintainer may overrule.** The reviewer of B05 raised this and the
+> orchestrator adopted the position below, because failing loudly is this project's rule. It is
+> written as a requirement on B08 and copied to issue #8. Whether a public contract may ship
+> with the remaining window at all is the maintainer's call.
+
+**The format does not change for it.** `version` is opaque to a sink, so the repair can arrive
+later inside v1 without re-keying a record already delivered: a normalizer derives the version
+from the move event, or the pipeline folds a counter that the ledger holds into `version`.
+Neither needs a new field.
+
+**The ledger stage (B08) must detect the case and must never skip it silently.** It is
+detectable with state the ledger needs anyway, which is, per entity (tenant, provider,
+`external_id`), the head of the supersede chain and the scope of that head:
+
+1. the incoming record's id is already in the ledger, and
+2. it is **not the head** of its entity's chain, and
+3. **the head's scope differs from the incoming record's scope.**
+
+A repeat of the head (a re-drain, a backfill overlap) fails condition 2. A late re-send of an
+old version fails condition 3, because a record hydrated at drain time carries the scope the
+entity is in now, which is the head's. What passes all three is either an entity that moved
+back, or a stale record from the old scope (a degraded record built from an old webhook body,
+see below), and the ledger cannot tell which. So it does not guess: such a record is
+**dead-lettered with a reason of its own and counted in a metric**, never skipped and never
+delivered.
+
+**What an operator does with one.** The dead letter names the tenant, the provider and the
+entity. The operator looks at the entity at the source. If it is in the scope the dead letter
+says (it moved back), the provider's normalizer has broken its contract: it is fixed so that a
+move changes the version, and the dead letter is replayed, which now yields a new id that
+supersedes the record in B. If the entity is in the head's scope, the dead letter was a stale
+record and is discarded. Until the first case is resolved the sink still holds the record in B.
+That is the window that remains, and it is now a visible one: a dead letter and a counter that
+is not zero.
+
+The normalizer contract stays what it was (B11 and every provider after it): a version changes
+with every change the provider reports, a move included, and where the provider's own version
+does not, the normalizer derives one from something that does (the move event's time). Hashing
+the scope makes the common case safe when that contract is broken, and the ledger rule makes the
+A, B, A case loud when it is. Neither makes the contract optional.
+
+Two relatives of this case, recorded so that B08 and B11 meet them knowingly:
+
+- **Delete, then restore, with an unchanged version.** The restored entity produces the id it
+  had before the delete. The ledger knows that id, it is not the head (the tombstone is), and
+  the head's scope is the same, so condition 3 does not see it and the record is skipped: the
+  entity stays deleted at the sink. That **fails closed**, nobody reads what they should not.
+  But the scope check cannot help, so the normalizer rule (a restore changes the version) is
+  the only protection. v0.1 sends no deletes, so this cannot happen before deletions ship, and
+  the item that ships them has to settle it.
+- **A degraded record must derive the same scope as the hydrated one would.** When hydration
+  fails and a record is built from the webhook body, its scope goes into its id. If the
+  degraded path derived a different scope for the same version of the same entity (a missing
+  field, another fallback), one version would get two ids, be delivered twice, and look like a
+  move to the ledger. So both paths build the scope from the same inputs through the same
+  function, and where the webhook body does not carry what the scope is made of, the record
+  cannot be degraded: that delivery is retried or dead-lettered, never given a guessed scope.
+
+### 8. The bytes of a document
+
+**A record document is UTF-8, and no `\u` escape in it names half of a surrogate pair.** An
+escaped pair (`\uD83D\uDE00`) is fine, and so is the astral character itself. This is a rule of
+the format that a sink may rely on, and Sluiceway never writes a document that breaks it.
+
+It has to be said because JSON parsers do three different things with such bytes, and the format
+exists so that two consumers never read two different records in one document:
+
+- Go's `encoding/json` accepts an invalid byte and a lone surrogate escape alike and puts U+FFFD
+  in their place. A document with the byte `0xFF` in `external_id` and the same document with
+  `0xFE` there decode to **one** external id, so two documents become one entity.
+- Python's `json` refuses a document that is not UTF-8, and **keeps** a lone surrogate, so
+  `\uD800` and `\uDC00` are two distinct values there, both of which pass the schema, and one
+  value in Go.
+- A JSON Schema never sees any of it: it is handed a parsed document.
+
+So the rule is checked on the bytes, before parsing. `Record.UnmarshalJSON` refuses a document
+that is not valid UTF-8 and one with an unpaired surrogate escape, anywhere in it, unknown
+fields included. **A sink that validates with the schema alone checks the same two things
+itself**, and the schema's description says so. It is the third rule beyond the schema, next to
+the two below.
+
+### 9. Which characters a field may hold
+
+The first draft refused the C0 control characters and DEL in identifiers and names, "for log
+forging". That was half a rule: U+0085, U+2028 and U+2029 break a line in many log viewers and
+terminals just as a line feed does, and a right-to-left override (U+202E) in a display name makes
+a sink's UI show one person's name as another's, or `invoice<U+202E>gnp.exe` as
+`invoiceexe.png`. Tightening after v0.1.0 is a new format version, so it is decided now, field by
+field. Every rule is in the schema (`$defs` `identifier`, `displayName`, `oneLine`) and in
+`Record.Validate`, the two are held together by a test that runs about 1,800 code points through
+every field on both sides, and the same run was made with Python's `jsonschema`.
+
+| Fields | Refused | Why |
+|---|---|---|
+| **Identifiers:** `external_id`, `version`, `author.id`, `container.id`, `edges.reply_parent`, `meta.delivery` | Every control character: C0 (U+0000 to U+001F), DEL and C1 (U+007F to U+009F). The line and paragraph separators U+2028, U+2029. Every bidirectional formatting character: the embeddings and overrides U+202A to U+202E, the isolates U+2066 to U+2069, the marks U+200E, U+200F and U+061C. The zero-width and invisible format characters: U+00AD, U+200B to U+200D, U+2060 to U+2065, U+206A to U+206F, U+FEFF. As ranges: U+0000 to U+001F, U+007F to U+009F, U+00AD, U+061C, U+200B to U+200F, U+2028 to U+202E, U+2060 to U+206F, U+FEFF. | A program compares them and an operator reads them in a log. No provider id holds any of these, so nothing is lost, and an identifier can neither break a log line, nor reorder what is printed beside it, nor differ from another one invisibly by the commonest means. |
+| **`author.display`** | The same, **except that U+200C and U+200D are allowed.** | A name somebody chose for themselves, so it is where an attack would be planted, and it is shown in a UI next to other names. The zero-width non-joiner and joiner stay because Persian and Indic names are spelled with them and emoji sequences (a family, a profession) are built with them. The directional marks and the soft hyphen go: a name loses nothing visible without them. |
+| **`title`** | Every control character (C0, DEL, C1), so also tab, line feed and carriage return, and U+2028, U+2029. **Nothing else.** | Human content in any language, on **one line**: a task name, a subject, a page title, shown as a heading or a list row. Right-to-left titles legitimately use U+200E, U+200F and the isolates, and older ones the embeddings, so bidirectional formatting is content here and stays. |
+| **`text`** | NUL. Nothing else. | Content. Newlines, tabs, form feeds, escape characters, every kind of line break and all bidirectional formatting are what somebody wrote. |
+
+Four things follow, and a sink author should know them:
+
+- **`title` and `text` are not safe to display as they stand**, and neither is any other field
+  in a context that the lists above do not cover. They may hold bidirectional overrides, and
+  `text` may hold terminal escape sequences. They are foreign text and a sink treats them as
+  such.
+- **The lists are fixed code points, never a Unicode category.** A category (`Cf`, say) grows
+  with every Unicode version, and the format may not grow (decision 1). So they are not every
+  invisible character there is: the Hangul fillers, the variation selectors and the tag
+  characters (U+E0000 to U+E007F, which can smuggle text past a human reader) are not refused.
+  The tag characters were left out for a stated reason: regular expression dialects do not agree
+  on how to name a character above U+FFFF (one needs surrogate pairs, where a range across them
+  does not even compile), and a schema that only some validators can load is worse than a
+  shorter list. `display` still cannot stop one name imitating another with look-alike letters.
+  No list of characters can.
+- **The format refuses, it never repairs.** A display name with a right-to-left override makes
+  a record that `Seal` refuses, and a person can put one into their own Slack name. So a
+  normalizer removes the refused characters from the name the source gave, turns the line breaks
+  of a title into spaces, and cuts a text to its limit, before `Seal`. That belongs to the
+  normalizer contract (B11 and every provider after it). A normalizer that forgets fails loudly
+  on the first such record, which is a dead letter and not a leak.
+- **Portability of the patterns.** Characters up to U+00FF are written as regular expression
+  escapes (`\x9f`), which Go's, Python's and ECMAScript's dialects all read alike. For anything
+  above there is no escape they share (`\u2028` is not RE2, `\x{2028}` is not Python or
+  ECMAScript), so those characters are in the pattern **as themselves**, written in the schema
+  file with JSON escapes, which every JSON parser turns into the character before any regular
+  expression engine sees it. The file stays pure ASCII.
+
+A container id inside a **scope id** is a different thing: it is carried as escaped bytes, the
+result is ASCII, and ADR 3 refuses only control bytes there. A provider id with a zero-width
+space in it (none is known) would make a valid scope id and an invalid `container.id`, so the
+record is refused, loudly, which is the right failure.
+
+### 10. What `origin` says, and what it does not
+
+Both fields are **signals, never clearances**:
+
+- `origin.untrusted: true` means Sluiceway has a **positive signal** that the author is outside
+  the tenant: inbound mail from a stranger, an external guest in a shared channel.
+- `origin.untrusted: false` means **no signal.** The source did not say, the provider cannot
+  tell, or this version of Sluiceway does not look. It never means that the author is inside
+  the tenant, and never that the text is safe to follow.
+- `origin.automation` likewise: `true` is a positive signal that a bot or an integration wrote
+  it (the source marks the author as one), `false` is no signal, never "a person wrote it".
+
+This has to be pinned before v0.1.0 because the roadmap populates the untrusted marking only
+**after v0.1**. In v0.1 no provider sets it, so mail from a stranger, delivered through Outlook,
+says `"untrusted": false`. A sink author who reads `false` the natural way ("checked, and fine")
+and lets such text past an injection guard is wrong from the first day, and a meaning cannot be
+repaired within v1. With `false` defined as "no signal", populating the marking later changes no
+meaning: more records say `true`, and every sink that was correct stays correct.
+
+So the rule for a sink: **every text is untrusted content, whatever `origin` says. Use `true` to
+be stricter, never `false` to be laxer.** And for a normalizer: set a field to `true` only on a
+positive signal from the source, leave it `false` otherwise.
+
+**Why two values and not three** (`true`, `false`, `unknown`). A third value would earn its
+place only if a sink could do something with "known to be inside" that it cannot do with "no
+signal", and the only such thing is to relax its guard. Sluiceway can never license that: an
+insider's message quotes an outsider's mail, a forwarded thread, a pasted web page, and the
+author's membership says nothing about where the words came from. A value that means "safe" is
+one Sluiceway cannot honestly send, so the field has no use for a way to say it, and the
+two-valued form already says everything true: "we saw a reason for extra care" or "we saw none".
 
 ### The Go side and the schema agree
 
@@ -235,16 +466,22 @@ directions. A `Record` that fails `Validate` cannot be marshalled. A document th
 cannot be unmarshalled into a `Record`: decoding checks that required fields are present and not
 null (plain `encoding/json` would read a missing `origin` as "trusted"), that field names are
 lowercase, that `visibility` holds nothing unknown, and that `occurred_at` is spelled as above.
-About 250 documents, 46 Go values and a fuzz target run through both and must get the same
-answer.
+About 330 documents, about 60 Go values and a fuzz target run through both and must get the same
+answer. Two parts of the grammar are small enough to run in full, and are: every `%XX` escape of
+a scope id, all 256 bytes in uppercase, lowercase and mixed hex (ADR 3), and about 1,800 code
+points in every field that has a character rule (decision 9). Both are judged against the rule
+as the ADRs state it and not against each other, because two halves that drift together agree.
 
-Two rules only the Go side has, because no JSON Schema can state them. A sink that validates
-with the schema alone should add both:
+Three rules only the Go side has, because no JSON Schema can state them. A sink that validates
+with the schema alone should add all three, and the schema's description lists them:
 
 - **`supersedes` is not the record's own `id`.** JSON Schema cannot compare two fields.
 - **No field name twice in one object.** Decoders disagree on which one counts, so a validator
   that keeps the first `visibility` and a consumer that keeps the last would see two different
   scopes in one record. Sluiceway never writes such a document. The Go decoder refuses one.
+- **The bytes of the document** (decision 8): UTF-8, and no escape for half of a surrogate pair.
+  The tests state the expected outcome of these cases themselves, because the schema validator
+  they use parses with `encoding/json` and so judges a document that has already been rewritten.
 
 Two properties of the schema exist for validators other than the one in our tests:
 
@@ -280,9 +517,21 @@ an error ends up in a log or an outbox row.
 - Closed sets mean a sixth `kind` after v0.1.0 is a v2. The alternative, an open `kind`, would
   push "what do I do with a kind I have never seen" onto every sink.
 - Decoding is strict and makes several passes (about 25 microseconds for the example record).
-  That is the consumer's side. On Sluiceway's side a record costs a `Validate`: about 0.2
-  microseconds and no allocation for a short message, about 0.25 milliseconds for the largest
-  text the format allows.
+  That is the consumer's side. On Sluiceway's side a record costs a `Validate`: about 0.25
+  microseconds and no allocation for a short message, and about 0.02 milliseconds for the
+  largest text the format allows, which is only searched for NUL and checked for UTF-8.
 - `delete` is defined before anything sends it. If deletions turn out to need more (a whole
   container deleted at once), that is an additive field or a v2, decided then.
-- The A, B, A move with an unchanged provider version is documented and not solved.
+- The A, B, A move with an unchanged provider version is not solved by the format. It is made
+  loud: B08 has to dead-letter and count it (decision 7), and until an operator acts on that,
+  the record stays in the wrong scope at the sink. Decided by default, for the maintainer to
+  confirm or overrule.
+- Every limit, pattern and character list is frozen in both directions from v0.1.0 on
+  (decision 1). What was not measured against real providers by then (the 512 bytes of a scope
+  id against Graph ids, ADR 3) can only be corrected in a v2.
+- The character rules put work on every normalizer: names and titles from the source have to be
+  cleaned before `Seal`, or the record is refused (decision 9). That is deliberate, the format
+  does not repair, and it is one more thing a provider can forget, loudly.
+- The character lists are not every invisible character (decision 9 says which are missing and
+  why), and `external_id` now has a grammar, so a sink can no longer be told "it is just an
+  opaque string": it is opaque after the provider key.

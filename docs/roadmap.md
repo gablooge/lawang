@@ -153,7 +153,9 @@ Roughly in priority order.
   `op: "delete"` records. Format v1 already defines them, so shipping this does not change the
   format ([ADR 4](adr/0004-record-format-v1.md)).
 - **Untrusted-origin marking** populated per provider (inbound mail, external guests). The format
-  already carries `origin.untrusted`.
+  already carries `origin.untrusted`, and defines `false` as "no signal", never as "safe", so
+  that every v0.1 record can say `false` and populating the marking later changes no meaning
+  ([ADR 4](adr/0004-record-format-v1.md), decision 10).
 - **An MCP-backed hydrator** and a tool-calling facade for acting on providers.
 - **More providers:** Gmail, Google Drive, Notion, Asana, Jira, GitHub.
 - **More sinks:** pgvector, webhook fan-out, S3.

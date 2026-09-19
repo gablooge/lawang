@@ -18,13 +18,15 @@
 // A Record that does not pass Validate cannot be marshalled, and a document the schema refuses
 // cannot be unmarshalled into one, so nothing the format forbids passes through encoding/json
 // in either direction. The Go side and the schema refuse the same things, and the tests run
-// every case through both. The exceptions are the two rules no JSON Schema can express: a record
-// that supersedes itself (Validate) and a field name used twice in one object (UnmarshalJSON).
+// every case through both. The exceptions are the three rules no JSON Schema can express: a
+// record that supersedes itself (Validate), and in UnmarshalJSON a field name used twice in one
+// object and a document whose bytes are not UTF-8 or that escapes half of a surrogate pair.
 package record
 
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gablooge/sluiceway/internal/ids"
@@ -33,9 +35,10 @@ import (
 
 // FormatV1 is the value of Record.Format. A sink learns which format it is reading from this
 // field, because it is the only thing that is still there when a record sits in a file or a
-// queue. Within v1 only fields a reader may ignore are added. Anything else is a new format with
-// a new value: a field removed or renamed, a changed meaning, a new Op, Kind or Audience, any
-// change inside Visibility.
+// queue. Within v1 every record Sluiceway produces validates against every earlier v1 schema. So
+// only fields a reader may ignore are added, and anything else is a new format with a new value:
+// a field removed, renamed or made optional, a changed meaning, a limit or a pattern changed in
+// either direction, a new Op, Kind or Audience, any change inside Visibility.
 const FormatV1 = "sluiceway.record/v1"
 
 // Op says what the sink does with the record.
@@ -90,11 +93,14 @@ type Record struct {
 	// need not equal the first segment of Visibility.Scope, which is always the provider key.
 	Source string `json:"source"`
 	Kind   Kind   `json:"kind"`
-	// ExternalID is the entity's identity at the source, the same for every version: 1 to
-	// MaxExternalID characters, no control characters. Opaque.
+	// ExternalID is the entity's identity, the same for every version of it, and unique within
+	// one tenant across all of the tenant's sources: it begins with the provider key and a colon
+	// ("slack:C0GENERAL:1752064245.000200"), and Seal refuses one that does not. A sink keys an
+	// entity by tenant and ExternalID together, never by Source. 1 to MaxExternalID characters of
+	// an identifier (see identifierChars for what that excludes). Opaque beyond the prefix.
 	ExternalID string `json:"external_id"`
-	// Version names this version of the entity: 1 to MaxVersion characters, no control
-	// characters. The provider's normalizer promises that it changes whenever the entity
+	// Version names this version of the entity: 1 to MaxVersion characters of an identifier.
+	// The provider's normalizer promises that it changes whenever the entity
 	// changes, and that for one ExternalID it never goes backwards. Nothing in the format can
 	// check that promise. To a sink a version is opaque: equal or not equal, and the order of
 	// versions is what Supersedes says.
@@ -107,8 +113,12 @@ type Record struct {
 	// the zero time.
 	OccurredAt time.Time `json:"occurred_at"`
 	// Title and Text may be empty, and are empty on a delete. Both are PII-masked before they
-	// get here. At most MaxTitle and MaxText characters, and no NUL, which a Postgres text
-	// column cannot hold. Cutting a longer text down is the normalizer's job.
+	// get here. At most MaxTitle and MaxText characters. Text holds anything but NUL, which a
+	// Postgres text column cannot hold. Title is one line: no control character (so no tab and
+	// no line break) and no line or paragraph separator. Both keep bidirectional formatting,
+	// which right-to-left text uses, so neither is safe to display as it stands. The format
+	// refuses and never repairs: cutting a text down, and turning the line breaks of a title
+	// into spaces, is the normalizer's job.
 	Title string `json:"title"`
 	Text  string `json:"text"`
 	// Author is informational. Access is never decided on it.
@@ -121,13 +131,37 @@ type Record struct {
 	// Meta is diagnostics and not part of the record's content: the same ID may arrive again
 	// with a different Meta.
 	Meta Meta `json:"meta"`
+
+	// sealed is what the ID stands for, as Seal minted it or as UnmarshalJSON read it. The four
+	// fields beside it stay assignable, because a Record is a plain value, and MarshalJSON
+	// refuses a record in which they no longer say what was sealed. No other package can set
+	// this, so outside this package the only ways to a record that can be marshalled are Seal
+	// and decoding one.
+	sealed seal
+}
+
+// seal is the ID and the three fields of the envelope that are hashed into it. The provider and
+// the tenant are hashed too and are not in the envelope, which is why the check is a comparison
+// with what Seal saw and not a second hash.
+type seal struct {
+	id, externalID, version, scope string
+}
+
+func (r Record) currentSeal() seal {
+	return seal{id: r.ID, externalID: r.ExternalID, version: r.Version, scope: r.Visibility.Scope}
 }
 
 // Author is who wrote the entity, in the source's own terms. Both fields may be empty when the
 // source does not say (a record degraded to the webhook body, a system event). At most MaxAuthor
-// characters each, no control characters.
+// characters each.
 type Author struct {
-	ID      string `json:"id"`
+	// ID is an identifier (identifierChars).
+	ID string `json:"id"`
+	// Display is a name somebody chose for themselves, so it is where a line break or a
+	// right-to-left override would be planted to forge a log line or to pass for somebody else
+	// in a sink's UI. It holds what an identifier holds, and the zero-width joiner and
+	// non-joiner, which names and emoji are spelled with (displayChars). The format refuses and
+	// never repairs: a normalizer removes the refused characters from the name the source gave.
 	Display string `json:"display"`
 }
 
@@ -139,7 +173,7 @@ type Container struct {
 	// of a-z 0-9 _.
 	Kind string `json:"kind"`
 	// ID is the source's id exactly as the source spells it, not escaped: 1 to MaxContainerID
-	// characters, no control characters.
+	// characters of an identifier (identifierChars).
 	ID string `json:"id"`
 }
 
@@ -152,12 +186,21 @@ type Visibility struct {
 	Audience Audience `json:"audience"`
 }
 
-// Origin says where the content came from, as far as it bears on trusting it.
+// Origin is what Sluiceway knows about where the content came from. Both fields are signals and
+// never clearances: true means there is a positive signal, false means there is NO SIGNAL (the
+// source did not say, the provider cannot tell, or this version does not look). False is never
+// the opposite of true. A sink treats every text as untrusted content whatever Origin says, and
+// uses true to be stricter, never false to be laxer. A normalizer sets a field to true only on a
+// positive signal from the source, and leaves it false otherwise.
 type Origin struct {
-	// Automation: written by a bot or an integration.
+	// Automation true: the source marks the author as a bot or an integration. False: no
+	// signal, never a statement that a person wrote it.
 	Automation bool `json:"automation"`
-	// Untrusted: written by somebody outside the tenant (inbound mail, an external guest).
-	// Such text may be written to steer an AI agent that reads it.
+	// Untrusted true: there is a positive signal that the author is outside the tenant (inbound
+	// mail from a stranger, an external guest). Such text may be written to steer an AI agent
+	// that reads it. False: no signal, never a statement that the author is inside the tenant
+	// or that the text is safe to follow. v0.1 sets it for no provider (the roadmap has the
+	// marking after v0.1), so in v0.1 mail from a stranger says false.
 	Untrusted bool `json:"untrusted"`
 }
 
@@ -206,23 +249,36 @@ func (r *Ref) UnmarshalJSON(data []byte) error {
 // wire has Record's fields and none of its methods, so marshalling it does not come back here.
 type wire Record
 
-// MarshalJSON refuses a record that does not pass Validate. The error says which field, never
-// what was in it.
+// MarshalJSON refuses a record that does not pass Validate, and a record whose ID is not the one
+// that was sealed for the ExternalID, Version and Visibility.Scope it now carries: one that was
+// never sealed, or one that was changed afterwards. A sink is promised that one id never appears
+// with two scopes, and without this a pipeline stage that reassigned the scope after sealing
+// would break the promise far from where anybody would look. Seal again after such a change.
+// Supersedes, Source and everything that is not in the id may be set after sealing.
+//
+// The error says which field, never what was in it.
 func (r Record) MarshalJSON() ([]byte, error) {
 	if err := r.Validate(); err != nil {
 		return nil, err
+	}
+	if r.sealed != r.currentSeal() {
+		return nil, invalid("id", "was not sealed for the external_id, version and visibility.scope the record carries")
 	}
 	return json.Marshal(wire(r))
 }
 
 // Seal finishes a record a normalizer built: it sets Format, sets Source to the provider key,
 // mints the ID, and validates the result. It is the only way to an ID, so an id always hashes
-// the scope the record carries, and a record with no tenant or no scope never gets one.
+// the scope the record carries, and a record with no tenant or no scope never gets one. Two
+// things hold that: a test in internal/ids fails when anything outside this package calls the id
+// recipe, and MarshalJSON refuses a record whose ID, ExternalID, Version or Visibility.Scope is
+// not what Seal left there.
 //
 // provider is the internal provider key (Provider.Key), never a wire name. Seal refuses a scope
 // that is not in that provider's namespace, so one provider cannot stamp a record into the scope
-// of another. It refuses a Source that was already set to anything else, and a tenant that
-// tenancy.Parse would refuse.
+// of another, and for the same reason an ExternalID or an Edges.ReplyParent that does not begin
+// with the provider key and a colon. It refuses a Source that was already set to anything else,
+// and a tenant that tenancy.Parse would refuse.
 //
 // Supersedes is usually set after sealing, once the ledger has been asked which record the new
 // ID replaces. Nothing is lost by that order: marshalling validates again.
@@ -237,8 +293,17 @@ func (r Record) Seal(provider string, tenant tenancy.ID) (Record, error) {
 	if err := checkScopeID(scope); err != nil {
 		return Record{}, invalid("visibility.scope", "is not a scope id")
 	}
-	if len(scope) <= len(provider) || scope[:len(provider)] != provider || scope[len(provider)] != ':' {
+	if !strings.HasPrefix(scope, provider+":") {
 		return Record{}, invalid("visibility.scope", "belongs to another provider")
+	}
+	// The same namespace holds the entity: an external id is unique within a tenant because it
+	// begins with the provider key, so a normalizer that handed over the source's bare id would
+	// let two providers share one entity at the sink, and a delete for one would remove the other.
+	if !strings.HasPrefix(r.ExternalID, provider+":") {
+		return Record{}, invalid("external_id", "does not begin with the provider key and a colon")
+	}
+	if parent := string(r.Edges.ReplyParent); parent != "" && !strings.HasPrefix(parent, provider+":") {
+		return Record{}, invalid("edges.reply_parent", "does not begin with the provider key and a colon")
 	}
 	if _, err := tenancy.Parse(tenant.String()); err != nil {
 		return Record{}, invalid("tenant", "is not a tenant id")
@@ -250,6 +315,7 @@ func (r Record) Seal(provider string, tenant tenancy.ID) (Record, error) {
 	r.Format = FormatV1
 	r.Source = provider
 	r.ID = id
+	r.sealed = r.currentSeal()
 	if err := r.Validate(); err != nil {
 		return Record{}, err
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"unicode/utf8"
 )
 
 // objectRule is what decoding demands of one JSON object of the envelope, beyond the types of
@@ -56,10 +57,22 @@ var nestedRules = []struct {
 // twice in one object. Decoders disagree on which of the two counts, so a validator that keeps
 // the first and a consumer that keeps the last would see two different scopes in one record.
 //
+// Two more refusals are about the bytes of the document, below the level a schema works at (ADR
+// 4, "The bytes of a document"): a document that is not valid UTF-8, and a \u escape that names
+// half of a surrogate pair. encoding/json accepts both and writes U+FFFD in their place, so two
+// different documents would decode to one identity, while another consumer of the same bytes
+// refuses the document or keeps the two apart.
+//
 // The error says which field, never what was in it.
 func (r *Record) UnmarshalJSON(data []byte) error {
+	if !utf8.Valid(data) {
+		return invalid("the record", "is not valid UTF-8")
+	}
 	if err := checkNoDuplicateNames(data); err != nil {
 		return err
+	}
+	if hasUnpairedSurrogate(data) {
+		return invalid("the record", "has an escape for half of a surrogate pair")
 	}
 	top, err := checkObject("the record", data, recordRule)
 	if err != nil {
@@ -91,10 +104,14 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 		}
 		return invalid("the record", "has a value that cannot be decoded")
 	}
-	if err := Record(w).Validate(); err != nil {
+	decoded := Record(w)
+	if err := decoded.Validate(); err != nil {
 		return err
 	}
-	*r = Record(w)
+	// A decoded record was sealed by whoever wrote the document. What was read is pinned, so
+	// that writing it out again after a change to what the id stands for is refused.
+	decoded.sealed = decoded.currentSeal()
+	*r = decoded
 	return nil
 }
 
@@ -170,6 +187,47 @@ func checkNoDuplicateNames(data []byte) error {
 		}
 		valueDone()
 	}
+}
+
+// hasUnpairedSurrogate reports whether a \u escape in a JSON document names half of a surrogate
+// pair with the other half missing: a high surrogate (D800 to DBFF) that is not followed at once
+// by an escaped low surrogate (DC00 to DFFF), or a low surrogate with no high one before it.
+//
+// data must be valid JSON. A backslash then occurs only inside a string, and every escape is
+// either one character after the backslash or 'u' and four hex digits, so the escapes can be
+// read in order without following the structure of the document.
+func hasUnpairedSurrogate(data []byte) bool {
+	const escapeLen = 6 // a backslash, 'u' and four hex digits
+	// surrogate returns 'h' or 'l' if an escape for a high or a low surrogate starts at i.
+	surrogate := func(i int) byte {
+		if i+escapeLen > len(data) || data[i] != '\\' || data[i+1] != 'u' || data[i+2]|0x20 != 'd' {
+			return 0
+		}
+		switch c := data[i+3] | 0x20; {
+		case c == '8' || c == '9' || c == 'a' || c == 'b':
+			return 'h'
+		case c >= 'c' && c <= 'f':
+			return 'l'
+		}
+		return 0
+	}
+	for i := 0; i < len(data); i++ {
+		if data[i] != '\\' {
+			continue
+		}
+		switch surrogate(i) {
+		case 'l':
+			return true
+		case 'h':
+			if surrogate(i+escapeLen) != 'l' {
+				return true
+			}
+			i += 2*escapeLen - 1
+		default:
+			i++ // the escaped character, which may be a backslash
+		}
+	}
+	return false
 }
 
 // validTimestamp is the occurred_at pattern of the schema, by hand:

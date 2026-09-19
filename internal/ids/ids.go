@@ -74,7 +74,11 @@ func DeliveryID(provider string, rawBody []byte) (string, error) {
 // so that an entity which moves to another scope is a new record even when the provider's own
 // version did not change with the move. Otherwise the moved record would keep its id, the ledger
 // would skip it as already delivered, and the sink would go on deciding access on the old scope.
-// Callers go through record.Seal, which hashes the scope the record carries and no other.
+//
+// record.Seal is the only caller, and it hashes the scope the record carries and no other. That
+// is enforced, not only said: TestRecordIDHasNoCallerOutsideRecord fails when any file outside
+// internal/record refers to this function, and a record whose id, external id, version or scope
+// was changed after Seal cannot be marshalled.
 func RecordID(provider, externalID, version, scope, tenant string) (string, error) {
 	parts := [...]struct{ name, value string }{
 		{"provider", provider},

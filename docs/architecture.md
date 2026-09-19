@@ -322,7 +322,16 @@ a task to another list, is decided on different members from then on, and the pr
 version does not have to change with the move. Without the scope in the hash the moved record
 would keep its id, the ledger would skip it as already delivered, and the sink would go on
 deciding access on the old scope, with no error anywhere. `record.Seal` is the only caller of the
-recipe, and it hashes the scope the record carries.
+recipe, and it hashes the scope the record carries. Both halves are enforced: a test fails when
+anything outside `internal/record` refers to `ids.RecordID`, and a record whose id, external id,
+version or scope was changed after `Seal` cannot be marshalled.
+
+One case the id cannot settle: an entity moved from scope A to B **and back to A**, with a
+provider version that changed at neither move, produces the first record's id again. The ledger
+(step 5 of [section 3.2](#32-drain-path-inside-worker)) must not skip it silently. An incoming id
+that is already known, is not the head of its entity's supersede chain, and whose scope differs
+from the head's scope is dead-lettered and counted (ADR 4, decision 7, which also says what an
+operator does then). This was decided by default and is the maintainer's to overrule.
 
 A **new version is a new record.** Edits never overwrite; the new record carries `supersedes`, the
 id of the version it replaces. Supersede links only point forward, so a late-arriving old version
@@ -372,32 +381,43 @@ always a record the schema accepts and the Go types produce.
 | `op` | required | `upsert`, or `delete`: a tombstone with empty `title` and `text`. `delete` is part of v1 so that shipping deletions does not change the format; v0.1 never sends one. |
 | `source` | required | The name the sink knows the source by. Sink configuration (principle 4), so it is in no id and need not match the first segment of the scope. |
 | `kind` | required | `task`, `message`, `ticket`, `document` or `page`. A closed set. |
-| `external_id` | required | The entity's identity at the source, the same for every version. Opaque. |
+| `external_id` | required | The entity's identity, the same for every version, **unique within one tenant across all its sources**: it begins with the internal provider key and a colon, and `Seal` refuses one that does not. A sink keys an entity by tenant and `external_id`, never by `source`. Opaque beyond the prefix. |
 | `version` | required | Names this version. Opaque to a sink: equal or not equal. The provider's normalizer promises it changes when the entity changes and never goes backwards for one `external_id`; the format cannot check that. |
 | `supersedes` | required, may be null | The `id` of the record this one replaces. Forward only. |
 | `occurred_at` | required | Source event time, never ingest time. RFC 3339, always UTC with `Z`, up to nine fractional digits. |
-| `title`, `text` | required, may be empty | Already PII-masked. At most 1,024 and 1,048,576 characters. Untrusted content by nature. |
-| `author` | required | `id` is the provider's own user id, as the provider spells it, and `display` a name to show. Either may be empty when the source does not say. Informational: **access is never decided on the author**, and `author.id` is not the person identifier that membership uses. |
+| `title`, `text` | required, may be empty | Already PII-masked. At most 1,024 and 1,048,576 characters (Unicode code points). `title` is one line: no control characters, no line or paragraph separator. `text` holds anything but NUL. Untrusted content by nature, whatever `origin` says, and not safe to display as it stands: both may hold bidirectional formatting. |
+| `author` | required | `id` is the provider's own user id, as the provider spells it, and `display` a name to show. Either may be empty when the source does not say. Informational: **access is never decided on the author**, and `author.id` is not the person identifier that membership uses. `display` can neither break a line nor reorder the text around it (ADR 4, decision 9). |
 | `container` | required | `kind` and `id` of where the entity lives at the source (the channel of a message, the task of a comment). Often what the scope is made of, and not always. |
 | `visibility.scope` | required | **The one thing access is decided on.** A scope id (ADR 3), always built from the internal provider key. |
 | `visibility.audience` | required | `direct` (named participants: a DM, a mailbox) or `group` (a shared space). Informational only: it grants and denies nothing. |
-| `origin` | required | `automation`: a bot or an integration wrote it. `untrusted`: somebody outside the tenant wrote it. |
+| `origin` | required | Signals, never clearances. `automation: true`: the source marks the author as a bot or an integration. `untrusted: true`: there is a positive signal that the author is outside the tenant. **`false` means no signal, never the opposite**, and never that the text is safe to follow. |
 | `edges.reply_parent` | required, may be null | The `external_id` of the entity this one replies to. Relations come from fields, never from NLP. |
 | `meta` | may be absent | Diagnostics (`delivery`: the accepted delivery the record was made from). Not part of the record's content. |
 
 **Reading rules for a sink.** Refuse a `format` you do not know. Be idempotent on `id`. Decide
 access on `visibility.scope` and nothing else, keyed by tenant and scope together, because the
 tenant is deliberately not in the envelope or in the scope id: it arrives beside the records,
-established by the per-tenant sink credential ([section 4](#4-trust-model)). Compare `id`,
-`external_id`, `version` and `visibility.scope` for equality only, never parse them. Ignore fields
+established by the per-tenant sink credential ([section 4](#4-trust-model)). Key an entity by
+tenant and `external_id` together, never by `source`, which is a name that may change. Compare `id`,
+`external_id`, `version` and `visibility.scope` for equality only, never parse them, and encode a
+scope id once more wherever it enters a URL (it holds percent signs, ADR 3). Ignore fields
 you do not know, **except inside `visibility`**, which is closed: an unknown field there could only
 be one that must not be ignored, so it is a reason to refuse the record. Field names are lowercase
 `a-z 0-9 _`, now and later, and a record with any other field name is refused (some decoders match
 names without regard to case, and would read `ID` beside `id` as the same field).
 
-**What may change.** Within v1, only fields a reader may ignore are added. A field removed or
-renamed, a changed meaning, a new `op`, `kind` or `audience`, and any change inside `visibility`
-make a new format with a new `format` value and a new schema `$id`.
+Three rules of the format are beyond what a JSON Schema can state, so a sink that validates with
+the schema alone checks them itself (the Go decoder does): **a record document is UTF-8 and
+escapes no half of a surrogate pair** (checked on the bytes, before parsing, because parsers
+refuse such a document, or silently replace the bad part, or keep it, and then two consumers
+read two different records), no field name occurs twice in one object, and `supersedes` is never
+the record's own `id`.
+
+**What may change.** Within v1, every record Sluiceway produces validates against every earlier
+v1 schema. So only fields a reader may ignore are added, and nothing that exists moves, in either
+direction: a field removed, renamed or made optional, a changed meaning, a limit or a pattern
+changed (raised or lowered, widened or narrowed), a new `op`, `kind` or `audience`, and any change
+inside `visibility` make a new format with a new `format` value and a new schema `$id`.
 
 **The visibility rule is uniform: a person may see a record if they are a member of its scope.**
 There is deliberately no `private` flag. A DM is a scope whose members are its participants; a
@@ -426,7 +446,14 @@ it and the old scope's members lose it.
 `origin.untrusted` exists from day one because records authored by people outside the tenant, such
 as inbound email or external Slack guests, can carry text written to steer a downstream AI agent.
 Marking them at the connector boundary, the only place that knows, lets the sink treat them with
-suspicion.
+more suspicion. **What the field means is pinned now, because a meaning cannot change within v1:**
+`true` is a positive signal that the author is outside the tenant, and `false` is **no signal**,
+never "inside" and never "safe to follow". v0.1 sets it for no provider (the marking is on the
+roadmap after v0.1), so in v0.1 even mail from a stranger says `false`. A sink therefore treats
+every text as untrusted content, uses `true` to be stricter, and never uses `false` to be laxer.
+`origin.automation` is read the same way. The field stays two-valued: a third value, "known to
+be inside", could only be used to relax a guard, and an insider's message can quote an
+outsider's, so that is a statement Sluiceway can never make (ADR 4, decision 10).
 
 ---
 
