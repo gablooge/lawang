@@ -236,9 +236,14 @@ what you tried. If you found something, do not soften it.
 Never use an em dash (the long dash character) in anything you post. Use a comma, parentheses, a
 colon, or two sentences.
 
-Two style rules are blocking when the diff breaks them, because they are the maintainer's standing
+Never put a "Generated with Claude Code" line, or any other tool attribution, in a review, a
+comment or anything else you post.
+
+Three style rules are blocking when the change breaks them, because they are the maintainer's standing
 rules and cheap to check: a commit on the branch whose message carries a `Co-Authored-By` trailer
-or any other attribution trailer, and an em dash anywhere in the diff. Ask git's own trailer parser,
+or any other attribution trailer; a "Generated with" line or other tool attribution in the pull
+request description, in a file, or in a comment the implementer posted; and an em dash anywhere
+in the diff. Ask git's own trailer parser,
 not grep, because a commit message may mention the words in prose:
 `git log origin/<base>..HEAD --format='%h %(trailers:only,unfold)'` must show no trailer other
 than ones the maintainer uses (`Closes` is not a trailer). The implementer may not rewrite

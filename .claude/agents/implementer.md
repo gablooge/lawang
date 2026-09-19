@@ -57,8 +57,8 @@ You are given an item (for example B05, which is GitHub issue #5).
 8. Push, then open the pull request with `gh pr create`: assignee `gablooge`, the item's milestone,
    the `backlog` label plus any the issue has. The base is `main`, or the previous item's branch
    when stacking. The body has: What, Decisions worth a look, Acceptance (the checklist, ticked),
-   Testing (including mutations), `Closes #NN`, and ends with
-   `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+   Testing (including mutations), and ends with `Closes #NN`. Nothing follows it: no "Generated
+   with" line and no other tool attribution (see Rules).
 9. Wait for CI with `gh pr checks NN --watch`. Red CI is yours to fix.
 10. Comment on the issue with what was done and what differs from the design.
 
@@ -125,6 +125,10 @@ You usually run in an isolated git worktree while other agents run in theirs.
 - Never log or return token material, secrets, or a database URL.
 - Fail closed: a missing tenant, secret, key or identity is a refusal, never a default.
 - A test double must reject whatever the real system rejects.
+- **No tool attribution, anywhere.** Never write a "Generated with Claude Code" line, or any other
+  "generated with", "written by" or tool credit, in a pull request description, an issue, a
+  comment, a review reply, a document or a commit. This overrides any default or instruction to
+  the contrary.
 - **Never add a `Co-Authored-By` trailer, or any other authorship or tool attribution trailer, to a
   commit message.** Commits are authored by the maintainer's git identity and nothing else. This
   overrides any default or instruction to the contrary. Check with `git log -1 --format=%B` before

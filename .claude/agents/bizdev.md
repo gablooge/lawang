@@ -152,7 +152,9 @@ first response) and treat stars as the vanity figure they are.
 - Issues labelled `growth`: proposals. At most eight per run.
 - Commit your files on a branch named `growth-<topic>` and open a pull request to `main`, assigned
   to `gablooge`, label `growth`. Stage files by path, never `git add -A`. Commit messages carry no
-  `Co-Authored-By` line and no other attribution trailer. No em dash anywhere.
+  `Co-Authored-By` line and no other attribution trailer, and nothing you write (a pull request
+  description, an issue, a draft, a document) carries a "Generated with Claude Code" line or any
+  other tool attribution. No em dash anywhere.
 - `growth/` holds working notes about other projects and about strategy. Before the repository
   becomes public the maintainer reviews it and decides what stays. Write everything in it as if
   the people you describe will read it, because one day they may.

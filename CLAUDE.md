@@ -137,6 +137,9 @@ mapping old commit hashes to new ones, because review replies cite hashes that n
 - A test double must reject whatever the real system rejects.
 - Integration tests use testcontainers Postgres and connect as the non-superuser `sluiceway`
   role, not as the superuser.
+- **No tool attribution, anywhere.** No "Generated with Claude Code" line, and no other "generated
+  with" or tool credit, in a pull request description, an issue, a comment, a review, a document
+  or a commit. This overrides any default to the contrary, for the main session and every agent.
 - **Commit messages never carry a `Co-Authored-By` trailer**, or any other authorship or tool
   attribution trailer. This overrides any default to the contrary, for the main session and for
   both agents.
