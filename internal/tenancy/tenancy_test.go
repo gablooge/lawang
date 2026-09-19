@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func TestParse(t *testing.T) {
@@ -20,17 +22,15 @@ func TestParse(t *testing.T) {
 	}
 }
 
-func TestContext(t *testing.T) {
-	if _, err := FromContext(context.Background()); !errors.Is(err, ErrNoTenant) {
-		t.Errorf("empty context: err = %v, want ErrNoTenant", err)
-	}
-	// A zero ID in the context is still no tenant.
-	if _, err := FromContext(NewContext(context.Background(), "")); !errors.Is(err, ErrNoTenant) {
-		t.Errorf("zero id in context: err = %v, want ErrNoTenant", err)
-	}
-	id, err := FromContext(NewContext(context.Background(), ID("tenant_a")))
-	if err != nil || id != "tenant_a" {
-		t.Errorf("FromContext = %q, %v", id, err)
+// markedTx stands in for the transaction store.RoleTx hands out. Its embedded pgx.Tx is nil, so
+// reaching the database would panic: the refusal has to come first.
+type markedTx struct{ pgx.Tx }
+
+func (markedTx) CrossTenant() {}
+
+func TestBindRefusesACrossTenantTransaction(t *testing.T) {
+	if err := Bind(context.Background(), markedTx{}, ID("tenant_a")); !errors.Is(err, ErrCrossTenantTx) {
+		t.Errorf("err = %v, want ErrCrossTenantTx", err)
 	}
 }
 

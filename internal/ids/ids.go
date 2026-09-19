@@ -33,7 +33,16 @@ var ErrEmptyPart = errors.New("ids: empty key part")
 // part lists produce the same hash input.
 var ErrSeparatorInPart = errors.New("ids: key part contains the 0x1F separator")
 
-// New returns a new ULID: unique, and sortable by creation time.
+// New returns a new ULID: unique, and sortable by creation time. It is safe for concurrent use.
+//
+// The result is an identifier, never a secret. It is guessable: the first 48 bits are the clock,
+// and ulid.Make draws the other 80 from math/rand, seeded once from the process start time in
+// nanoseconds. Whoever can estimate when the process started can search the seeds (about 10^9 of
+// them for a one second guess, not 2^80), and one observed id confirms the right one. Ids minted
+// in the same millisecond differ only by an increment of at most 32 bits.
+//
+// So never use New for a token, a nonce, an OAuth state or anything else whose value must be
+// unpredictable. Those come from crypto/rand.
 func New() string {
 	return ulid.Make().String()
 }
@@ -78,20 +87,6 @@ func RecordID(provider, externalID, version, tenant string) (string, error) {
 		_, _ = h.WriteString(p.value)
 	}
 	return RecordPrefix + hex.EncodeToString(h.Sum(nil))[:recordHexLen], nil
-}
-
-// IsRecordID reports whether s has the shape of a record id.
-func IsRecordID(s string) bool {
-	rest, ok := strings.CutPrefix(s, RecordPrefix)
-	if !ok || len(rest) != recordHexLen {
-		return false
-	}
-	for _, c := range []byte(rest) {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
 }
 
 func checkPart(name, value string) error {

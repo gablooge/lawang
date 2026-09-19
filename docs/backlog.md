@@ -106,7 +106,8 @@ project's whole claim.
   **Done when:** the stub rejects everything the schema rejects plus a repeated id with different
   content; the http sink classifies 401/403 as halt, 5xx and timeouts as retryable, 4xx per-record
   rejections as dead-letter.
-- [ ] **B10 Worker drain.** Drain goroutine pool, tenant re-bind per row, the two-transaction
+- [ ] **B10 Worker drain.** Drain goroutine pool, each claimed row worked in a second transaction
+  bound to its tenant (never a bind inside the worker role, architecture section 4), the two-transaction
   commit, degrade-to-minimal on hydration failure, dead letters and replay, graceful shutdown.
   **Done when:** a crash injected between prepare and deliver re-drains into "already delivered"
   with exactly one record at the stub; a failing sink walks the ladder and parks; replaying the
