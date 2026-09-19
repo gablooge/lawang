@@ -23,19 +23,33 @@ You are given an item (for example B05, which is GitHub issue #5).
    - A test that passes on the first run has proven nothing yet. For each acceptance criterion,
      break the code on purpose (a mutation), confirm a test fails, and restore it. If no test
      fails, fix the test. Say in the pull request which mutations you ran.
-4. If the code has to differ from `docs/architecture.md`, change the document in the same branch
+4. Review your own change before anyone else has to, along the same dimensions the reviewer
+   uses (`.claude/agents/pr-reviewer.md`, "What to check"), and fix what you find:
+   - **Tests:** error paths, boundaries, negative cases and concurrency, not only the happy path.
+     Look at `go test -cover` for the packages you changed and ask what the uncovered lines need.
+   - **Security:** input that reaches SQL, a path, a URL or a log; limits on anything a sender
+     controls; secrets in errors, logs, fixtures; grants no wider than the query needs.
+   - **Performance:** no query in a loop, an index behind every WHERE and ORDER BY that runs per
+     request or per poll (check with EXPLAIN), a LIMIT on anything that can grow, no transaction
+     held across network I/O.
+   - **Dead code:** no unused function, field, column, grant, config variable or dependency, no
+     stub or TODO left behind, no test-only code outside `_test.go`.
+   - **Docs:** architecture, ADRs, backlog, the README status paragraph, doc comments on exported
+     identifiers, and anything new an operator has to know (variables, commands, endpoints, roles).
+   Say in the pull request, under Testing, what you checked for each.
+5. If the code has to differ from `docs/architecture.md`, change the document in the same branch
    and call the difference out in the pull request under "Decisions worth a look". Settle any open
    decision the item names as an ADR in `docs/adr/`.
-5. Tick the item in `docs/backlog.md` and add a log line with today's date.
-6. Commit. The message explains why and ends with `Closes #NN`. Nothing follows it: no
+6. Tick the item in `docs/backlog.md` and add a log line with today's date.
+7. Commit. The message explains why and ends with `Closes #NN`. Nothing follows it: no
    `Co-Authored-By` line and no other attribution trailer, ever (see Rules).
-7. Push, then open the pull request with `gh pr create`: assignee `gablooge`, the item's milestone,
+8. Push, then open the pull request with `gh pr create`: assignee `gablooge`, the item's milestone,
    the `backlog` label plus any the issue has. The base is `main`, or the previous item's branch
    when stacking. The body has: What, Decisions worth a look, Acceptance (the checklist, ticked),
    Testing (including mutations), `Closes #NN`, and ends with
    `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
-8. Wait for CI with `gh pr checks NN --watch`. Red CI is yours to fix.
-9. Comment on the issue with what was done and what differs from the design.
+9. Wait for CI with `gh pr checks NN --watch`. Red CI is yours to fix.
+10. Comment on the issue with what was done and what differs from the design.
 
 ## Mode 2: address a review
 

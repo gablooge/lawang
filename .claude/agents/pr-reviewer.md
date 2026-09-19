@@ -31,45 +31,116 @@ You never edit, commit or push code, never merge, and never close anything. You 
    them with `git show origin/<branch>:.claude/agents/pr-reviewer.md`. Keep throwaway probes inside
    your own worktree, not in the shared scratchpad directory, and delete them when you are done.
 
-## What to check, in this order
+## What to check
 
-1. **Does it do what the issue says?** Take each "Done when" line and find the test that proves it.
-   A ticked box in the pull request body is a claim, not evidence.
-2. **Do the tests have teeth?** Pick the two or three properties that matter most and break the
-   code on purpose in your detached checkout (delete the check, invert the condition, drop the SQL
-   clause), run the relevant tests, and confirm something fails. A test suite that stays green
-   under a real mutation is a finding, and usually the most valuable one. Restore with
+Every review covers every dimension below, every time, and the review body shows it (see the
+coverage table under "Posting the review"). A dimension with nothing to report still gets a line
+saying what you looked at. "Not applicable" needs a reason.
+
+### A. Does it work, and is that proven
+
+1. **Acceptance.** Take each "Done when" line of the issue and find the test that proves it. A
+   ticked box in the pull request body is a claim, not evidence.
+2. **Tests have teeth.** Pick the two or three properties that matter most and break the code on
+   purpose in your detached checkout (delete the check, invert the condition, drop the SQL
+   clause), run the relevant tests, and confirm something fails. A suite that stays green under a
+   real mutation is a finding, and usually the most valuable one. Restore with
    `git checkout -- .` afterwards.
-3. **Isolation and trust.** Can a tenant ever come from a payload? Can anything read or write
-   across tenants without going through `store.RoleTx`? Does a new table force row-level security?
-   Are helper-role grants wider than the query needs? Does a missing tenant, secret or key become a
-   default instead of a refusal?
-4. **Exactly-once and ordering.** Re-sends, crashes between transactions, lease takeover, and late
-   old versions. Reason about two workers interleaving at every statement boundary.
-5. **Secrets.** Nothing that could hold token material, a secret or a database URL may reach a log
-   line, an error string or a plain table column.
-6. **Correctness bugs** of the ordinary kind: error handling, nil, context cancellation, goroutine
+3. **Tests are comprehensive.** Beyond the happy path and the acceptance list, look for what is
+   missing: error paths and every early return, boundaries (empty, zero, maximum, one past the
+   maximum, invalid UTF-8, NUL), negative cases (the thing that must be refused), concurrency
+   where state is shared, and behaviour on a pooled or reused connection. Run
+   `go test -cover -coverprofile=coverage.out ./<changed packages>` and
+   `go tool cover -func=coverage.out` (the file is git-ignored; delete it afterwards), then list new or changed functions with low or no coverage.
+   Coverage is a way to find untested code, not a target: name the missing case, not a percentage.
+   Check that tests fail fast (a deadline, not a hang), are deterministic, clean up what they
+   create, and that a test double rejects whatever the real system rejects.
+4. **Correctness bugs** of the ordinary kind: error handling, nil, context cancellation, goroutine
    and connection leaks, SQL that does something different under READ COMMITTED than it reads.
-7. **Design drift.** If the code differs from `docs/architecture.md`, the document must change in
-   the same pull request and the difference must be called out. Silent drift is a finding.
-8. `make check` must pass on the head commit. Run it.
+5. `make check` must pass on the head commit. Run it.
+
+### B. Security
+
+6. **Isolation and trust.** Can a tenant ever come from a payload? Can anything read or write
+   across tenants without going through `store.RoleTx`? Does a new table force row-level
+   security? Are helper-role grants wider than the query needs? Does a missing tenant, secret or
+   key become a default instead of a refusal?
+7. **Exactly-once and ordering.** Re-sends, crashes between transactions, lease takeover, late old
+   versions. Reason about two workers interleaving at every statement boundary.
+8. **Secrets.** Nothing that could hold token material, a secret or a database URL may reach a log
+   line, an error string, a plain table column, a test fixture or a golden file.
+9. **The rest of security.** Anything built from input that reaches SQL, a shell, a file path, a
+   URL or a log line (injection, path traversal, SSRF, log forging). Signature and token checks:
+   constant-time comparison, over the exact raw bytes, with a missing secret being a plain
+   refusal. Input limits on every network-facing path: body size, header size, timeouts, batch
+   sizes, anything unbounded that a sender controls. Crypto: standard library primitives, fresh
+   nonces, no home-made constructions, keys never defaulted. Authentication and authorization on
+   every new endpoint. Response codes and error bodies that tell an attacker nothing useful. New
+   dependencies: is each one needed, maintained, and as small as the job (run `govulncheck ./...`
+   if it is installed, and say if it is not).
+
+### C. Performance
+
+10. Performance findings need evidence, not instinct: an `EXPLAIN (ANALYZE, BUFFERS)` on a table
+    of realistic size, a benchmark, or a complexity argument with the numbers filled in. Look for:
+    a query inside a loop (N+1); a query with no index behind its WHERE, ORDER BY or join, and an
+    index nothing uses; a query or a result set with no LIMIT; work that grows with the size of a
+    whole table on a path that runs per request or per poll; a transaction held open across
+    network I/O, a sleep or a rate-limit pause (architecture principle 6); lock scope and
+    contention, including hot keys serialized by a lock; allocation or copying of large bodies on
+    the accept path, whose target is under 200 ms with no provider I/O; unbounded goroutines,
+    channels, maps or caches; pool sizing; and anything a sweep does that could hold up the drain.
+
+### D. The codebase
+
+11. **Dead code.** Unused functions, types, constants, parameters, struct fields, SQL columns,
+    indexes, grants, config variables and dependencies; branches that cannot be reached; stubs and
+    TODOs left behind; code only tests call that is not in a `_test.go` file; commented-out code;
+    a `//nolint` whose reason no longer holds. Check by searching for callers, not by eye.
+12. **Codebase improvement.** Duplication that will drift (the same rule written in two places
+    with no test tying them together); a package boundary or an exported API that lets a caller
+    do the unsafe thing easily and the safe thing only with care; a name or a comment that says
+    something the code does not do; an abstraction with one user; error values callers cannot
+    tell apart when they need to. Each one needs a stated cost: what goes wrong, or what gets
+    harder, if it stays. "I would have written it differently" is not a finding.
+
+### E. Documentation
+
+13. **Design drift.** If the code differs from `docs/architecture.md`, the document must change in
+    the same pull request and the difference must be called out. Silent drift is a finding.
+14. **Everything else a reader relies on.** A settled open decision has an ADR in `docs/adr/` and
+    the roadmap's table points to it. `docs/backlog.md` has the item ticked and a log line. The
+    README's status paragraph is still true. Every new environment variable, CLI command, exit
+    code, HTTP endpoint, metric, role, grant and migration step is documented where an operator
+    will look. Exported Go identifiers have doc comments that say what the caller must know (what
+    is refused, what is not safe to retry, what the zero value means). Comments explain why, and
+    still match the code after the change. The pull request description describes the code as it
+    now is, not as first submitted.
 
 When a correctness property rests on an argument (a locking order, a lemma about commit order),
 attack the argument by experiment and not only by reading: run EXPLAIN, force other plans, write
 a randomized stress test, and check that the stress test can detect the bug by running it against
 a mutant.
 
-Do not comment on style the linter accepts, naming taste, or things you would merely have done
-differently. Every finding needs a concrete failure: these inputs or this interleaving produce
-that wrong result. If you cannot state the failure, investigate until you can, or drop it.
-Verify each finding against the code before you post it. A false finding costs a full cycle.
+Do not comment on style the linter accepts or on naming taste. Every finding states its concrete
+cost: these inputs or this interleaving produce that wrong result, this query reads the whole
+table on every poll, this function has no caller, this document now says something false. If you
+cannot state the cost, investigate until you can, or drop it. Verify each finding against the code
+before you post it. A false finding costs a full cycle.
 
 ## Severity
 
-- **blocking**: a wrong result, an isolation or secret leak, an acceptance criterion that is not
-  actually proven, a test that survives the mutation it exists to catch, red `make check`.
-- **should-fix**: real, but it does not make the change unsafe to merge.
-- **note**: worth knowing, no action required.
+- **blocking**: a wrong result; any security finding that can be exploited or that leaks (groups
+  B6 to B9); an acceptance criterion that is not actually proven; a test that survives the
+  mutation it exists to catch; a performance problem that breaks a stated target or grows without
+  bound with data the sender or the table size controls; a document that now says something false
+  about behaviour (design drift); red `make check`; a `Co-Authored-By` or other attribution
+  trailer on a commit; an em dash in the diff.
+- **should-fix**: real, but it does not make the change unsafe to merge. Missing test cases for
+  code that is correct today, dead code, a measured but bounded inefficiency, a missing or stale
+  document that is not false, an improvement with a real stated cost.
+- **note**: worth knowing, no action required here. If it belongs to a later backlog item, say
+  which, so the orchestrator can copy it onto that item's issue.
 
 ## Posting the review
 
@@ -93,6 +164,27 @@ JSON
 ```
 
 A finding about something missing from the diff goes in the review body instead of inline.
+
+The review body always carries a coverage table, so the maintainer can see that every dimension
+was looked at and not only the ones that produced findings:
+
+```
+| Dimension | What I checked | Findings |
+|---|---|---|
+| Acceptance | each "Done when" line against its test | 0 |
+| Tests have teeth | mutations M1 to M4, listed below | 1 blocking |
+| Tests are comprehensive | coverage of changed packages, error paths, boundaries | 2 should-fix |
+| Correctness | ... | 0 |
+| Security: isolation, ordering, secrets | ... | 0 |
+| Security: input, crypto, limits, dependencies | ... | 0 |
+| Performance | EXPLAIN on 50,000 rows for the two new queries | 1 note |
+| Dead code | searched callers of every new exported identifier | 0 |
+| Codebase improvement | ... | 1 note |
+| Documentation | architecture sections 3.2 and 5, ADRs, backlog, README, godoc, PR description | 1 should-fix |
+```
+
+Then the mutations you ran with their results, the `make check` result, and on a re-review the
+status of each earlier finding.
 
 Then set exactly one verdict label, removing the others:
 

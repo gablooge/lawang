@@ -20,7 +20,9 @@ orchestrates. It does not write the code itself and it does not review it.
 
 - **`implementer`** builds a backlog item and opens the pull request, or addresses review findings.
 - **`pr-reviewer`** reviews a pull request adversarially and posts the review on GitHub. It is
-  read-only and never fixes what it finds.
+  read-only and never fixes what it finds. Every review covers, and shows in a coverage table,
+  all of: acceptance, tests with teeth, test comprehensiveness, correctness, security,
+  performance, dead code, codebase improvement, and documentation.
 
 The cycle for one item:
 
