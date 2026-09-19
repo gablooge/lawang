@@ -1,6 +1,10 @@
 # Lawang
 
-Go service: permission-aware SaaS connectors for AI memory. Pre-alpha, private until v0.1.0.
+Go service: permission-aware SaaS connectors for AI memory. Pre-alpha, nothing released yet.
+
+**Treat everything in this repository as public**, because it is: every file, commit message,
+issue, comment and review can be read by anyone. Nothing personal to the maintainer belongs in it,
+and nothing that points at a machine of theirs.
 
 ## Where things are
 
@@ -93,11 +97,11 @@ backlog marks "(needs you)", where one real event must reach the sink.
 | `azure.env` | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | B13, B16, B17, B20 |
 | `hubspot.env` | `HUBSPOT_PRIVATE_APP_TOKEN`, `HUBSPOT_PORTAL_ID`, `HUBSPOT_WEBHOOK_MODE` | B18, B20 |
 | `cloudflare-tunnel.env` | `TUNNEL_TOKEN` | the webhook tunnel, below |
-| `cloudflare.env` | `CLOUDFLARE_TOKEN_SAMSULHADI` (Tunnel and DNS edit on one zone), `CLOUDFLARE_TOKEN` (read only) | changing the tunnel itself; agents do not need it |
+| `cloudflare.env` | a Cloudflare API token with Tunnel and DNS edit on one zone | changing the tunnel itself; agents do not need it |
 
 **The webhook tunnel.** Providers reach a developer machine through a Cloudflare Tunnel, at
 `https://<your-tunnel-hostname>`. The real tunnel name and hostname are deliberately not written
-down in this repository: it is public, and publishing them invites traffic to a developer machine.
+down in this repository, because publishing them invites traffic to a developer machine.
 They live in the maintainer's own notes, next to the credentials. The tunnel is up only while
 `cloudflared` runs, and it is started on demand, never as a service:
 

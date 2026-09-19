@@ -432,7 +432,7 @@ Built-in implementations planned for v0.1:
 ## 8. Package layout
 
 ```text
-cmd/lawang/        main: serve | worker | migrate | connect | reconcile | version
+cmd/lawang/         main: serve | worker | migrate | connect | reconcile | version
 internal/
   appversion/         the release version set by the linker, or the VCS revision of a dev build
   config/             environment config, fail-closed defaults

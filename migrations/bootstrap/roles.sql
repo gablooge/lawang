@@ -22,7 +22,7 @@
 --
 -- Three roles (docs/architecture.md, section 4):
 --   lawang           the application role. NOSUPERUSER NOBYPASSRLS, so row-level security
---                       actually applies to it.
+--                    actually applies to it.
 --   lawang_resolver  reads the delivery-resolution columns of subscriptions across tenants.
 --   lawang_worker    claims outbox rows across tenants, then re-binds to each row's tenant.
 --

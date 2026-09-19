@@ -5,7 +5,10 @@ Dates are deliberately absent, because a design document that carries dates star
 they slip. The design itself is in [architecture.md](architecture.md). The dated, item-by-item
 working plan is kept apart in [backlog.md](backlog.md), where slipping is cheap.
 
-The repository stays private until **M6**, so the first thing anyone sees is something that runs.
+The repository was private until 2026-09-20, on the reasoning that the first thing anyone sees
+should be something that runs. It is public earlier than that, from the record format onward,
+because the work itself is worth reading before it is worth running. The README says plainly what
+runs today, so nobody is misled.
 
 ---
 
@@ -109,7 +112,8 @@ locally with nothing but Docker installed.
 - setup guides per provider
 - a container image published to GHCR, a tagged release, a changelog
 - `CONTRIBUTING.md` and a provider-authoring guide
-- the repository flips to public
+- the community files a public repository needs: a code of conduct, issue and pull request
+  templates, and real first issues (the repository itself went public on 2026-09-20)
 
 **Done when:** someone who has never seen the project can follow the quickstart to a record at the
 stub sink.
