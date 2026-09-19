@@ -6,7 +6,14 @@ Status: accepted, 2026-09-19 (backlog item B03)
 
 Migrations are plain SQL files in `migrations/`, embedded in the binary and applied by
 `sluiceway migrate` using [`goose`](https://github.com/pressly/goose) as a library. A session-level
-advisory lock serializes concurrent runs, so several replicas may migrate at once.
+advisory lock serializes concurrent runs, so several replicas may migrate at once. A run that finds
+the lock taken asks again every second, for up to five minutes. The goose default is every five
+seconds, which made the k-th of N replicas started together wait about 5(k-1) seconds, usually for
+a lock that had been released within milliseconds; one second is the shortest period goose accepts.
+
+Every migration has a `Down` section. No command exposes it (rolling a production database back is
+a restore, not a command), but a test runs every `Down` to zero and back up as the application
+role, so the sections stay correct as migrations are added and remain usable by hand.
 
 Migrations run as the **non-superuser application role**, the same login `serve` and `worker` use.
 `store.Open` refuses a `SUPERUSER` or `BYPASSRLS` login outright, for migrations as for everything

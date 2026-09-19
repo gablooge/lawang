@@ -21,15 +21,23 @@ const maxIDLen = 64
 // ErrInvalidID reports a tenant id that is empty or malformed.
 var ErrInvalidID = errors.New("tenancy: invalid tenant id")
 
-// ErrNoTenant reports a context with no tenant in it. Missing identity is a denial, never a
-// default.
-var ErrNoTenant = errors.New("tenancy: no tenant in context")
+// ErrCrossTenantTx reports a Bind on a transaction that runs under a helper role. Binding would
+// not narrow such a transaction, so it is refused instead of giving a false sense of isolation.
+var ErrCrossTenantTx = errors.New("tenancy: this transaction runs under a cross-tenant helper role and a bind would not narrow it, do the tenant's work in a second transaction under store.TenantTx")
+
+// CrossTenantTx marks a transaction that runs under a helper database role, whose policies admit
+// rows of every tenant. store.RoleTx hands out transactions that implement it.
+type CrossTenantTx interface {
+	pgx.Tx
+	CrossTenant()
+}
 
 // ID identifies a tenant. The zero value is invalid; build one with Parse.
 type ID string
 
 // Parse validates s as a tenant id: 1 to 64 characters of A-Z, a-z, 0-9, underscore and hyphen.
-// The tenant_id domain in the database enforces the same rule.
+// The tenant_id domain in the database enforces the same rule, and the two are held together by
+// TestTheGoRuleAndTheDomainAgree in internal/store: change one and that test names the other.
 func Parse(s string) (ID, error) {
 	if s == "" || len(s) > maxIDLen {
 		return "", ErrInvalidID
@@ -47,31 +55,24 @@ func Parse(s string) (ID, error) {
 // String returns the id as stored.
 func (id ID) String() string { return string(id) }
 
-type ctxKey struct{}
-
-// NewContext returns a context carrying the tenant.
-func NewContext(ctx context.Context, id ID) context.Context {
-	return context.WithValue(ctx, ctxKey{}, id)
-}
-
-// FromContext returns the tenant carried by ctx, or ErrNoTenant.
-func FromContext(ctx context.Context) (ID, error) {
-	id, ok := ctx.Value(ctxKey{}).(ID)
-	if !ok || id == "" {
-		return "", ErrNoTenant
-	}
-	return id, nil
-}
-
 // Bind scopes tx to the tenant. The setting is transaction-local: it is gone at commit or
-// rollback, so a pooled connection never carries one tenant into the next transaction.
+// rollback, so a pooled connection never carries one tenant into the next transaction. Callers
+// outside internal/store want store.TenantTx, which binds before anything else runs.
 //
-// Binding again inside the same transaction replaces the tenant, which is how the worker moves
-// from claiming rows across tenants to working on one row's tenant.
+// Binding again inside the same transaction replaces the tenant.
+//
+// A bind narrows only a transaction of the application role. Under a helper role
+// (store.RoleTx) the role's own cross-tenant policies keep applying, because Postgres ORs
+// permissive policies together, so Bind refuses such a transaction with ErrCrossTenantTx. The
+// worker therefore claims rows in one transaction under its role and does each row's work in a
+// second one under store.TenantTx.
 func Bind(ctx context.Context, tx pgx.Tx, id ID) error {
 	// Re-validate: ID is a string type, so a caller can build one without Parse.
 	if _, err := Parse(string(id)); err != nil {
 		return err
+	}
+	if _, ok := tx.(CrossTenantTx); ok {
+		return ErrCrossTenantTx
 	}
 	if _, err := tx.Exec(ctx, "SELECT set_config($1, $2, true)", setting, string(id)); err != nil {
 		return fmt.Errorf("tenancy: bind: %w", err)

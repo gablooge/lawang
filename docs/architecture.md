@@ -79,7 +79,11 @@ else including poison, because providers retry non-2xx responses and a retry sto
 
 1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so all
    versions of one entity deliver in arrival order while different entities proceed in parallel.
-2. Re-bind row-level security to the row's own tenant before touching anything.
+2. Commit the claim, then open a **second transaction** as the application role, bound to the
+   row's own tenant, before touching anything that belongs to a tenant. The claim runs as
+   `sluiceway_worker`, and that transaction is cross-tenant for its whole life: Postgres ORs
+   permissive policies together, so binding a tenant inside it would take nothing away (see
+   [section 4](#4-trust-model)).
 3. Parse the stored raw body into changes. One delivery can produce several records (a comment and
    its parent task, for example).
 4. Hydrate each change into the full object. On failure, degrade to a minimal record built from the
@@ -127,10 +131,19 @@ on a transaction-local setting. If the setting is missing, a query returns zero 
 |---|---|
 | `sluiceway` | the application role; `NOSUPERUSER NOBYPASSRLS`, so RLS actually applies |
 | `sluiceway_resolver` | reads only the delivery-resolution columns of subscriptions, because it has to derive the tenant and so cannot be filtered by it |
-| `sluiceway_worker` | claims outbox rows across tenants, then re-binds to each row's tenant for the work itself |
+| `sluiceway_worker` | claims outbox rows across tenants, in a transaction that does nothing else; the work on each row then runs in a second transaction, as `sluiceway`, bound to that row's tenant |
 
 The resolver and worker roles are granted with `INHERIT FALSE` and entered explicitly with
 `SET LOCAL ROLE`, so the application role does not silently pick up their wider policies.
+
+**A helper-role transaction is cross-tenant until it ends.** Permissive policies are ORed together,
+so once a helper role's policy applies (`TO sluiceway_worker USING (true)`, for example), binding a
+tenant in the same transaction narrows nothing: every tenant's rows stay visible, and updatable
+where the role may update. A bind could only add rows, on tables where the role has no policy of
+its own. The rule is therefore two transactions: the cross-tenant step (resolve an owner, claim a
+row) under the helper role, and everything that belongs to a tenant in a second transaction as the
+application role bound to that tenant. The code enforces it: the transaction `store.RoleTx` hands
+out refuses `tenancy.Bind`, savepoints included.
 
 **Bootstrap and preflight.** The application role cannot create roles, so an administrator applies
 a one-time bootstrap script (`sluiceway migrate bootstrap` prints it) that creates the three roles
@@ -163,6 +176,18 @@ On every start, `serve`, `worker` and `migrate` run a preflight and refuse to co
 The preflight runs once per process, at start. It guards against misconfiguration, not against an
 administrator: a membership or attribute changed while the process runs is not seen until the next
 start, and anyone able to make that change could read the tables directly anyway.
+
+**No part of the database URL reaches a log or an error**, not only the password. The driver and
+the server both quote the connection target when a connection fails (user, database, host, port,
+client address), so a failure to connect is reduced to its classification: the host name does not
+resolve, connection refused, timed out, authentication failed or no such database (with the
+SQLSTATE, and never the server's message), TLS failure, or other, always prefixed with
+`SLUICEWAY_DATABASE_URL`. The same holds for a connection that fails later, in the middle of a
+transaction or a migration, while an error from a statement that ran (a constraint violation, a
+failed migration) keeps the server's message. Preflight refusals say "the login role", not its
+name. One connection attempt is bounded at 10 seconds unless the URL sets `connect_timeout`
+(seconds), so a host that silently drops packets is reported instead of holding the start for the
+TCP timeout of the operating system.
 
 See [ADR 2](adr/0002-migrations-goose.md).
 

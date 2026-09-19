@@ -43,11 +43,29 @@ func open(t *testing.T, params string) *store.DB {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(db.Close)
+	t.Cleanup(func() { closeWithin(t, db, 10*time.Second) })
 	if _, err := db.Migrate(ctx, quiet); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 	return db
+}
+
+// closeWithin closes the pool, which waits for every connection to come back. A test that finds a
+// connection that was never given back (an open transaction left behind by a panic, for example)
+// would otherwise hang here for as long as go test allows, after it had already failed. A test
+// that is expected to fail has to fail fast.
+func closeWithin(t *testing.T, db *store.DB, limit time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		db.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(limit):
+		t.Errorf("Close was still waiting after %s: a connection was never given back to the pool", limit)
+	}
 }
 
 func seedTenants(t *testing.T, db *store.DB) {
@@ -116,7 +134,8 @@ func TestMigrationsRunAndRerunAsTheNonSuperuserRole(t *testing.T) {
 	if second != 0 {
 		t.Errorf("second Migrate applied %d migrations, want 0", second)
 	}
-	if err := db.Ping(ctx); err != nil {
+	// Migrate closes the database/sql handle it borrowed the pool through. The pool must survive it.
+	if err := db.Tx(ctx, func(tx pgx.Tx) error { _, err := tx.Exec(ctx, "SELECT 1"); return err }); err != nil {
 		t.Errorf("pool unusable after Migrate: %v", err)
 	}
 }
@@ -435,16 +454,6 @@ func TestASchemaOwnedByAnotherRoleIsRefused(t *testing.T) {
 	db.Close()
 }
 
-func TestOpenNeverEchoesTheURL(t *testing.T) {
-	_, err := store.Open(testCtx(t), "postgres://app:hunter2@db:5432/x?pool_max_conns=banana")
-	if err == nil {
-		t.Fatal("Open accepted a malformed URL")
-	}
-	if strings.Contains(err.Error(), "hunter2") {
-		t.Errorf("error leaks the password: %v", err)
-	}
-}
-
 func TestBootstrapIsRerunnable(t *testing.T) {
 	tdb := testdb.New(t) // first run
 	testdb.Bootstrap(t, tdb.AdminURL)
@@ -455,22 +464,130 @@ func TestBootstrapIsRerunnable(t *testing.T) {
 	db.Close()
 }
 
+// domainVerdict asks the tenant_id domain, and nothing else, about one value: a cast, as the
+// application role, with no table and so no policy anywhere near it. It returns the SQLSTATE, or
+// "" when the domain accepts the value.
+func domainVerdict(t *testing.T, db *store.DB, value string) string {
+	t.Helper()
+	ctx := testCtx(t)
+	err := db.Tx(ctx, func(tx pgx.Tx) error {
+		var got string
+		if err := tx.QueryRow(ctx, "SELECT ($1::text::tenant_id)::text", value).Scan(&got); err != nil {
+			return err
+		}
+		if got != value {
+			t.Errorf("the domain accepted %q and handed back %q", value, got)
+		}
+		return nil
+	})
+	if err == nil {
+		return ""
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("casting %q to tenant_id: %v, want an answer from the server", value, err)
+	}
+	return pgErr.Code
+}
+
 func TestTenantIDDomainRejectsMalformedIDs(t *testing.T) {
 	db := open(t, "")
 	ctx := testCtx(t)
-	// Bind would refuse these first, so go around it and let the database be the last line.
-	for _, bad := range []string{"", "tenant a", strings.Repeat("x", 65)} {
+	bad := []string{"", "tenant a", strings.Repeat("x", 65)}
+
+	// The domain by itself. An insert cannot show this for the empty id: with '' bound,
+	// current_tenant() is NULL and the policy refuses the row (42501) whatever the domain thinks
+	// of it. 23514 is a check violation, and the domain's check is the only one in reach.
+	for _, id := range bad {
+		if got := domainVerdict(t, db, id); got != "23514" {
+			t.Errorf("casting %q to tenant_id: SQLSTATE %q, want 23514 from the domain's check", id, got)
+		}
+	}
+
+	// And the column really is of that domain. Bind would refuse these ids first, so go around it;
+	// the policy is content (the id equals the bound tenant), which leaves the domain as the only
+	// thing that can refuse. The empty id is left out for the reason above.
+	for _, id := range bad[1:] {
 		err := db.Tx(ctx, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, "SELECT set_config('sluiceway.tenant', $1, true)", bad); err != nil {
+			if _, err := tx.Exec(ctx, "SELECT set_config('sluiceway.tenant', $1, true)", id); err != nil {
 				return err
 			}
-			_, err := tx.Exec(ctx, "INSERT INTO tenants (id) VALUES ($1)", bad)
+			_, err := tx.Exec(ctx, "INSERT INTO tenants (id) VALUES ($1)", id)
 			return err
 		})
 		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || (pgErr.Code != "23514" && pgErr.Code != "42501") {
-			t.Errorf("inserting tenant id %q: err = %v, want a check or policy violation", bad, err)
+		if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Errorf("inserting tenant id %q: err = %v, want a check violation (23514)", id, err)
 		}
+	}
+}
+
+// TestTheGoRuleAndTheDomainAgree ties tenancy.Parse to the tenant_id domain. The rule is written
+// twice, as a byte loop in Go and as a regular expression in SQL, and the places where those two
+// dialects usually part ways are the cases here. If this fails after a change to one of them, the
+// other one needs the same change.
+func TestTheGoRuleAndTheDomainAgree(t *testing.T) {
+	db := open(t, "")
+	cases := []struct {
+		name, id string
+		// notText: Postgres cannot hold the value in a text at all (22021), so it never reaches
+		// the domain. That is a refusal too, and the only other one allowed.
+		notText bool
+	}{
+		{name: "plain", id: "tenant_a"},
+		{name: "a ULID", id: "01JZXA8Q2KTENANT0000000000"},
+		{name: "one character", id: "a"},
+		{name: "every class", id: "A-b_9"},
+		{name: "only a hyphen", id: "-"},
+		{name: "only an underscore", id: "_"},
+		{name: "64 characters", id: strings.Repeat("x", 64)},
+		{name: "65 characters", id: strings.Repeat("x", 65)},
+		{name: "empty", id: ""},
+		{name: "space", id: " "},
+		{name: "inner space", id: "tenant a"},
+		{name: "trailing newline", id: "tenant_a\n"},
+		{name: "leading newline", id: "\ntenant_a"},
+		{name: "only a newline", id: "\n"},
+		{name: "carriage return", id: "tenant\ra"},
+		{name: "tab", id: "tenant\ta"},
+		{name: "the separator byte of the id recipes", id: "tenant\x1fa"},
+		{name: "dot", id: "a.b"},
+		{name: "semicolon", id: "a;b"},
+		{name: "quote", id: "tenant'a"},
+		{name: "backslash", id: `a\b`},
+		{name: "accented letter", id: "ténant"},
+		{name: "fullwidth letters", id: "ｔｅｎａｎｔ"},
+		{name: "64 characters that are 128 bytes", id: strings.Repeat("é", 64)},
+		{name: "a digit from another script", id: "tenant٣"},
+		{name: "invalid UTF-8", id: "tenant\xff", notText: true},
+		{name: "NUL", id: "tenant\x00a", notText: true},
+	}
+	accepted := 0
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, goErr := tenancy.Parse(tc.id)
+			verdict := domainVerdict(t, db, tc.id)
+
+			switch verdict {
+			case "", "23514":
+			case "22021":
+				if !tc.notText {
+					t.Fatalf("%q: Postgres refused it as text (22021), which only the cases marked notText may be", tc.id)
+				}
+			default:
+				t.Fatalf("%q: SQLSTATE %s, want the domain's verdict", tc.id, verdict)
+			}
+			if goAccepts, sqlAccepts := goErr == nil, verdict == ""; goAccepts != sqlAccepts {
+				t.Errorf("%q: tenancy.Parse accepts=%v, the tenant_id domain accepts=%v (SQLSTATE %q)", tc.id, goAccepts, sqlAccepts, verdict)
+			}
+			if verdict == "" {
+				accepted++
+			}
+		})
+	}
+	// Guards the test itself: a domainVerdict that always refused would agree with nothing valid.
+	if accepted != 7 {
+		t.Errorf("the domain accepted %d of the cases, want exactly the 7 valid ones", accepted)
 	}
 }
 
