@@ -1,0 +1,25 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema: migrations
+    queries: internal/outbox/queries.sql
+    gen:
+      go:
+        package: outboxdb
+        out: internal/outbox/outboxdb
+        sql_package: pgx/v5
+        emit_pointers_for_null_types: true
+        # sqlc makes a struct for every table under migrations, used or not. Left in, each
+        # generated package would carry every table of every other package, and outbox.Outbox
+        # would be the one type that pairs raw_body with lease_token.
+        omit_unused_structs: true
+        overrides:
+          - db_type: tenant_id
+            go_type: string
+          - db_type: timestamptz
+            go_type: time.Time
+          - db_type: timestamptz
+            nullable: true
+            go_type:
+              type: time.Time
+              pointer: true

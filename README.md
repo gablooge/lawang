@@ -6,10 +6,11 @@ Sluiceway connects a workspace's SaaS tools (Slack, Microsoft Teams, Outlook, Cl
 receives their webhooks directly, and turns every change into a clean, permission-stamped record
 delivered exactly once to your memory, search, or RAG system.
 
-> **Status: pre-alpha, design stage.** There is no runnable code yet. The design is written down in
-> [docs/architecture.md](docs/architecture.md) and the build order in
-> [docs/roadmap.md](docs/roadmap.md). The first release, v0.1.0, is the point where it runs end to
-> end against real providers.
+> **Status: pre-alpha.** The foundations are built (M0: configuration, id recipes, Postgres with
+> row-level security, the outbox), but nothing ingests a webhook yet. The design is written down in
+> [docs/architecture.md](docs/architecture.md), the build order in [docs/roadmap.md](docs/roadmap.md),
+> and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the
+> point where it runs end to end against real providers.
 
 ---
 

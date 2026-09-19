@@ -77,8 +77,9 @@ else including poison, because providers retry non-2xx responses and a retry sto
 
 ### 3.2 Drain path (inside `worker`)
 
-1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so all
-   versions of one entity deliver in arrival order while different entities proceed in parallel.
+1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so the
+   versions of one entity deliver one at a time, in queue order, while different entities proceed
+   in parallel.
 2. Commit the claim, then open a **second transaction** as the application role, bound to the
    row's own tenant, before touching anything that belongs to a tenant. The claim runs as
    `sluiceway_worker`, and that transaction is cross-tenant for its whole life: Postgres ORs
@@ -93,6 +94,90 @@ else including poison, because providers retry non-2xx responses and a retry sto
 6. Commit the ledger rows and the prepared records together, then deliver to the sink.
 7. Commit the delivered state. A crash between steps 6 and 7 re-drains the prepared records, and
    the sink's idempotency turns the repeat into a no-op.
+
+**Outbox row states.** `pending` to `prepared` (step 6) to `delivered` (step 7), or to `dead`. A
+claim is a **lease** (`lease_until` plus a `lease_token`), not a held lock, because the work spans
+two transactions and a sink call; a worker that dies lets its lease run out and another takes
+over. Every transition is guarded by the lease token, so a slow worker that comes back after a
+takeover changes nothing. The head of an ordering key is its row with the lowest `seq` that is
+`pending` or `prepared`: while the head is leased or waiting out a backoff, nothing behind it is
+claimable, so two versions of one entity are never in flight together. A `dead` row is finished
+and does not hold back newer versions of its entity.
+
+**The head is stored, not computed** ([ADR 10](adr/0010-outbox-head-marker.md)). Each row has an
+`is_head` marker, true for exactly the head of its key, and the claim walks an index of heads in
+the order they fall due (`due_at`, which is the later of the backoff and the lease) and stops at
+its batch. A poll therefore costs what it returns. It never visits the rows waiting behind a head,
+the heads waiting out a backoff, or the heads other workers hold, so a sink outage or a backfill
+with a million rows waiting does not make finding work any dearer: a batch of 10 takes about 0.3
+ms there, where a claim that worked the heads out on every poll took 4 seconds, and 0.4 seconds
+to find that nothing was due.
+
+The marker is kept by the writers, and guarded by the database. An accepted or replayed row is
+the head if its key has nothing unfinished, and the transition that finishes a head
+(`delivered` or `dead`) hands the marker to the next row of the key in the same transaction. A
+unique index allows one head per key and a CHECK says a head is unfinished, so "never two
+versions of one entity in flight" does not depend on every writer getting it right: a row that
+reached the table any other way is simply not a head, and waits.
+
+**Queue order.** `seq` is assigned when a row is inserted, not when its transaction commits. Left
+alone, version 1 could be inserted first and commit last, and a claim in between would lease
+version 2 and then version 1 alongside it. So every statement that assigns a `seq` first takes a
+transaction-scoped advisory lock on a hash of (tenant, ordering key): within one key, accepts
+commit in `seq` order, and a second accept of the same entity waits for the first to commit.
+Different entities do not wait for each other (two keys that hash alike do, harmlessly). A
+transaction that accepts several deliveries holds several of these locks until it commits, so it
+should accept in a stable key order or be ready to retry a deadlock.
+
+The same lock keeps the head marker. The transitions that finish a row take it too, before
+anything else, so the writers of one key (accept, replay, delivered, dead) run strictly one
+after the other. Without that, an accept and a finish of the same entity can miss each other: the
+accept sees version 1 unfinished and stores version 2 as a non-head, while the finish of version 1
+cannot yet see version 2 and hands the marker to nobody, and version 2 is never delivered. The
+lock always comes before any row lock, and the claim takes no advisory lock and never waits for a
+row (`SKIP LOCKED`), so nothing can deadlock on it. The price is that finishing a row waits for
+an accept of the same entity that is still open, which is one more reason to keep accepting
+transactions short.
+
+Waiting is only half of it: the writer that waited must also see what the one before it
+committed, and it does because its next statement takes a new snapshot. That is READ COMMITTED.
+Under REPEATABLE READ the same writers wait and then decide on a snapshot from before the wait,
+and version 2 is stranded exactly as above, silently. So the store begins every transaction
+`ISOLATION LEVEL READ COMMITTED` by name, and a `default_transaction_isolation` set on the server,
+the database or the role cannot change it (ADR 10).
+
+**Replay goes to the back.** Replaying a dead letter gives the row a fresh `seq`, under the same
+lock, as if it had just been accepted, and like an accepted row it is the head only if its entity
+has nothing unfinished. While it was dead, newer versions of its entity were free to move, and one
+may be in flight at the moment of the replay: a row that kept its old `seq` would be the earliest
+unfinished row again, ahead of the version in flight. The replayed version is therefore
+delivered after every version accepted before the replay, and the forward-only supersede chain
+treats it like any other late arrival of an old version. A row that died after step 6 remembers
+it (`prepared_at`) and is replayed as `prepared`, so it is delivered again but never prepared
+again.
+
+The claim picks its rows on its statement snapshot and leases each on its latest version, so it
+re-checks on the locked row everything that can change in between: the marker, and `due_at` (the
+lease and the backoff). Both are columns of the locked row itself, so the re-check never compares
+against anything stale. The claim does not look at the state: the CHECK makes every head
+unfinished, and a condition that repeats it misleads the planner into reading every waiting row
+(ADR 10). The second line of defense is the unique index: whatever a writer does, a key cannot
+have two heads, so it cannot have two rows in flight.
+
+The claim runs as `sluiceway_worker`, which is granted only what it reads (`id`, `seq`,
+`tenant_id`, `is_head`, `attempts`, `due_at`) and may update only the lease. It cannot read
+`raw_body`, a row's state, or which entity a row belongs to, it writes `lease_token` without
+being able to read one back, and it cannot write `is_head`, so it can lease a head but never make
+one. Payloads are read afterwards, as the application role bound to the claimed row's tenant.
+
+**What a failure leaves behind.** `last_error` and `dead_reason` are plain text that operators
+read and every backup carries, so they never hold token material, a URL, or text written by a
+remote system. The outbox does not take an error string at all. A failure is recorded as an
+`outbox.Cause`: one of the outbox's own classifications (section 11), the HTTP status, and the
+remote system's error code if it looks like one (short, and nothing but letters, digits, `_`, `-`
+and `.`), otherwise the word "withheld". The reason is the obvious call it rules out: the error
+of an HTTP client quotes the request URL, and the query string is where many sinks and providers
+carry their API key.
 
 ### 3.3 Reconciliation
 
@@ -212,7 +297,7 @@ Three deterministic keys, minted in exactly one package (`internal/ids`) so the 
 
 | Where | Key | Effect |
 |---|---|---|
-| accept | `delivery_id = blake3(provider, raw_body)`, unique | an identical re-send is an accept no-op |
+| accept | `delivery_id = blake3(provider, raw_body)`, unique per tenant | an identical re-send is an accept no-op |
 | record | `id = "rec_" + blake3(provider, external_id, version, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
 | subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates |
 
@@ -221,6 +306,10 @@ that is empty or itself contains `0x1F` is refused with an error rather than has
 must never mint an id, and a separator inside a part would bring the collision back. The raw body of
 a delivery is exempt because it is the last part. Test vectors for both recipes are in
 `internal/ids/testdata/golden.json`.
+
+The delivery id is unique **per tenant**, not globally, for the same reason the record id is salted
+(below): two tenants may connect one provider workspace, and reconciliation then synthesizes
+byte-identical deliveries for both. A global constraint would drop the second tenant's.
 
 The **tenant** is part of the record id on purpose: two tenants can legitimately connect the same
 provider workspace, and without the salt the second tenant's records would dedupe away as
@@ -378,7 +467,16 @@ until the shape has stopped moving.
 The worker runs each concern as its own goroutine under one cancellable context:
 
 - **Drain:** a small pool of goroutines, each claiming a batch with `SKIP LOCKED`. Adding worker
-  replicas adds drain capacity with no coordination.
+  replicas adds drain capacity with no coordination. That holds because a poll costs what it
+  returns (section 3.2): it reads neither the backlog nor the rows other replicas have in flight,
+  so more pollers do not mean more scanning of the same waiting rows, and an idle poll is a few
+  pages. What does not scale with replicas is one entity: its versions deliver one at a time by
+  design, so a single hot entity drains at the speed of one worker. The one standing cost is
+  Postgres housekeeping: every lease, retry and finish leaves a dead entry at the front of the
+  index the claim walks, until autovacuum removes them. Measured, that is 9 to 11 more pages per
+  poll for every 1,000 rows delivered since the last vacuum (ADR 10). A
+  long-running transaction anywhere in the database holds that cleanup back, which is one more
+  reason for principle 6.
 - **Sweeps** (renewal, reconcile, access sync, retention, dead-letter re-resolution): each on its
   own ticker. A sweep that must run once per cluster takes a Postgres advisory lock for its
   duration, so exactly one replica runs it and a crashed holder releases it automatically.

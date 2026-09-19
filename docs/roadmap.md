@@ -176,3 +176,4 @@ Each becomes a short decision record under `docs/adr/` when it is settled.
 | 7 | Vault encryption key source | environment master key for v0.1, a KMS interface later | Keeps the local setup dependency-free |
 | 8 | Configuration | environment only for v0.1 | Twelve-factor, container-friendly; a file format can come later |
 | 9 | License | Apache 2.0 | Patent grant, standard for Go infrastructure projects |
+| 10 | How the outbox claim finds the head of each ordering key | **settled:** a stored marker kept under the key's lock, see [ADR 10](adr/0010-outbox-head-marker.md) | Working the heads out on every poll cost 4 seconds at a million waiting rows, on a path that runs every second |

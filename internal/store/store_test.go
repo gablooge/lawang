@@ -358,6 +358,61 @@ func TestHelperRolesAreEnteredExplicitlyAndLeftAtCommit(t *testing.T) {
 	}
 }
 
+// TestEveryTransactionIsReadCommittedWhateverTheDefault: callers rely on a statement that follows a
+// lock wait seeing what the transaction it waited for committed (the outbox's head marker is the
+// first, docs/adr/0010-outbox-head-marker.md), and that is READ COMMITTED only. The default can be
+// changed on the database or on the role by an administrator, so the helpers ask for the level by
+// name. Both settings here are scoped to the test's own database.
+func TestEveryTransactionIsReadCommittedWhateverTheDefault(t *testing.T) {
+	for name, alter := range map[string]string{
+		"set on the database": "ALTER DATABASE %I SET default_transaction_isolation = %L",
+		"set on the role":     "ALTER ROLE sluiceway IN DATABASE %I SET default_transaction_isolation = %L",
+	} {
+		for _, level := range []string{"repeatable read", "serializable"} {
+			t.Run(name+", "+level, func(t *testing.T) {
+				ctx := testCtx(t)
+				tdb := testdb.New(t)
+				testdb.Exec(t, tdb.AdminURL,
+					"DO $do$ BEGIN EXECUTE format($f$"+alter+"$f$, current_database(), '"+level+"'); END $do$")
+				db, err := store.Open(ctx, tdb.URL)
+				if err != nil {
+					t.Fatalf("Open: %v", err)
+				}
+				t.Cleanup(func() { closeWithin(t, db, 10*time.Second) })
+				if _, err := db.Migrate(ctx, quiet); err != nil {
+					t.Fatalf("Migrate under a default of %s: %v", level, err)
+				}
+
+				check := func(tx pgx.Tx) error {
+					var session, got string
+					err := tx.QueryRow(ctx, "SELECT current_setting('default_transaction_isolation'), current_setting('transaction_isolation')").
+						Scan(&session, &got)
+					if err != nil {
+						return err
+					}
+					if session != level {
+						t.Fatalf("the session's default is %q, want %q: the test has not set up what it is about", session, level)
+					}
+					if got != "read committed" {
+						t.Errorf("the transaction runs at %q, want read committed", got)
+					}
+					return nil
+				}
+				for helper, err := range map[string]error{
+					"Tx":               db.Tx(ctx, check),
+					"TenantTx":         db.TenantTx(ctx, tenantA, check),
+					"RoleTx(worker)":   db.RoleTx(ctx, store.RoleWorker, check),
+					"RoleTx(resolver)": db.RoleTx(ctx, store.RoleResolver, check),
+				} {
+					if err != nil {
+						t.Errorf("%s: %v", helper, err)
+					}
+				}
+			})
+		}
+	}
+}
+
 // readTenantsOutcome reports how a read of tenants went, for callers that expect it to fail. It
 // runs inside a savepoint, because a failed statement would otherwise abort the caller's
 // transaction.
