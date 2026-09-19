@@ -17,10 +17,12 @@ type Outbox struct {
 	OrderingKey   string
 	RawBody       []byte
 	State         string
+	IsHead        bool
 	Attempts      int32
 	NextAttemptAt time.Time
 	LeaseUntil    *time.Time
 	LeaseToken    *string
+	DueAt         time.Time
 	LastError     string
 	DeadReason    string
 	AcceptedAt    time.Time

@@ -5,6 +5,7 @@ package outbox_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/gablooge/sluiceway/internal/outbox"
 )
@@ -50,15 +52,24 @@ func (e *env) waitsOn(admin *pgx.Conn, which string, finished func() bool) bool 
 	deadline := time.Now().Add(time.Minute)
 	for time.Now().Before(deadline) {
 		var waiting int
+		var elsewhere *string
+		// A transaction's lock belongs to no database in pg_locks, so the database comes from the
+		// session that waits.
 		err := admin.QueryRow(e.ctx, `
-			SELECT count(*) FROM pg_locks
-			 WHERE locktype = 'advisory' AND NOT granted AND `+which+`
-			   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&waiting)
+			SELECT count(*) FILTER (WHERE l.locktype = 'advisory' AND `+which+`),
+			       min(l.locktype) FILTER (WHERE l.locktype <> 'advisory')
+			  FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+			 WHERE NOT l.granted AND a.datname = current_database()`).Scan(&waiting, &elsewhere)
 		if err != nil {
 			e.t.Fatalf("pg_locks: %v", err)
 		}
 		if waiting > 0 {
 			return true
+		}
+		if elsewhere != nil {
+			// Waiting, and for the wrong thing: a row or a transaction, which is what happens
+			// when two writers of a key meet without the key's lock. Say so now, not in a minute.
+			e.t.Fatalf("waiting for a %s lock, not for an advisory lock: two writers of one key got past the key's lock", *elsewhere)
 		}
 		if finished() {
 			return false
@@ -101,13 +112,15 @@ func (e *env) closeGate() (admin *pgx.Conn, open func()) {
 //
 // The pause is a test-only RESTRICTIVE select policy for the worker role. Its function is always
 // true, and waits for the gate when it is shown the gate row. A policy is checked where the table
-// is scanned, and the claim's row locks are taken above its scans and joins, so under any plan the
-// gate row is read before the first row is locked. The tests that use this run under several
+// is scanned, and the gate row is the first row any scan of the due heads returns (holdFirstInLine),
+// so under any plan it is read before the first row is locked: a plan that walks the index of due
+// heads reads it first and only then goes on to the rows the test is about, and a plan that scans
+// and sorts reads every row before it locks one. The rows read after the pause are still read on
+// the snapshot taken before it, which is the point. The tests that use this run under several
 // planner settings (see planners), and each of them checks that the row it changes in the window
 // was in fact not locked.
 //
-// Every claim reads the gate row, so only the first one to get there stops (firstLock). The gate
-// row comes from acceptGateRow.
+// Every claim reads the gate row, so only the first one to get there stops (firstLock).
 func (e *env) gateClaimOn(id string) (admin *pgx.Conn, open func()) {
 	e.t.Helper()
 	e.admin(fmt.Sprintf(`
@@ -120,12 +133,12 @@ func (e *env) gateClaimOn(id string) (admin *pgx.Conn, open func()) {
 		END $$;
 		CREATE POLICY test_gate ON sluiceway.outbox AS RESTRICTIVE FOR SELECT TO sluiceway_worker
 		  USING (sluiceway.test_gate(id));`, id, firstLock, gateLock))
+	e.holdFirstInLine(id)
 	return e.closeGate()
 }
 
-// acceptGateRow accepts the row for gateClaimOn. It is unfinished, so the claim's search for the
-// heads is sure to read it, whatever else the plan filters first. It is never due, so no claim
-// leases it, and every claim in the test returns only the rows the test is about.
+// acceptGateRow accepts the row for gateClaimOn: the head of a key of its own. Until the gate is
+// set up it is not due, so the claims a test makes before that do not lease it.
 func (e *env) acceptGateRow() string {
 	e.t.Helper()
 	id := e.accept(tenantA, "gate", 1)
@@ -133,11 +146,30 @@ func (e *env) acceptGateRow() string {
 	return id
 }
 
+// holdFirstInLine makes the gate row due for a year, so that it is the very first row of the index
+// the claim walks, and the first row in the claim's order under any other plan. No claim leases
+// it, because this holds its row lock until the test ends and the claim skips locked rows: every
+// claim in the test still returns only the rows the test is about. It comes after the gate's DDL,
+// which needs the table to itself.
+func (e *env) holdFirstInLine(id string) {
+	e.t.Helper()
+	e.admin("UPDATE sluiceway.outbox SET next_attempt_at = now() - interval '1 year' WHERE id = '" + id + "'")
+	holder := e.adminConn() // closing it, when the test ends, ends the transaction and the lock
+	if _, err := holder.Exec(e.ctx, "BEGIN"); err != nil {
+		e.t.Fatalf("hold the gate row: %v", err)
+	}
+	if _, err := holder.Exec(e.ctx, "SELECT id FROM sluiceway.outbox WHERE id = $1 FOR UPDATE", id); err != nil {
+		e.t.Fatalf("hold the gate row: %v", err)
+	}
+}
+
 // planners are the planner settings the gated claim tests run under: each entry lists what is
-// turned off. The claim's re-checks have to hold under any plan. With the default settings the
-// claim locks and updates its rows one at a time (the top of the plan is a nested loop with the
-// locked subquery on its outer side). Without nested loops, or without index scans, that join
-// becomes a hash or merge join, and every chosen row is locked before the first one is updated.
+// turned off. The claim's re-checks have to hold under any plan. With the default settings on a
+// small table the candidates come from a scan and a sort, on a large one from a walk of the index
+// of due heads, and the claim locks and updates its rows one at a time (the top of the plan is a
+// nested loop with the locked subquery on its outer side). Without nested loops that join becomes
+// a hash or merge join, and every chosen row is locked before the first one is updated. With
+// sequential scans and sorts off, the candidates come from the index walk even on a small table.
 var planners = map[string][]string{
 	"default":               nil,
 	"no nested loop":        {"enable_nestloop"},
@@ -234,6 +266,80 @@ func (e *env) acceptAndHold(key string, version int) (id string, commit func()) 
 			e.t.Fatalf("held Accept: %v", err)
 		}
 	}
+}
+
+// deliverAndHold marks a claimed row of tenantA delivered in a transaction that stays open,
+// holding the ordering key's lock, until commit is called. The row is finished and the marker
+// handed on inside that transaction, and nobody else can see it yet.
+func (e *env) deliverAndHold(c outbox.Claimed) (commit func()) {
+	e.t.Helper()
+	marked := make(chan error, 1)
+	hold := make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	e.t.Cleanup(release) // a failing test must not leave it open, or closing the pool would hang
+	done := make(chan error, 1)
+	go func() {
+		done <- e.db.TenantTx(e.ctx, tenantA, func(tx pgx.Tx) error {
+			err := outbox.MarkDeliveredIn(e.ctx, tx, c)
+			marked <- err
+			if err != nil {
+				return err
+			}
+			<-hold
+			return nil
+		})
+	}()
+	if err := <-marked; err != nil {
+		e.t.Fatalf("held MarkDelivered: %v", err)
+	}
+	return func() {
+		e.t.Helper()
+		release()
+		if err := <-done; err != nil {
+			e.t.Fatalf("held MarkDelivered: %v", err)
+		}
+	}
+}
+
+// headsBroken is the invariant of the head marker, as one statement, so on one snapshot: every
+// key with unfinished rows has exactly one head, that head is its earliest unfinished row, and no
+// finished row is a head. Writers of one key run one after the other and each of them keeps it, so
+// it holds on every snapshot, also in the middle of a concurrent test. It returns the keys that
+// break it.
+const headsBroken = `
+	SELECT coalesce(string_agg(format('%s/%s: %s heads among %s unfinished rows, the earliest %s a head',
+	                                  tenant_id, ordering_key, heads, unfinished,
+	                                  CASE WHEN first_is_head THEN 'is' ELSE 'is not' END), '; '), '')
+	  FROM (
+	        SELECT tenant_id, ordering_key,
+	               count(*) FILTER (WHERE state IN ('pending', 'prepared')) AS unfinished,
+	               count(*) FILTER (WHERE is_head) AS heads,
+	               coalesce((array_agg(is_head ORDER BY seq) FILTER (WHERE state IN ('pending', 'prepared')))[1], false) AS first_is_head,
+	               bool_or(is_head AND state NOT IN ('pending', 'prepared')) AS finished_head
+	          FROM sluiceway.outbox
+	         GROUP BY tenant_id, ordering_key
+	       ) k
+	 WHERE finished_head OR (unfinished = 0 AND heads <> 0) OR (unfinished > 0 AND (heads <> 1 OR NOT first_is_head))`
+
+// checkHeads fails the test if the head marker's invariant does not hold right now.
+func (e *env) checkHeads(admin *pgx.Conn) {
+	e.t.Helper()
+	var broken string
+	if err := admin.QueryRow(e.ctx, headsBroken).Scan(&broken); err != nil {
+		e.t.Fatalf("head invariant: %v", err)
+	}
+	if broken != "" {
+		e.t.Fatalf("head invariant broken: %s", broken)
+	}
+}
+
+func (e *env) isHead(id string) bool {
+	e.t.Helper()
+	row, err := e.ob.Get(e.ctx, tenantA, id)
+	if err != nil {
+		e.t.Fatalf("Get(%s): %v", id, err)
+	}
+	return row.IsHead
 }
 
 func (e *env) seqOf(id string) int64 {
@@ -364,22 +470,75 @@ func TestReplayWaitsForAnOpenAcceptOfItsKey(t *testing.T) {
 	e.claimOne(v1)
 }
 
-// TestAKeyWithAnyLeasedRowIsNotClaimable pins the claim's second line of defense. The row below
-// reaches the table the way a late commit would without the ordering-key lock: ahead of a version
-// that is already in flight.
-func TestAKeyWithAnyLeasedRowIsNotClaimable(t *testing.T) {
+// adminErr runs one statement as the superuser and returns the server's verdict.
+func (e *env) adminErr(sql string) error {
+	e.t.Helper()
+	_, err := e.adminConn().Exec(e.ctx, sql)
+	return err
+}
+
+func sqlState(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+	return ""
+}
+
+// TestAKeyNeverHasTwoHeads pins the second line of defense, which is the database's and not the
+// claim's: one head per key, by a unique index. The rows below reach the table the way a writer
+// would that took no ordering-key lock and knew nothing of the marker: ahead of a version that is
+// already in flight. (Before the head marker this was a NOT EXISTS in the claim, evaluated on the
+// snapshot. The index holds at every moment, and for every writer.)
+func TestAKeyNeverHasTwoHeads(t *testing.T) {
 	e := setup(t)
 	v2 := e.accept(tenantA, "task:1", 2)
 	e.claimOne(v2)
 
-	e.admin(`INSERT INTO sluiceway.outbox (id, seq, tenant_id, provider, delivery_id, ordering_key, raw_body)
-	         OVERRIDING SYSTEM VALUE VALUES ('late', 0, 'tenant_a', 'fake', 'late', 'task:1', '')`)
+	const late = `INSERT INTO sluiceway.outbox (id, seq, tenant_id, provider, delivery_id, ordering_key, raw_body, is_head)
+	              OVERRIDING SYSTEM VALUE VALUES ('%s', 0, 'tenant_a', 'fake', '%[1]s', 'task:1', '', %v)`
+	if err := e.adminErr(fmt.Sprintf(late, "second-head", true)); sqlState(err) != "23505" {
+		t.Fatalf("a second head for a key whose head is in flight: err = %v, want a unique violation", err)
+	}
+	// Without the marker the row is stored, and is nothing a claim can see.
+	if err := e.adminErr(fmt.Sprintf(late, "late", false)); err != nil {
+		t.Fatal(err)
+	}
 	e.claimNone("v2 is in flight, so nothing else of its entity is claimable, not even an earlier row")
 
-	// An expired lease is not a live one, and then the earlier row is simply the head.
+	// When v2's lease runs out it is v2 that is taken over. The earlier row is still not a head.
 	e.admin("UPDATE sluiceway.outbox SET lease_until = now() - interval '1 second' WHERE id = '" + v2 + "'")
-	e.claimOne("late")
-	e.claimNone("now the earlier row is in flight")
+	c2 := e.claimOne(v2)
+	e.claimNone("v2 is in flight again")
+
+	// Finishing the head hands the marker to the earliest unfinished row of the key.
+	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ob.MarkDelivered(e.ctx, e.claimOne("late")); err != nil {
+		t.Fatal(err)
+	}
+
+	// And a finished row can never be a head, even of a key that has none.
+	err := e.adminErr("UPDATE sluiceway.outbox SET is_head = true WHERE id = '" + v2 + "'")
+	if sqlState(err) != "23514" {
+		t.Errorf("making a delivered row a head: err = %v, want a check violation", err)
+	}
+}
+
+// TestAFinishedRowIsNeverAHead: the claim asks for is_head and does not look at the state, so
+// "a finished row is never leased" rests on the table's CHECK, for every writer there is or will
+// be. Neither way of finishing a row while keeping its marker gets past it.
+func TestAFinishedRowIsNeverAHead(t *testing.T) {
+	e := setup(t)
+	v1 := e.accept(tenantA, "task:1", 1)
+	for _, state := range []string{outbox.StateDelivered, outbox.StateDead} {
+		err := e.adminErr(fmt.Sprintf("UPDATE sluiceway.outbox SET state = '%s', finished_at = now() WHERE id = '%s'", state, v1))
+		if sqlState(err) != "23514" {
+			t.Errorf("a head made %s and left a head: err = %v, want a check violation", state, err)
+		}
+	}
+	e.claimOne(v1) // and it is still there to be claimed
 }
 
 // TestClaimRechecksARowFinishedAfterItsSnapshot: v1's lease has run out, and its slow holder is
@@ -468,4 +627,163 @@ func TestClaimRechecksARowReplayedAfterItsSnapshot(t *testing.T) {
 			e.claimOne(v1)
 		})
 	}
+}
+
+// The three tests below are the races the head marker brings with it. In each, two writers of one
+// key overlap: one decides from what it can see whether a row is a head, the other changes that
+// under it. Whichever comes second has to wait for the first to commit, or a row ends up
+// unfinished with no head in front of it, and is never delivered.
+
+// TestAFinishWaitsForAnOpenAcceptOfItsKey is the lost promotion. The Accept of v2 sees v1
+// unfinished and inserts v2 as a non-head. Were the MarkDelivered of v1 to run now, it would not
+// see the uncommitted v2, would promote nothing, and v2 would wait forever.
+func TestAFinishWaitsForAnOpenAcceptOfItsKey(t *testing.T) {
+	e := setup(t)
+	admin := e.adminConn()
+	v1 := e.accept(tenantA, "task:1", 1)
+	c1 := e.claimOne(v1)
+
+	v2, commitV2 := e.acceptAndHold("task:1", 2)
+
+	delivered := make(chan error, 1)
+	var finished atomic.Bool
+	go func() {
+		err := e.ob.MarkDelivered(e.ctx, c1)
+		finished.Store(true)
+		delivered <- err
+	}()
+	waited := e.waitsOn(admin, onAnOrderingKey, finished.Load)
+
+	commitV2()
+	if err := <-delivered; err != nil {
+		t.Fatal(err)
+	}
+	if !waited {
+		t.Error("MarkDelivered of v1 finished while an Accept of its key was open")
+	}
+	e.checkHeads(admin)
+	e.claimOne(v2) // the property: v2 was handed the marker
+}
+
+// TestAnAcceptWaitsForAnOpenFinishOfItsKey is the same race from the other side. The MarkDelivered
+// of v1 has found nothing to promote and has not committed. Were the Accept of v2 to run now, it
+// would still see v1 unfinished and insert v2 as a non-head, behind a row that is about to be gone.
+func TestAnAcceptWaitsForAnOpenFinishOfItsKey(t *testing.T) {
+	e := setup(t)
+	admin := e.adminConn()
+	v1 := e.accept(tenantA, "task:2", 1)
+	commitV1 := e.deliverAndHold(e.claimOne(v1))
+
+	t2, t2Finished := e.acceptInBackground("task:2", 2)
+	waited := e.waitsOn(admin, onAnOrderingKey, t2Finished)
+
+	commitV1()
+	second := <-t2
+	if second.err != nil || second.id == "" {
+		t.Fatalf("Accept of v2 = %q, %v", second.id, second.err)
+	}
+	if !waited {
+		t.Error("Accept of v2 finished while a MarkDelivered of its key was open")
+	}
+	e.checkHeads(admin)
+	e.claimOne(second.id) // the property: v2 is the head of a key with nothing else unfinished
+}
+
+// TestAReplayWaitsForAnOpenFinishOfItsKey: a replayed row is a head only if its key has nothing
+// unfinished, so it has the same race with a finish that an Accept has.
+func TestAReplayWaitsForAnOpenFinishOfItsKey(t *testing.T) {
+	e := setup(t)
+	admin := e.adminConn()
+	v1 := e.accept(tenantA, "task:1", 1)
+	v2 := e.accept(tenantA, "task:1", 2)
+	if err := e.ob.MarkDead(e.ctx, e.claimOne(v1), "normalizer", "bad shape"); err != nil {
+		t.Fatal(err)
+	}
+	commitV2 := e.deliverAndHold(e.claimOne(v2))
+
+	replayed := make(chan error, 1)
+	var finished atomic.Bool
+	go func() {
+		err := e.ob.Replay(e.ctx, tenantA, v1)
+		finished.Store(true)
+		replayed <- err
+	}()
+	waited := e.waitsOn(admin, onAnOrderingKey, finished.Load)
+
+	commitV2()
+	if err := <-replayed; err != nil {
+		t.Fatal(err)
+	}
+	if !waited {
+		t.Error("Replay of v1 finished while a MarkDelivered of its key was open")
+	}
+	e.checkHeads(admin)
+	e.claimOne(v1)
+}
+
+// TestTheMarkerFollowsTheQueue walks one key through every writer and looks at the marker after
+// each: it is always on the earliest unfinished row, and nowhere else.
+func TestTheMarkerFollowsTheQueue(t *testing.T) {
+	e := setup(t)
+	admin := e.adminConn()
+	heads := func(step string, want map[string]bool) {
+		t.Helper()
+		e.checkHeads(admin)
+		for id, isHead := range want {
+			if got := e.isHead(id); got != isHead {
+				t.Fatalf("%s: row %s is a head = %v, want %v", step, id, got, isHead)
+			}
+		}
+	}
+
+	v1 := e.accept(tenantA, "task:1", 1)
+	v2 := e.accept(tenantA, "task:1", 2)
+	v3 := e.accept(tenantA, "task:1", 3)
+	heads("accepted", map[string]bool{v1: true, v2: false, v3: false})
+
+	// A retry keeps the marker: the key waits with its head.
+	c1 := e.claimOne(v1)
+	if err := e.ob.Fail(e.ctx, c1, outbox.Ladder{time.Hour}, "sink 503"); err != nil {
+		t.Fatal(err)
+	}
+	heads("v1 backing off", map[string]bool{v1: true, v2: false, v3: false})
+	e.admin("UPDATE sluiceway.outbox SET next_attempt_at = now() - interval '1 second' WHERE id = '" + v1 + "'")
+
+	// A dead letter gives it up, to the next row and not to the last.
+	if err := e.ob.MarkDead(e.ctx, e.claimOne(v1), "normalizer", "bad shape"); err != nil {
+		t.Fatal(err)
+	}
+	heads("v1 dead", map[string]bool{v1: false, v2: true, v3: false})
+
+	// A replay onto a key with unfinished rows joins the back, without the marker.
+	if err := e.ob.Replay(e.ctx, tenantA, v1); err != nil {
+		t.Fatal(err)
+	}
+	heads("v1 replayed behind v2 and v3", map[string]bool{v1: false, v2: true, v3: false})
+
+	c2 := e.claimOne(v2)
+	if err := e.ob.MarkPrepared(e.ctx, c2); err != nil {
+		t.Fatal(err)
+	}
+	heads("v2 prepared", map[string]bool{v1: false, v2: true, v3: false})
+	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+		t.Fatal(err)
+	}
+	heads("v2 delivered", map[string]bool{v1: false, v2: false, v3: true})
+
+	if err := e.ob.MarkDead(e.ctx, e.claimOne(v3), "normalizer", "bad shape"); err != nil {
+		t.Fatal(err)
+	}
+	heads("v3 dead", map[string]bool{v1: true, v2: false, v3: false})
+	if err := e.ob.MarkDelivered(e.ctx, e.claimOne(v1)); err != nil {
+		t.Fatal(err)
+	}
+	heads("v1 delivered, nothing unfinished", map[string]bool{v1: false, v2: false, v3: false})
+
+	// A replay onto a key with nothing unfinished is a head at once.
+	if err := e.ob.Replay(e.ctx, tenantA, v3); err != nil {
+		t.Fatal(err)
+	}
+	heads("v3 replayed onto an empty queue", map[string]bool{v1: false, v2: false, v3: true})
+	e.claimOne(v3)
 }

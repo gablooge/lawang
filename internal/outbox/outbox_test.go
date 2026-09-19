@@ -302,6 +302,15 @@ func TestTheWorkerRoleNeverReadsAPayload(t *testing.T) {
 		"SELECT * FROM outbox",
 		"SELECT provider, delivery_id FROM outbox",
 		"SELECT lease_token FROM outbox", // it writes the token, and never reads one back
+		// The claim reads is_head and due_at, and nothing they are made from: not which entity a
+		// row belongs to, not its state, and not the two times due_at is computed from.
+		"SELECT ordering_key FROM outbox",
+		"SELECT state FROM outbox",
+		"SELECT next_attempt_at FROM outbox",
+		"SELECT lease_until FROM outbox",
+		// It can lease a head. It can never make one, or make a row due.
+		"UPDATE outbox SET is_head = true",
+		"UPDATE outbox SET next_attempt_at = now()",
 		"UPDATE outbox SET state = 'delivered'",
 		"UPDATE outbox SET tenant_id = 'tenant_b'",
 		"DELETE FROM outbox",
@@ -359,6 +368,7 @@ func TestGetIsTenantScoped(t *testing.T) {
 // TestConcurrentClaimersNeverShareARow hammers Claim from many goroutines, several times over.
 func TestConcurrentClaimersNeverShareARow(t *testing.T) {
 	e := setup(t)
+	admin := e.adminConn()
 	const (
 		rounds   = 5
 		rows     = 120
@@ -389,10 +399,15 @@ func TestConcurrentClaimersNeverShareARow(t *testing.T) {
 						return
 					}
 					mu.Lock()
+					again := false
 					for _, c := range got {
 						seen[c.ID]++
+						again = again || seen[c.ID] > 1
 					}
 					mu.Unlock()
+					if again {
+						return // reported below. A claim that hands rows out twice never runs dry.
+					}
 				}
 			})
 		}
@@ -409,7 +424,8 @@ func TestConcurrentClaimersNeverShareARow(t *testing.T) {
 		if len(seen) != rows {
 			t.Errorf("round %d: %d rows claimed, want %d", round, len(seen), rows)
 		}
-		e.admin("UPDATE sluiceway.outbox SET state = 'delivered', lease_until = NULL, lease_token = NULL, finished_at = now() WHERE state <> 'delivered'")
+		e.checkHeads(admin)
+		e.admin("UPDATE sluiceway.outbox SET state = 'delivered', is_head = false, lease_until = NULL, lease_token = NULL, finished_at = now() WHERE state <> 'delivered'")
 	}
 }
 
@@ -501,6 +517,7 @@ func TestConcurrentWorkersDeliverEachEntityInOrder(t *testing.T) {
 	if delivered != entities*versions {
 		t.Errorf("delivered %d rows, want %d", delivered, entities*versions)
 	}
+	e.checkHeads(e.adminConn())
 }
 
 // TestReplayNeverOvertakesAVersionInFlight: v1 is a dead letter, v2 is being delivered, and the

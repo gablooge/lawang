@@ -5,10 +5,22 @@
 // ordering key (the unfinished row with the lowest seq for one source entity), so the versions of
 // an entity deliver one at a time, in queue order, while different entities proceed in parallel.
 //
-// Queue order is arrival order, with one exception: a replayed dead letter goes to the back. Every
-// writer that gives a row its place (Accept, Replay) first takes a transaction-scoped advisory
-// lock on the ordering key, so within one key a lower seq always commits first and a claim can
-// never see a row before the rows ahead of it.
+// Being the head is a stored column, is_head, and not something the claim works out: the claim
+// walks an index of due heads and stops at its batch, so a poll costs what it returns, however
+// much is waiting behind the heads, in backoff, or leased to other workers. The record of that
+// decision, and the full correctness argument, is docs/adr/0010-outbox-head-marker.md. In brief:
+//
+//   - Safety is the database's. A unique index allows one head per key, a CHECK says a head is
+//     unfinished, and the claim re-checks is_head on the row it has locked. An unfinished row keeps
+//     the marker until it finishes. So two rows of one key are never in flight together, whatever
+//     the callers do.
+//   - Liveness and order are the writers'. Every writer that changes which rows of a key are
+//     unfinished (Accept, Replay, MarkDelivered, MarkDead) first takes a transaction-scoped
+//     advisory lock on the key. Within one key they therefore run one after the other: a lower seq
+//     always commits first, a new row knows whether it is the head, and the row that finishes the
+//     head hands the marker to the next one, with no window in which the two can miss each other.
+//
+// Queue order is arrival order, with one exception: a replayed dead letter goes to the back.
 package outbox
 
 import (
@@ -79,7 +91,9 @@ type Row = outboxdb.GetRow
 // a delivery this tenant already has, which makes a provider's re-send a no-op.
 //
 // Two Accepts for one ordering key run one after the other: the second waits until the first has
-// committed. See LockOrderingKey in queries.sql.
+// committed, and so does an Accept that meets a MarkDelivered, MarkDead or Replay of its key. See
+// LockOrderingKey in queries.sql. The new row is claimable at once if its entity has nothing
+// unfinished, and otherwise when the rows ahead of it have finished.
 func (o *Outbox) Accept(ctx context.Context, tenant tenancy.ID, d Delivery) (id string, fresh bool, err error) {
 	err = o.db.TenantTx(ctx, tenant, func(tx pgx.Tx) (err error) {
 		id, fresh, err = acceptIn(ctx, tx, tenant, d)
@@ -101,7 +115,8 @@ func acceptIn(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, d Delivery) (id
 		return "", false, err
 	}
 	q := outboxdb.New(tx)
-	// Before the INSERT, which is what assigns seq, and as a statement of its own.
+	// Before the INSERT, which assigns seq and decides whether the row is the head of its key, and
+	// as a statement of its own.
 	err = q.LockOrderingKey(ctx, outboxdb.LockOrderingKeyParams{TenantID: tenant.String(), OrderingKey: d.OrderingKey})
 	if err != nil {
 		return "", false, fmt.Errorf("outbox: accept: %w", err)
@@ -173,16 +188,47 @@ func (o *Outbox) Get(ctx context.Context, tenant tenancy.ID, id string) (Row, er
 // MarkPrepared records that the ledger rows and prepared records are committed. After this, a
 // crash re-drains into delivery, not into preparing again.
 func (o *Outbox) MarkPrepared(ctx context.Context, c Claimed) error {
-	return o.transition(ctx, c, func(q *outboxdb.Queries) (int64, error) {
-		return q.MarkPrepared(ctx, outboxdb.MarkPreparedParams{ID: c.ID, LeaseToken: c.token})
+	return o.transition(ctx, c, func(tx pgx.Tx) error {
+		return held(outboxdb.New(tx).MarkPrepared(ctx, outboxdb.MarkPreparedParams{ID: c.ID, LeaseToken: c.token}))
 	})
 }
 
-// MarkDelivered finishes the row.
+// MarkDelivered finishes the row, and makes the next version of its entity claimable.
 func (o *Outbox) MarkDelivered(ctx context.Context, c Claimed) error {
-	return o.transition(ctx, c, func(q *outboxdb.Queries) (int64, error) {
+	return o.transition(ctx, c, func(tx pgx.Tx) error { return markDeliveredIn(ctx, tx, c) })
+}
+
+// markDeliveredIn is MarkDelivered inside a transaction already bound to the row's tenant.
+func markDeliveredIn(ctx context.Context, tx pgx.Tx, c Claimed) error {
+	return finishIn(ctx, tx, c, func(q *outboxdb.Queries) (string, error) {
 		return q.MarkDelivered(ctx, outboxdb.MarkDeliveredParams{ID: c.ID, LeaseToken: c.token})
 	})
+}
+
+// finishIn runs one of the two transitions that finish a row, and hands the head marker on. The
+// order is fixed, and each step is a statement of its own:
+//
+//  1. The ordering key's lock, as in Accept. It comes before any row lock, here as everywhere, so
+//     that no two transactions ever wait for each other.
+//  2. The lease-guarded state change, which also gives up the marker. No row means the lease was
+//     lost: nothing changed, and nothing is promoted.
+//  3. The promotion of the key's next unfinished row. Its snapshot is taken after step 1, so it
+//     sees every row of the key an earlier lock holder committed, and no Accept or Replay of the
+//     key is open while it runs. Without the lock, an Accept that saw this row unfinished would
+//     insert a non-head that this statement cannot see yet, and that row would wait forever.
+func finishIn(ctx context.Context, tx pgx.Tx, c Claimed, finish func(*outboxdb.Queries) (orderingKey string, err error)) error {
+	q := outboxdb.New(tx)
+	if err := q.LockOrderingKeyOf(ctx, c.ID); err != nil {
+		return err
+	}
+	key, err := finish(q)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ErrLeaseLost
+	case err != nil:
+		return err
+	}
+	return q.PromoteNextHead(ctx, outboxdb.PromoteNextHeadParams{TenantID: c.Tenant.String(), OrderingKey: key})
 }
 
 // Fail handles a retryable failure: it schedules the next attempt from the ladder, or parks the
@@ -192,19 +238,21 @@ func (o *Outbox) Fail(ctx context.Context, c Claimed, ladder Ladder, cause strin
 	if !ok {
 		return o.MarkDead(ctx, c, "retries exhausted", cause)
 	}
-	return o.transition(ctx, c, func(q *outboxdb.Queries) (int64, error) {
-		return q.Retry(ctx, outboxdb.RetryParams{
+	return o.transition(ctx, c, func(tx pgx.Tx) error {
+		return held(outboxdb.New(tx).Retry(ctx, outboxdb.RetryParams{
 			ID: c.ID, LeaseToken: c.token, DelaySeconds: delay.Seconds(), LastError: clip(cause),
-		})
+		}))
 	})
 }
 
 // MarkDead parks the row as a dead letter, for failures that retrying cannot fix. A dead row no
-// longer holds back newer versions of its entity.
+// longer holds back newer versions of its entity: the next one becomes claimable.
 func (o *Outbox) MarkDead(ctx context.Context, c Claimed, reason, cause string) error {
-	return o.transition(ctx, c, func(q *outboxdb.Queries) (int64, error) {
-		return q.MarkDead(ctx, outboxdb.MarkDeadParams{
-			ID: c.ID, LeaseToken: c.token, DeadReason: clip(reason), LastError: clip(cause),
+	return o.transition(ctx, c, func(tx pgx.Tx) error {
+		return finishIn(ctx, tx, c, func(q *outboxdb.Queries) (string, error) {
+			return q.MarkDead(ctx, outboxdb.MarkDeadParams{
+				ID: c.ID, LeaseToken: c.token, DeadReason: clip(reason), LastError: clip(cause),
+			})
 		})
 	})
 }
@@ -217,7 +265,8 @@ func (o *Outbox) Replay(ctx context.Context, tenant tenancy.ID, id string) error
 	var n int64
 	err := o.db.TenantTx(ctx, tenant, func(tx pgx.Tx) (err error) {
 		q := outboxdb.New(tx)
-		// Before the UPDATE, which is what assigns the new seq, and as a statement of its own.
+		// Before the UPDATE, which assigns the new seq and decides whether the row is the head of
+		// its key, and as a statement of its own.
 		if err := q.LockOrderingKeyOf(ctx, id); err != nil {
 			return err
 		}
@@ -233,23 +282,30 @@ func (o *Outbox) Replay(ctx context.Context, tenant tenancy.ID, id string) error
 	return nil
 }
 
-// transition runs one lease-guarded state change bound to the row's own tenant.
-func (o *Outbox) transition(ctx context.Context, c Claimed, change func(*outboxdb.Queries) (int64, error)) error {
+// transition runs one lease-guarded state change bound to the row's own tenant. change returns
+// ErrLeaseLost when the guard matched no row, and only then: a database or context error is never
+// reported as a lost lease, because the two tell a worker opposite things (stop working on the
+// row, or try the transition again while the lease lasts).
+func (o *Outbox) transition(ctx context.Context, c Claimed, change func(pgx.Tx) error) error {
 	if c.token == "" {
 		return ErrLeaseLost
 	}
-	var n int64
-	err := o.db.TenantTx(ctx, c.Tenant, func(tx pgx.Tx) (err error) {
-		n, err = change(outboxdb.New(tx))
-		return err
-	})
-	if err != nil {
+	err := o.db.TenantTx(ctx, c.Tenant, change)
+	switch {
+	case errors.Is(err, ErrLeaseLost):
+		return ErrLeaseLost
+	case err != nil:
 		return fmt.Errorf("outbox: %w", err)
 	}
-	if n == 0 {
+	return nil
+}
+
+// held turns the row count of a lease-guarded UPDATE into ErrLeaseLost when it matched nothing.
+func held(rows int64, err error) error {
+	if err == nil && rows == 0 {
 		return ErrLeaseLost
 	}
-	return nil
+	return err
 }
 
 // clip makes s storable and bounded: valid UTF-8 with no NUL (Postgres rejects both in text, and a

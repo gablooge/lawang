@@ -19,12 +19,27 @@ CREATE TABLE outbox (
   raw_body        bytea       NOT NULL,                          -- exactly as received
   state           text        NOT NULL DEFAULT 'pending'
                               CHECK (state IN ('pending', 'prepared', 'delivered', 'dead')),
+  -- The head marker: true for exactly the earliest unfinished row of its (tenant, ordering key),
+  -- and only a head is ever claimable. It is stored, not computed by the claim, so that a claim
+  -- costs what it returns and not what is waiting (docs/adr/0010-outbox-head-marker.md). Writers
+  -- keep it under the ordering key's advisory lock: Accept and Replay set it when the key has no
+  -- unfinished row, and finishing the head hands it to the next row in the same transaction. The
+  -- database refuses the two states that would break ordering: a finished row that is still a head
+  -- (the CHECK below) and two heads for one key (outbox_one_head). A row that reaches the table
+  -- any other way is not a head, and waits until the head of its key finishes. The claim relies on
+  -- that CHECK: it asks for is_head and does not look at the state.
+  is_head         boolean     NOT NULL DEFAULT false,
   attempts        integer     NOT NULL DEFAULT 0,
   next_attempt_at timestamptz NOT NULL DEFAULT now(),
   -- A claim is a lease, not a held lock, because the work spans two transactions and a sink call.
   -- A worker that dies simply lets its lease run out.
   lease_until     timestamptz,
   lease_token     text,
+  -- When the row may next be claimed: once its backoff is over AND its lease has run out. One
+  -- column, so that one index range holds exactly the claimable rows, and a poll visits neither
+  -- the rows waiting out a backoff nor the rows other workers hold. (GREATEST ignores a NULL, so
+  -- a row with no lease is due at next_attempt_at.)
+  due_at          timestamptz NOT NULL GENERATED ALWAYS AS (GREATEST(next_attempt_at, lease_until)) STORED,
   last_error      text        NOT NULL DEFAULT '',
   dead_reason     text        NOT NULL DEFAULT '',
   accepted_at     timestamptz NOT NULL DEFAULT now(),
@@ -33,12 +48,22 @@ CREATE TABLE outbox (
   prepared_at     timestamptz,
   finished_at     timestamptz,
   UNIQUE (tenant_id, delivery_id),
-  CHECK ((lease_until IS NULL) = (lease_token IS NULL))
+  CHECK ((lease_until IS NULL) = (lease_token IS NULL)),
+  CONSTRAINT outbox_head_is_unfinished CHECK (NOT is_head OR state IN ('pending', 'prepared'))
 );
 
--- The claim reads the earliest unfinished row of every key.
+-- The unfinished rows of one key, in queue order. Accept and Replay ask it whether the key has
+-- any, and finishing a head asks it for the next one. Each is a probe of one key.
 CREATE INDEX outbox_unfinished ON outbox (tenant_id, ordering_key, seq)
   WHERE state IN ('pending', 'prepared');
+
+-- At most one head per key. This is what makes "never two versions of one entity in flight" a
+-- property of the database and not of the callers' discipline.
+CREATE UNIQUE INDEX outbox_one_head ON outbox (tenant_id, ordering_key) WHERE is_head;
+
+-- What the claim walks: heads only, in the order they fall due. Its size is the number of keys
+-- with work, never the number of rows behind them, and the claim reads only its due front.
+CREATE INDEX outbox_due_heads ON outbox (due_at, seq) WHERE is_head;
 
 ALTER TABLE outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE outbox FORCE ROW LEVEL SECURITY;
@@ -50,12 +75,12 @@ CREATE POLICY tenant_isolation ON outbox
 -- The worker role claims across tenants, because it cannot know which tenants have work. It sees
 -- only what a scheduler needs, and may change only the lease. It can never read a payload: the
 -- work itself happens afterwards, as the application role bound to the claimed row's own tenant.
--- It writes lease_token but cannot read it back: the token guards every transition.
+-- It writes lease_token but cannot read it back: the token guards every transition. It cannot
+-- write is_head, so it can never make a row claimable.
 CREATE POLICY worker_claim_select ON outbox FOR SELECT TO sluiceway_worker USING (true);
 CREATE POLICY worker_claim_update ON outbox FOR UPDATE TO sluiceway_worker USING (true) WITH CHECK (true);
 
-GRANT SELECT (id, seq, tenant_id, ordering_key, state, attempts, next_attempt_at, lease_until)
-  ON outbox TO sluiceway_worker;
+GRANT SELECT (id, seq, tenant_id, is_head, attempts, due_at) ON outbox TO sluiceway_worker;
 GRANT UPDATE (attempts, lease_until, lease_token) ON outbox TO sluiceway_worker;
 
 -- +goose Down
