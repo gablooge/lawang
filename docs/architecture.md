@@ -159,6 +159,15 @@ The claim runs as `sluiceway_worker`, which is granted only what it reads (`id`,
 being able to read one back, and it cannot write `is_head`, so it can lease a head but never make
 one. Payloads are read afterwards, as the application role bound to the claimed row's tenant.
 
+**What a failure leaves behind.** `last_error` and `dead_reason` are plain text that operators
+read and every backup carries, so they never hold token material, a URL, or text written by a
+remote system. The outbox does not take an error string at all. A failure is recorded as an
+`outbox.Cause`: one of the outbox's own classifications (section 11), the HTTP status, and the
+remote system's error code if it looks like one (short, and nothing but letters, digits, `_`, `-`
+and `.`), otherwise the word "withheld". The reason is the obvious call it rules out: the error
+of an HTTP client quotes the request URL, and the query string is where many sinks and providers
+carry their API key.
+
 ### 3.3 Reconciliation
 
 A per-tenant, per-provider cursor records the newest change already seen. A reconcile pass asks the

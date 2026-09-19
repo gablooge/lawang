@@ -442,7 +442,7 @@ func TestReplayWaitsForAnOpenAcceptOfItsKey(t *testing.T) {
 	e := setup(t)
 	admin := e.adminConn()
 	v1 := e.accept(tenantA, "task:1", 1)
-	if err := e.ob.MarkDead(e.ctx, e.claimOne(v1), "normalizer", "bad shape"); err != nil {
+	if err := e.ob.MarkDead(e.ctx, e.claimOne(v1), badShape); err != nil {
 		t.Fatal(err)
 	}
 
@@ -603,7 +603,7 @@ func TestClaimRechecksARowReplayedAfterItsSnapshot(t *testing.T) {
 			// These claims read the gate row too, and pass: only the first claim stops there. That
 			// the first of them gets v1 also shows the paused claim had not locked it.
 			c1 := e.claimOne(v1)
-			if err := e.ob.MarkDead(e.ctx, c1, "normalizer", "bad shape"); err != nil {
+			if err := e.ob.MarkDead(e.ctx, c1, badShape); err != nil {
 				t.Fatal(err)
 			}
 			c2 := e.claimOne(v2)
@@ -696,7 +696,7 @@ func TestAReplayWaitsForAnOpenFinishOfItsKey(t *testing.T) {
 	admin := e.adminConn()
 	v1 := e.accept(tenantA, "task:1", 1)
 	v2 := e.accept(tenantA, "task:1", 2)
-	if err := e.ob.MarkDead(e.ctx, e.claimOne(v1), "normalizer", "bad shape"); err != nil {
+	if err := e.ob.MarkDead(e.ctx, e.claimOne(v1), badShape); err != nil {
 		t.Fatal(err)
 	}
 	commitV2 := e.deliverAndHold(e.claimOne(v2))
@@ -743,14 +743,14 @@ func TestTheMarkerFollowsTheQueue(t *testing.T) {
 
 	// A retry keeps the marker: the key waits with its head.
 	c1 := e.claimOne(v1)
-	if err := e.ob.Fail(e.ctx, c1, outbox.Ladder{time.Hour}, "sink 503"); err != nil {
+	if err := e.ob.Fail(e.ctx, c1, outbox.Ladder{time.Hour}, sink503); err != nil {
 		t.Fatal(err)
 	}
 	heads("v1 backing off", map[string]bool{v1: true, v2: false, v3: false})
 	e.admin("UPDATE sluiceway.outbox SET next_attempt_at = now() - interval '1 second' WHERE id = '" + v1 + "'")
 
 	// A dead letter gives it up, to the next row and not to the last.
-	if err := e.ob.MarkDead(e.ctx, e.claimOne(v1), "normalizer", "bad shape"); err != nil {
+	if err := e.ob.MarkDead(e.ctx, e.claimOne(v1), badShape); err != nil {
 		t.Fatal(err)
 	}
 	heads("v1 dead", map[string]bool{v1: false, v2: true, v3: false})
@@ -771,7 +771,7 @@ func TestTheMarkerFollowsTheQueue(t *testing.T) {
 	}
 	heads("v2 delivered", map[string]bool{v1: false, v2: false, v3: true})
 
-	if err := e.ob.MarkDead(e.ctx, e.claimOne(v3), "normalizer", "bad shape"); err != nil {
+	if err := e.ob.MarkDead(e.ctx, e.claimOne(v3), badShape); err != nil {
 		t.Fatal(err)
 	}
 	heads("v3 dead", map[string]bool{v1: true, v2: false, v3: false})

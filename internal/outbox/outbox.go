@@ -50,12 +50,26 @@ const (
 // maxErrorLen bounds what is kept of an error message.
 const maxErrorLen = 1000
 
+// MaxOrderingKeyLen is the longest ordering key Accept takes, in bytes. An entity id is a few dozen
+// bytes. The bound exists because the key is a column of two indexes, and a btree tuple cannot
+// exceed about 2700 bytes: without it, whether a long key can be stored depends on how well it
+// compresses. The table has a CHECK for the same number.
+const MaxOrderingKeyLen = 512
+
+// MaxBatch is the most rows one Claim leases, whatever it is asked for.
+const MaxBatch = 1000
+
 // ErrLeaseLost reports a transition by a worker that no longer holds the row: its lease ran out
 // and another worker took over, or the row already finished. The caller must stop working on it.
 var ErrLeaseLost = errors.New("outbox: lease lost")
 
 // ErrNotFound reports a row that does not exist for this tenant.
 var ErrNotFound = errors.New("outbox: not found")
+
+// ErrBadOrderingKey reports a delivery whose ordering key is empty or longer than
+// MaxOrderingKeyLen. It can never be stored, however often it is sent again, so a caller that
+// answers a provider must treat it as poison (park it, answer 2xx) and not as a failure to retry.
+var ErrBadOrderingKey = errors.New("outbox: ordering key must be 1 to 512 bytes")
 
 // Outbox reads and writes the outbox table.
 type Outbox struct {
@@ -74,15 +88,28 @@ type Delivery struct {
 	RawBody []byte
 }
 
-// Claimed is a leased row. It deliberately carries no payload: claiming runs across tenants, and
-// the payload is only ever read bound to Tenant.
+// Claimed is a leased row, and the only thing that can move it on. It deliberately carries no
+// payload: claiming runs across tenants, and the payload is only ever read bound to Tenant.
+//
+// It can be read and not changed or built: only Claim makes one that any transition accepts. The
+// tenant in particular is the one the row was claimed under, because every transition binds
+// row-level security to it. (A Claimed aimed at another tenant would change nothing, since that
+// tenant cannot see the row. It should not be possible to write one by accident either.)
 type Claimed struct {
-	ID     string
-	Tenant tenancy.ID
-	// Attempt counts claims of this row, starting at 1.
-	Attempt int
+	id      string
+	tenant  tenancy.ID
+	attempt int
 	token   string
 }
+
+// ID is the row's id.
+func (c Claimed) ID() string { return c.id }
+
+// Tenant is the tenant that owns the row. Bind to it before reading the payload.
+func (c Claimed) Tenant() tenancy.ID { return c.tenant }
+
+// Attempt counts the claims of this row, starting at 1.
+func (c Claimed) Attempt() int { return c.attempt }
 
 // Row is a full outbox row, as its own tenant sees it.
 type Row = outboxdb.GetRow
@@ -107,8 +134,9 @@ func (o *Outbox) Accept(ctx context.Context, tenant tenancy.ID, d Delivery) (id 
 
 // acceptIn is Accept inside a transaction already bound to tenant.
 func acceptIn(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, d Delivery) (id string, fresh bool, err error) {
-	if d.OrderingKey == "" {
-		return "", false, errors.New("outbox: empty ordering key")
+	if d.OrderingKey == "" || len(d.OrderingKey) > MaxOrderingKeyLen {
+		// The length is reported, the key is not: it is derived from what a sender sent.
+		return "", false, fmt.Errorf("%w, got %d", ErrBadOrderingKey, len(d.OrderingKey))
 	}
 	deliveryID, err := ids.DeliveryID(d.Provider, d.RawBody)
 	if err != nil {
@@ -141,6 +169,11 @@ func acceptIn(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, d Delivery) (id
 
 // Claim leases up to batch rows for the given duration, across tenants, as the worker role. Rows
 // locked by a concurrent claimer are skipped, never waited for.
+//
+// It never leases more than MaxBatch rows: a larger batch is cut to that, silently, so a caller
+// that sizes anything by its batch should not ask for more. A batch or a lease that is not
+// positive is refused. (A lease of zero would hand out rows that are claimable again at once, and
+// every poll would use up one attempt of the ladder with no delivery ever tried.)
 func (o *Outbox) Claim(ctx context.Context, batch int, lease time.Duration) ([]Claimed, error) {
 	if batch <= 0 || lease <= 0 {
 		return nil, errors.New("outbox: claim needs a positive batch size and lease")
@@ -151,7 +184,7 @@ func (o *Outbox) Claim(ctx context.Context, batch int, lease time.Duration) ([]C
 		rows, err := outboxdb.New(tx).Claim(ctx, outboxdb.ClaimParams{
 			LeaseSeconds: lease.Seconds(),
 			LeaseToken:   token,
-			BatchSize:    int32(min(batch, 1000)), //nolint:gosec // bounded just here
+			BatchSize:    int32(min(batch, MaxBatch)), //nolint:gosec // bounded just here
 		})
 		if err != nil {
 			return err
@@ -162,7 +195,7 @@ func (o *Outbox) Claim(ctx context.Context, batch int, lease time.Duration) ([]C
 			if err != nil {
 				return err
 			}
-			claimed = append(claimed, Claimed{ID: r.ID, Tenant: tenant, Attempt: int(r.Attempts), token: token})
+			claimed = append(claimed, Claimed{id: r.ID, tenant: tenant, attempt: int(r.Attempts), token: token})
 		}
 		return nil
 	})
@@ -189,7 +222,7 @@ func (o *Outbox) Get(ctx context.Context, tenant tenancy.ID, id string) (Row, er
 // crash re-drains into delivery, not into preparing again.
 func (o *Outbox) MarkPrepared(ctx context.Context, c Claimed) error {
 	return o.transition(ctx, c, func(tx pgx.Tx) error {
-		return held(outboxdb.New(tx).MarkPrepared(ctx, outboxdb.MarkPreparedParams{ID: c.ID, LeaseToken: c.token}))
+		return held(outboxdb.New(tx).MarkPrepared(ctx, outboxdb.MarkPreparedParams{ID: c.id, LeaseToken: c.token}))
 	})
 }
 
@@ -201,7 +234,7 @@ func (o *Outbox) MarkDelivered(ctx context.Context, c Claimed) error {
 // markDeliveredIn is MarkDelivered inside a transaction already bound to the row's tenant.
 func markDeliveredIn(ctx context.Context, tx pgx.Tx, c Claimed) error {
 	return finishIn(ctx, tx, c, func(q *outboxdb.Queries) (string, error) {
-		return q.MarkDelivered(ctx, outboxdb.MarkDeliveredParams{ID: c.ID, LeaseToken: c.token})
+		return q.MarkDelivered(ctx, outboxdb.MarkDeliveredParams{ID: c.id, LeaseToken: c.token})
 	})
 }
 
@@ -218,7 +251,7 @@ func markDeliveredIn(ctx context.Context, tx pgx.Tx, c Claimed) error {
 //     insert a non-head that this statement cannot see yet, and that row would wait forever.
 func finishIn(ctx context.Context, tx pgx.Tx, c Claimed, finish func(*outboxdb.Queries) (orderingKey string, err error)) error {
 	q := outboxdb.New(tx)
-	if err := q.LockOrderingKeyOf(ctx, c.ID); err != nil {
+	if err := q.LockOrderingKeyOf(ctx, c.id); err != nil {
 		return err
 	}
 	key, err := finish(q)
@@ -228,30 +261,42 @@ func finishIn(ctx context.Context, tx pgx.Tx, c Claimed, finish func(*outboxdb.Q
 	case err != nil:
 		return err
 	}
-	return q.PromoteNextHead(ctx, outboxdb.PromoteNextHeadParams{TenantID: c.Tenant.String(), OrderingKey: key})
+	return q.PromoteNextHead(ctx, outboxdb.PromoteNextHeadParams{TenantID: c.tenant.String(), OrderingKey: key})
 }
 
+// Why a row is dead, as stored in dead_reason. Fixed texts: what went wrong is the Cause.
+const (
+	reasonRetriesExhausted = "retries exhausted"
+	reasonNotRetryable     = "not retryable"
+)
+
 // Fail handles a retryable failure: it schedules the next attempt from the ladder, or parks the
-// row as a dead letter once the ladder is used up. cause must never contain token material.
-func (o *Outbox) Fail(ctx context.Context, c Claimed, ladder Ladder, cause string) error {
-	delay, ok := ladder.Next(c.Attempt)
+// row as a dead letter once the ladder is used up. What went wrong is a Cause and never an error
+// string: see Cause for why.
+func (o *Outbox) Fail(ctx context.Context, c Claimed, ladder Ladder, cause Cause) error {
+	delay, ok := ladder.Next(c.attempt)
 	if !ok {
-		return o.MarkDead(ctx, c, "retries exhausted", cause)
+		return o.markDead(ctx, c, reasonRetriesExhausted, cause)
 	}
 	return o.transition(ctx, c, func(tx pgx.Tx) error {
 		return held(outboxdb.New(tx).Retry(ctx, outboxdb.RetryParams{
-			ID: c.ID, LeaseToken: c.token, DelaySeconds: delay.Seconds(), LastError: clip(cause),
+			ID: c.id, LeaseToken: c.token, DelaySeconds: delay.Seconds(), LastError: clip(cause.String()),
 		}))
 	})
 }
 
 // MarkDead parks the row as a dead letter, for failures that retrying cannot fix. A dead row no
-// longer holds back newer versions of its entity: the next one becomes claimable.
-func (o *Outbox) MarkDead(ctx context.Context, c Claimed, reason, cause string) error {
+// longer holds back newer versions of its entity: the next one becomes claimable. Like Fail, it
+// takes a Cause and no text.
+func (o *Outbox) MarkDead(ctx context.Context, c Claimed, cause Cause) error {
+	return o.markDead(ctx, c, reasonNotRetryable, cause)
+}
+
+func (o *Outbox) markDead(ctx context.Context, c Claimed, reason string, cause Cause) error {
 	return o.transition(ctx, c, func(tx pgx.Tx) error {
 		return finishIn(ctx, tx, c, func(q *outboxdb.Queries) (string, error) {
 			return q.MarkDead(ctx, outboxdb.MarkDeadParams{
-				ID: c.ID, LeaseToken: c.token, DeadReason: clip(reason), LastError: clip(cause),
+				ID: c.id, LeaseToken: c.token, DeadReason: reason, LastError: clip(cause.String()),
 			})
 		})
 	})
@@ -290,7 +335,7 @@ func (o *Outbox) transition(ctx context.Context, c Claimed, change func(pgx.Tx) 
 	if c.token == "" {
 		return ErrLeaseLost
 	}
-	err := o.db.TenantTx(ctx, c.Tenant, change)
+	err := o.db.TenantTx(ctx, c.tenant, change)
 	switch {
 	case errors.Is(err, ErrLeaseLost):
 		return ErrLeaseLost

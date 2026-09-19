@@ -14,8 +14,11 @@ CREATE TABLE outbox (
   -- blake3(provider, raw_body). Unique per tenant, not globally: two tenants may connect the same
   -- provider workspace, and reconciliation synthesizes byte-identical deliveries for both.
   delivery_id     text        NOT NULL CHECK (delivery_id <> ''),
-  -- All rows that share a key deliver in arrival order. One key per source entity.
-  ordering_key    text        NOT NULL CHECK (ordering_key <> ''),
+  -- All rows that share a key deliver in arrival order. One key per source entity. Bounded, because
+  -- it is a column of two indexes and a btree tuple cannot exceed about 2700 bytes: a longer key
+  -- would fail the INSERT, or not, depending on how well it compresses. internal/outbox refuses one
+  -- by name (ErrBadOrderingKey, MaxOrderingKeyLen) before it gets here.
+  ordering_key    text        NOT NULL CHECK (ordering_key <> '' AND octet_length(ordering_key) <= 512),
   raw_body        bytea       NOT NULL,                          -- exactly as received
   state           text        NOT NULL DEFAULT 'pending'
                               CHECK (state IN ('pending', 'prepared', 'delivered', 'dead')),
@@ -40,6 +43,12 @@ CREATE TABLE outbox (
   -- the rows waiting out a backoff nor the rows other workers hold. (GREATEST ignores a NULL, so
   -- a row with no lease is due at next_attempt_at.)
   due_at          timestamptz NOT NULL GENERATED ALWAYS AS (GREATEST(next_attempt_at, lease_until)) STORED,
+  -- last_error and dead_reason are plain text that operators read and every backup carries. They
+  -- must never hold token material, a URL, or text written by a remote system. internal/outbox
+  -- writes last_error from an outbox.Cause (one of its own texts, an HTTP status, and a remote
+  -- error code only if it looks like one) and dead_reason from a fixed text, and offers no way to
+  -- pass an error string in: the error of an HTTP client quotes the request URL, query string and
+  -- API key included.
   last_error      text        NOT NULL DEFAULT '',
   dead_reason     text        NOT NULL DEFAULT '',
   accepted_at     timestamptz NOT NULL DEFAULT now(),

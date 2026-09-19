@@ -118,7 +118,7 @@ func TestStressOrderingUnderRandomLoad(t *testing.T) {
 				// Everything in the batch is in flight from the moment it is claimed.
 				keysOf := make([]string, len(got))
 				for i, c := range got {
-					row, err := e.ob.Get(ctx, c.Tenant, c.ID)
+					row, err := e.ob.Get(ctx, c.Tenant(), c.ID())
 					if err != nil {
 						if running() {
 							fail("Get: %v", err)
@@ -129,24 +129,24 @@ func TestStressOrderingUnderRandomLoad(t *testing.T) {
 					keysOf[i] = key
 					mu.Lock()
 					if other, busy := inFlight[key]; busy {
-						fail("%s: row %s claimed while %s is still in flight", key, c.ID, other)
+						fail("%s: row %s claimed while %s is still in flight", key, c.ID(), other)
 					}
 					if row.Seq <= lastSeq[key] {
 						fail("%s: seq %d claimed after seq %d", key, row.Seq, lastSeq[key])
 					}
 					if !row.IsHead {
-						fail("%s: row %s was claimed and is not the head of its key", key, c.ID)
+						fail("%s: row %s was claimed and is not the head of its key", key, c.ID())
 					}
-					inFlight[key] = c.ID
+					inFlight[key] = c.ID()
 					lastSeq[key] = row.Seq
 					mu.Unlock()
 				}
 				for i, c := range got {
 					time.Sleep(time.Duration(rng.IntN(1500)) * time.Microsecond) // the work
 					mu.Lock()
-					dies := !diedOnce[c.ID] && rng.IntN(100) < deadPercent
+					dies := !diedOnce[c.ID()] && rng.IntN(100) < deadPercent
 					if dies {
-						diedOnce[c.ID] = true
+						diedOnce[c.ID()] = true
 					}
 					// No longer in flight from just before the finishing call: the next row of the
 					// key is claimable from the moment that call commits, which is before it returns.
@@ -154,14 +154,14 @@ func TestStressOrderingUnderRandomLoad(t *testing.T) {
 					mu.Unlock()
 
 					if dies {
-						err = e.ob.MarkDead(ctx, c, "normalizer", "bad shape")
-						toReplay <- dead{c.Tenant, c.ID}
+						err = e.ob.MarkDead(ctx, c, badShape)
+						toReplay <- dead{c.Tenant(), c.ID()}
 					} else {
 						err = e.ob.MarkDelivered(ctx, c)
 						delivered.Add(1)
 					}
 					if err != nil && running() {
-						fail("finishing %s: %v", c.ID, err)
+						fail("finishing %s: %v", c.ID(), err)
 					}
 				}
 			}

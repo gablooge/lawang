@@ -3,35 +3,3 @@
 //   sqlc v1.31.1
 
 package outboxdb
-
-import (
-	"time"
-)
-
-type Outbox struct {
-	ID            string
-	Seq           int64
-	TenantID      string
-	Provider      string
-	DeliveryID    string
-	OrderingKey   string
-	RawBody       []byte
-	State         string
-	IsHead        bool
-	Attempts      int32
-	NextAttemptAt time.Time
-	LeaseUntil    *time.Time
-	LeaseToken    *string
-	DueAt         time.Time
-	LastError     string
-	DeadReason    string
-	AcceptedAt    time.Time
-	PreparedAt    *time.Time
-	FinishedAt    *time.Time
-}
-
-type Tenant struct {
-	ID        string
-	Name      string
-	CreatedAt time.Time
-}
