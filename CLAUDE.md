@@ -106,11 +106,13 @@ docker run --rm --name sluiceway-tunnel \
 ```
 
 The token travels in the env file, so it is never on a command line. Cloudflare forwards ONLY
-paths matching `^/ingress/[a-z0-9_-]{1,64}$` to `http://host.docker.internal:8080`, and answers
-404 itself for everything else, so the operator API, `/healthz` and any path with `..` or a second
-segment never reach the machine. (A plain `^/ingress/` prefix was tried first and let
-`/ingress/../x` through to a server that normalizes paths; do not loosen the rule.) A provider
-key must therefore match `[a-z0-9_-]{1,64}`. Stop the container when the live check is done, and
+paths matching `^/ingress/[a-z][a-z0-9_]{0,31}$` to `http://host.docker.internal:8080`, and
+answers 404 itself for everything else, so the operator API, `/healthz` and any path with `..` or
+a second segment never reach the machine. (A plain `^/ingress/` prefix was tried first and let
+`/ingress/../x` through to a server that normalizes paths; do not loosen the rule.) The segment
+is exactly the provider key grammar that ADR 3 freezes for a scope id: a lowercase letter first,
+then lowercase letters, digits and underscores, at most 32 characters, no hyphen. The provider
+registry must enforce the same grammar, from the same function, not from a copy of the pattern. Stop the container when the live check is done, and
 deregister every webhook that points at the hostname. Everything that arrives through it is
 hostile input from the public internet, signed or not.
 
