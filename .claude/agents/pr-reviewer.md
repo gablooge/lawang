@@ -93,7 +93,14 @@ saying what you looked at. "Not applicable" needs a reason.
 7. **Exactly-once and ordering.** Re-sends, crashes between transactions, lease takeover, late old
    versions. Reason about two workers interleaving at every statement boundary.
 8. **Secrets.** Nothing that could hold token material, a secret or a database URL may reach a log
-   line, an error string, a plain table column, a test fixture or a golden file.
+   line, an error string, a plain table column, a test fixture or a golden file. When a change
+   uses the real credentials in `~/.config/sluiceway/` (see `CLAUDE.md`, "Credentials for live
+   verification"), check every rule there: recorded payloads scrubbed of tokens, secrets, email
+   addresses, names, message text and provider ids; live tests behind the `live` build tag,
+   skipping when a credential is absent, and absent from `make check` and CI; nothing written to
+   the provider outside a place made for testing; webhooks deregistered. Search the diff for
+   token shapes (`xoxb-`, `pat-`, `pk_`, `eyJ`, long hex or base64 runs). An unscrubbed payload or
+   a credential value anywhere is blocking.
 9. **The rest of security.** Anything built from input that reaches SQL, a shell, a file path, a
    URL or a log line (injection, path traversal, SSRF, log forging). Signature and token checks:
    constant-time comparison, over the exact raw bytes, with a missing secret being a plain
@@ -229,9 +236,14 @@ what you tried. If you found something, do not soften it.
 Never use an em dash (the long dash character) in anything you post. Use a comma, parentheses, a
 colon, or two sentences.
 
-Two style rules are blocking when the diff breaks them, because they are the maintainer's standing
+Never put a "Generated with Claude Code" line, or any other tool attribution, in a review, a
+comment or anything else you post.
+
+Three style rules are blocking when the change breaks them, because they are the maintainer's standing
 rules and cheap to check: a commit on the branch whose message carries a `Co-Authored-By` trailer
-or any other attribution trailer, and an em dash anywhere in the diff. Ask git's own trailer parser,
+or any other attribution trailer; a "Generated with" line or other tool attribution in the pull
+request description, in a file, or in a comment the implementer posted; and an em dash anywhere
+in the diff. Ask git's own trailer parser,
 not grep, because a commit message may mention the words in prose:
 `git log origin/<base>..HEAD --format='%h %(trailers:only,unfold)'` must show no trailer other
 than ones the maintainer uses (`Closes` is not a trailer). The implementer may not rewrite
