@@ -90,6 +90,13 @@ func New(db *store.DB) *Outbox { return &Outbox{db: db} }
 
 // Delivery is one accepted webhook, or one change synthesized by reconciliation.
 type Delivery struct {
+	// Provider is the internal provider key, and it must be a constant of the program: a key
+	// from the provider registry, never text taken from a request (not a path segment, a header
+	// or a payload field). Accept refuses a provider that cannot be stored with an error that is
+	// deliberately NOT a sentinel, because a bad provider is a bug in the caller, not poison from
+	// a sender. A caller that passed request text here would turn a crafted request into a
+	// server error, and a provider into a retry storm. Look the provider up in the registry
+	// first, and answer an unknown one before reaching the outbox.
 	Provider string
 	// OrderingKey names the source entity. Rows sharing a key deliver in arrival order.
 	OrderingKey string

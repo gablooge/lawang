@@ -264,7 +264,7 @@ sure the query and the repair exist and are tested.
 The repair, for one key, as an administrator (or bound to the tenant as the application role):
 
 ```sql
-BEGIN;
+BEGIN ISOLATION LEVEL READ COMMITTED; -- a plain BEGIN inherits the session default
 SELECT pg_advisory_xact_lock(hashtextextended('<tenant>' || chr(31) || '<ordering key>', 0));
 UPDATE sluiceway.outbox SET is_head = true
  WHERE id = (SELECT id FROM sluiceway.outbox
