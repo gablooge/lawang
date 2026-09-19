@@ -43,8 +43,32 @@ func TestRunUsageErrors(t *testing.T) {
 	}
 }
 
+func TestRunNeverPrintsAnUnknownCommand(t *testing.T) {
+	// The first argument is whatever was typed first. An image whose entrypoint is the bare binary,
+	// run with the database URL as its only argument, puts the password there, and stderr is the
+	// container log. Nothing after it is printed either.
+	const secret = "postgres://leakuser:hunter2@leakhost:5432/leakdb"
+	for _, args := range [][]string{{secret}, {secret, "serve"}, {"--" + secret}} {
+		var out, errOut bytes.Buffer
+		if code := run(context.Background(), args, noEnv, &out, &errOut); code != 2 {
+			t.Errorf("exit = %d, want 2", code)
+		}
+		if !strings.HasPrefix(errOut.String(), "sluiceway: unknown command\n") || !strings.Contains(errOut.String(), "Usage:") {
+			t.Errorf("stderr does not say the command is unknown and how to use the binary: %.60s", errOut.String())
+		}
+		if out.Len() != 0 {
+			t.Errorf("stdout is not empty: %.60s", out.String())
+		}
+		for _, frag := range []string{"hunter2", "leakuser", "leakhost", "leakdb", "postgres://leak"} {
+			if strings.Contains(out.String()+errOut.String(), frag) {
+				t.Errorf("output leaks %q from the first argument", frag)
+			}
+		}
+	}
+}
+
 func TestRunRefusesExtraArguments(t *testing.T) {
-	// No command takes an argument, and none may ignore one: "serve --listen :9090" would otherwise
+	// No command may ignore an argument it does not take: "serve --listen :9090" would otherwise
 	// start on the default port with no warning.
 	//
 	// The environment is a valid development one, so that the only thing wrong is the argument.
@@ -125,7 +149,9 @@ func TestRunHelp(t *testing.T) {
 func TestUsageDocumentsTheConfigurationAndTheExitCodes(t *testing.T) {
 	// The usage text is the only documentation an operator is sure to have. Every variable
 	// config.Load reads has to be in it, found here by watching what Load asks for and not by
-	// trusting a list. Load runs in both environments so a read behind a branch is seen.
+	// trusting a list. This recording drives the two environments only. The thorough one, over
+	// every combination of states, is TestVariablesAreExactlyWhatLoadReads in the config package,
+	// and the loop over config.Variables below carries its result into the usage text.
 	read := make(map[string]bool)
 	for _, envName := range []string{"", "development"} {
 		_, _ = config.Load(func(k string) string {
@@ -148,6 +174,12 @@ func TestUsageDocumentsTheConfigurationAndTheExitCodes(t *testing.T) {
 		if !strings.Contains(usage, v.Doc) || !strings.Contains(usage, "default: "+v.Default) {
 			t.Errorf("the usage text does not carry the description and default of %s", v.Name)
 		}
+		if len(v.Values) > 0 && !strings.Contains(usage, "values: "+strings.Join(v.Values, ", ")+"\n") {
+			t.Errorf("the usage text does not list the values %s accepts", v.Name)
+		}
+	}
+	if !strings.Contains(usage, "\n  help ") {
+		t.Error("the usage text does not list help among the commands")
 	}
 
 	for _, line := range []string{

@@ -23,6 +23,7 @@ Commands:
   worker    drain the outbox and run the maintenance sweeps
   migrate   apply database migrations
   version   print the version
+  help      print this text (also -h and --help)
 
 Configuration comes from SLUICEWAY_* environment variables only.
 `
@@ -34,9 +35,12 @@ Exit codes:
   2   usage error: no command, an unknown command, or an argument the command does not take
 `
 
-// usage is what "sluiceway help" prints. The variables come from config.Variables, the same
-// package that reads them, so the text cannot drift from what Load does: an operator should never
-// have to read Go source to configure the service.
+// usage is what "sluiceway help" prints, so that an operator never has to read Go source to
+// configure the service. The variables come from config.Variables, in the package that reads
+// them. What is held to Load there: the names (by recording what Load reads), the defaults (by
+// comparing them with what Load applies) and the values of the enumerated variables (Load
+// validates against the same lists that are printed here). The descriptions are prose, and
+// nothing checks prose.
 var usage = buildUsage(config.Variables())
 
 func buildUsage(vars []config.Variable) string {
@@ -44,7 +48,11 @@ func buildUsage(vars []config.Variable) string {
 	b.WriteString(usageHead)
 	b.WriteString("\nVariables:\n")
 	for _, v := range vars {
-		fmt.Fprintf(&b, "  %s\n      %s\n      default: %s\n", v.Name, v.Doc, v.Default)
+		fmt.Fprintf(&b, "  %s\n      %s\n", v.Name, v.Doc)
+		if len(v.Values) > 0 {
+			fmt.Fprintf(&b, "      values: %s\n", strings.Join(v.Values, ", "))
+		}
+		fmt.Fprintf(&b, "      default: %s\n", v.Default)
 	}
 	b.WriteString(usageExitCodes)
 	return b.String()
@@ -55,12 +63,13 @@ func buildUsage(vars []config.Variable) string {
 var errNotBuilt = errors.New("not built yet, see docs/backlog.md")
 
 // refuseArguments reports anything after the command name as a usage error, and says whether it
-// did. No command takes an argument, and ignoring one is worse than refusing it: "serve --listen
-// :9090" would start on the default port without a word.
+// did. A command that takes an argument handles it before this check runs, so whatever reaches
+// here is unexpected, and ignoring it is worse than refusing it: "serve --listen :9090" would
+// start on the default port without a word.
 //
 // It is called once the command is known to exist, so args[0] is one of our own words. The
 // arguments themselves are not printed: stderr is the container log, and an argument can be a
-// pasted secret as easily as a variable can.
+// pasted secret as easily as a variable can. The unknown command path in run keeps the same rule.
 func refuseArguments(stderr io.Writer, args []string) bool {
 	if len(args) == 1 {
 		return false
@@ -111,7 +120,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	case "migrate":
 		cmd = func(context.Context, config.Config, *slog.Logger) error { return errNotBuilt }
 	default:
-		fmt.Fprintf(stderr, "sluiceway: unknown command %q\n\n%s", args[0], usage) //nolint:gosec // G705: a terminal, not a browser
+		// The word is not repeated: it is whatever was typed first, which can be a pasted database
+		// URL as easily as a typo, and stderr is the container log. The usage lists the real ones.
+		fmt.Fprintf(stderr, "sluiceway: unknown command\n\n%s", usage)
 		return 2
 	}
 	if refuseArguments(stderr, args) {

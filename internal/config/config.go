@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -23,7 +24,9 @@ const (
 	Development Env = "development"
 )
 
-// devDatabaseURL matches the local compose stack. It is only ever used when development is explicit.
+// devDatabaseURL is where the compose stack of backlog item B27 will put Postgres. Until that item
+// lands nothing in this repository starts such a database. It is only ever used when development
+// is explicit.
 const devDatabaseURL = "postgres://sluiceway:sluiceway@localhost:5432/sluiceway?sslmode=disable" //nolint:gosec // local development only, never reachable in production
 
 // Config is the full process configuration.
@@ -38,30 +41,41 @@ type Config struct {
 // defaultListenAddr is where serve listens when SLUICEWAY_LISTEN_ADDR is unset.
 const defaultListenAddr = ":8080"
 
+// The values of the enumerated variables. Load validates against these slices and Variables
+// publishes the same slices, so a value added here is accepted and documented in one step.
+var (
+	envValues       = []string{string(Production), string(Development)}
+	logLevelValues  = []string{"debug", "info", "warn", "error"}
+	logFormatValues = []string{"json", "text"}
+)
+
 // Variable documents one environment variable that Load reads.
 type Variable struct {
 	Name    string
 	Doc     string
-	Default string // what Load uses when the variable is unset, in words an operator can act on
+	Values  []string // every value Load accepts, or nil when the variable is not an enumeration
+	Default string   // what Load uses when the variable is unset, in words an operator can act on
 }
 
 // Variables lists every variable Load reads, in the order an operator should think about them.
-// The command's usage text is built from it, so the binary documents its own configuration, and a
-// test holds it to what Load really reads and to the defaults Load really applies.
+// The command's usage text is built from it, so the binary documents its own configuration, and
+// tests hold it to what Load really reads, to the defaults Load really applies, and to the values
+// Load really accepts.
 //
 // The development database URL is described, not printed: it is a URL with a password in it, and
-// usage text ends up in logs and tickets.
+// usage text ends up in logs and tickets. Its host, port and database name are not secret.
 func Variables() []Variable {
 	return []Variable{
 		{
 			Name:    "SLUICEWAY_ENV",
-			Doc:     `"production" or "development". Anything else is refused, never treated as development.`,
+			Doc:     "The deployment environment. Anything unrecognized is refused, never treated as development.",
+			Values:  slices.Clone(envValues),
 			Default: string(Production),
 		},
 		{
 			Name:    "SLUICEWAY_DATABASE_URL",
 			Doc:     "Postgres URL (postgres:// or postgresql://) of the non-superuser application role.",
-			Default: "none, it is required in production. Development falls back to the local compose database.",
+			Default: "none, it is required in production. Development connects to localhost:5432, database sluiceway.",
 		},
 		{
 			Name:    "SLUICEWAY_LISTEN_ADDR",
@@ -70,15 +84,23 @@ func Variables() []Variable {
 		},
 		{
 			Name:    "SLUICEWAY_LOG_LEVEL",
-			Doc:     "debug, info, warn or error.",
+			Doc:     "The lowest level that is logged. Case does not matter.",
+			Values:  slices.Clone(logLevelValues),
 			Default: strings.ToLower(slog.LevelInfo.String()),
 		},
 		{
 			Name:    "SLUICEWAY_LOG_FORMAT",
-			Doc:     `"json" or "text".`,
+			Doc:     "The encoding of the log on stderr. Case does not matter.",
+			Values:  slices.Clone(logFormatValues),
 			Default: "json in production, text in development",
 		},
 	}
+}
+
+// notOneOf is the refusal for an enumerated variable. It lists what is accepted and, like every
+// error here, never what was received.
+func notOneOf(name string, values []string) error {
+	return fmt.Errorf("%s: must be one of: %s", name, strings.Join(values, ", "))
 }
 
 const redacted = "[redacted]"
@@ -118,13 +140,13 @@ func Load(getenv func(string) string) (Config, error) {
 		LogLevel:   slog.LevelInfo,
 	}
 
-	switch v := getenv("SLUICEWAY_ENV"); v {
-	case "", string(Production):
-	case string(Development):
-		cfg.Env = Development
-	default:
-		// An unrecognized value stays production. A typo must never relax anything.
-		errs = append(errs, fmt.Errorf("SLUICEWAY_ENV: must be %q or %q", Production, Development))
+	if v := getenv("SLUICEWAY_ENV"); v != "" {
+		if slices.Contains(envValues, v) {
+			cfg.Env = Env(v)
+		} else {
+			// An unrecognized value stays production. A typo must never relax anything.
+			errs = append(errs, notOneOf("SLUICEWAY_ENV", envValues))
+		}
 	}
 
 	cfg.DatabaseURL = getenv("SLUICEWAY_DATABASE_URL")
@@ -147,10 +169,12 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 	}
 
-	if v := getenv("SLUICEWAY_LOG_LEVEL"); v != "" {
-		// slog's parse error quotes its input, so it is deliberately not wrapped.
-		if err := cfg.LogLevel.UnmarshalText([]byte(v)); err != nil {
-			errs = append(errs, errors.New("SLUICEWAY_LOG_LEVEL: must be debug, info, warn or error"))
+	if v := strings.ToLower(getenv("SLUICEWAY_LOG_LEVEL")); v != "" {
+		// Only the documented names. slog on its own would also take offsets such as "info+2",
+		// which the usage text does not list. Its parse error quotes its input, so it is
+		// deliberately not wrapped.
+		if !slices.Contains(logLevelValues, v) || cfg.LogLevel.UnmarshalText([]byte(v)) != nil {
+			errs = append(errs, notOneOf("SLUICEWAY_LOG_LEVEL", logLevelValues))
 		}
 	}
 
@@ -159,10 +183,10 @@ func Load(getenv func(string) string) (Config, error) {
 		cfg.LogFormat = "text"
 	}
 	if v := strings.ToLower(getenv("SLUICEWAY_LOG_FORMAT")); v != "" {
-		if v != "json" && v != "text" {
-			errs = append(errs, errors.New(`SLUICEWAY_LOG_FORMAT: must be "json" or "text"`))
-		} else {
+		if slices.Contains(logFormatValues, v) {
 			cfg.LogFormat = v
+		} else {
+			errs = append(errs, notOneOf("SLUICEWAY_LOG_FORMAT", logFormatValues))
 		}
 	}
 
