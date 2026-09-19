@@ -52,7 +52,14 @@ type DB struct {
 // defaultConnectTimeout bounds one connection attempt when the URL has no connect_timeout of its
 // own. Without it a host that drops packets (a firewall or a security group, the usual mistake on
 // managed Postgres) holds Open for the TCP timeout of the operating system, 75 seconds or more,
-// with nothing logged. An operator overrides it with connect_timeout=N (seconds) in the URL.
+// with nothing logged. An operator overrides it with connect_timeout=N (seconds) in the URL, for
+// N of 1 or more.
+//
+// connect_timeout=0 does NOT lift the bound, and that is deliberate. In libpq 0 means "wait for as
+// long as it takes", but pgx parses an explicit 0 to the same zero value as a missing parameter, so
+// the two cannot be told apart here, and of the two readings the bounded one is the safe one: a
+// start that hangs with nothing logged is the failure this constant exists to prevent. An operator
+// who needs a long wait (a slow failover proxy, a debugger on the server) writes a large number.
 const defaultConnectTimeout = 10 * time.Second
 
 // Open connects and then refuses to return a pool that is not safe to use: see preflight.
@@ -86,6 +93,7 @@ func poolConfig(databaseURL string) (*pgxpool.Config, error) {
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = Schema
 	cfg.ConnConfig.RuntimeParams["application_name"] = "sluiceway"
+	// Zero is "not set" and also an explicit connect_timeout=0: see defaultConnectTimeout.
 	if cfg.ConnConfig.ConnectTimeout == 0 {
 		cfg.ConnConfig.ConnectTimeout = defaultConnectTimeout
 	}
@@ -226,6 +234,9 @@ func (db *DB) helperStates(ctx context.Context) ([]helperState, error) {
 
 // Tx runs fn in a transaction with no tenant bound. Every tenant-scoped table reads as empty and
 // refuses writes. It is for the few things that are not tenant data.
+//
+// fn does database work and nothing else: see begin for what happens to a network error that fn
+// returns.
 func (db *DB) Tx(ctx context.Context, fn func(pgx.Tx) error) error {
 	return db.begin(ctx, fn)
 }
@@ -235,12 +246,30 @@ func (db *DB) Tx(ctx context.Context, fn func(pgx.Tx) error) error {
 // server, and a network error in the middle of one carries addresses too: those errors are
 // replaced the way Open replaces them. Every other error, from fn or from the server, reaches the
 // caller untouched.
+//
+// The replacement looks at the error and not at where it came from, ON PURPOSE. An error that fn
+// returns is replaced too when it wraps a *net.OpError, a *net.DNSError or a *pgconn.ConnectError,
+// and then nothing fn wrapped around it survives: errors.Is(err, aSentinelOfTheCaller) is false
+// and the text points at SLUICEWAY_DATABASE_URL. It has to work on what fn returns, because a
+// statement that fn runs on a connection that has just died fails with exactly such an error, and
+// fn is the one that returns it. Telling that error from a network error of the caller's own would
+// mean trusting a side channel (is the connection marked closed?) on every failure path of pgx,
+// and a miss there puts the connection target back into the log. The wrong label costs less.
+//
+// So fn must not do network I/O of its own (a provider call, a sink delivery, a lookup), and must
+// not return a net error that is not the database's. That is already the rule for other reasons:
+// a transaction that waits on the far end of a network call holds a pooled connection and its row
+// locks for as long as that takes (docs/architecture.md section 10, principle 6). Do the call
+// before or after the transaction and pass in what it returned.
 func (db *DB) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	return scrub(ctx, pgx.BeginFunc(ctx, db.pool, fn))
 }
 
 // TenantTx runs fn in a transaction scoped to one tenant. It is the only way to do a tenant's
 // work.
+//
+// fn does database work and nothing else. No network I/O inside it: a net error that fn returns
+// comes back as a database connection error, without whatever fn wrapped around it (see begin).
 func (db *DB) TenantTx(ctx context.Context, id tenancy.ID, fn func(pgx.Tx) error) error {
 	return db.begin(ctx, func(tx pgx.Tx) error {
 		if err := tenancy.Bind(ctx, tx, id); err != nil {
@@ -264,6 +293,10 @@ func (db *DB) TenantTx(ctx context.Context, id tenancy.ID, fn func(pgx.Tx) error
 // To keep that from being forgotten, the transaction handed to fn refuses tenancy.Bind with
 // tenancy.ErrCrossTenantTx, savepoints included. An item that really wants a helper role and a
 // tenant in one transaction has to add that on purpose, with a test of what is visible inside it.
+//
+// As in Tx and TenantTx, fn does database work and nothing else. No network I/O inside it: a net
+// error that fn returns comes back as a database connection error, without whatever fn wrapped
+// around it (see begin).
 func (db *DB) RoleTx(ctx context.Context, role Role, fn func(pgx.Tx) error) error {
 	// A role name cannot be a query parameter, so each statement is a literal. Nothing here is
 	// ever built from input.

@@ -51,6 +51,9 @@ func (db *DB) provider(logger *slog.Logger) (*goose.Provider, func(), error) {
 func (db *DB) Migrate(ctx context.Context, logger *slog.Logger) (int, error) {
 	provider, closeProvider, err := db.provider(logger)
 	if err != nil {
+		// goose does not connect while it builds a provider (it first touches the database in Up),
+		// so nothing can reach this scrub today and no test can fail without it. It stays so that a
+		// goose release that does connect here cannot put the connection target into the log.
 		return 0, fmt.Errorf("store: migrate: %w", scrub(ctx, err))
 	}
 	defer closeProvider()

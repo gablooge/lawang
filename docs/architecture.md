@@ -185,9 +185,17 @@ SQLSTATE, and never the server's message), TLS failure, or other, always prefixe
 `SLUICEWAY_DATABASE_URL`. The same holds for a connection that fails later, in the middle of a
 transaction or a migration, while an error from a statement that ran (a constraint violation, a
 failed migration) keeps the server's message. Preflight refusals say "the login role", not its
-name. One connection attempt is bounded at 10 seconds unless the URL sets `connect_timeout`
-(seconds), so a host that silently drops packets is reported instead of holding the start for the
-TCP timeout of the operating system.
+name. One connection attempt is bounded at 10 seconds unless the URL sets `connect_timeout` to 1
+or more (seconds), so a host that silently drops packets is reported instead of holding the start
+for the TCP timeout of the operating system. `connect_timeout=0`, which means "wait forever" to
+libpq, does not lift the bound: the driver cannot tell it from a missing parameter, and a bounded
+start is the safe reading of the two. An operator who needs a long wait writes a large number.
+
+The replacement judges the error, not where it came from. A network error that a transaction
+function returns is reduced in the same way, along with anything the function wrapped around it,
+because a statement on a connection that has just died fails with exactly such an error. So a
+transaction function does database work only: no provider call, no sink delivery, no lookup inside
+it, which principle 6 of section 10 asks for anyway.
 
 See [ADR 2](adr/0002-migrations-goose.md).
 

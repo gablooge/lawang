@@ -156,6 +156,17 @@ func bindAround(ctx context.Context, tx pgx.Tx) error {
 // pgx.BeginFunc, and the pool destroying a connection that comes back in the middle of something.
 // A pgx upgrade, or a move away from BeginFunc, must not be able to leave a role or a tenant on a
 // pooled connection with the rest of the suite still green.
+//
+// They do not have the same teeth, and the difference is worth knowing before trusting them:
+//
+//   - The panic test can be failed from this package: a begin written by hand without the deferred
+//     rollback fails it.
+//   - The two cancellation tests CANNOT be failed by any mutation of this package. What they pin
+//     belongs to pgxpool, not to store: a connection that is released in the middle of an operation
+//     (a transaction still open, a statement interrupted by the cancel) is destroyed and never
+//     handed out again, so no SET LOCAL or set_config can ride along, whatever begin does. Nothing
+//     here implements that and nothing here can break it. They exist for one reason: to notice the
+//     pgx upgrade that changes it. If one of them goes red, read the pgx changelog first.
 
 func TestAPanicLeavesNoRoleOrTenantOnTheConnection(t *testing.T) {
 	db := open(t, "&pool_max_conns=1")
@@ -193,6 +204,8 @@ func TestAPanicLeavesNoRoleOrTenantOnTheConnection(t *testing.T) {
 	})
 }
 
+// Pins pgxpool behaviour, not code of this package (see the comment above the panic test): no
+// mutation of store fails it. It is here to catch a pgx upgrade.
 func TestACancelledContextLeavesNoRoleOrTenantOnTheConnection(t *testing.T) {
 	db := open(t, "&pool_max_conns=1")
 	scratchJobs(t, db)
@@ -219,6 +232,9 @@ func TestACancelledContextLeavesNoRoleOrTenantOnTheConnection(t *testing.T) {
 	}
 }
 
+// Like the test above it, this pins pgxpool behaviour (a connection released while a statement was
+// being interrupted is destroyed), which no mutation of store can break. It is here to catch a pgx
+// upgrade.
 func TestACancelInFlightLeavesNoRoleOrTenantOnTheConnection(t *testing.T) {
 	db := open(t, "&pool_max_conns=1")
 	scratchJobs(t, db)

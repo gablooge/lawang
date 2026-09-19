@@ -171,6 +171,17 @@ func TestPoolConfigSetsAConnectTimeout(t *testing.T) {
 	if got := cfg.ConnConfig.ConnectTimeout; got != 3*time.Second {
 		t.Errorf("with connect_timeout=3 in the URL, ConnectTimeout = %s, want the operator's 3s", got)
 	}
+
+	// Deliberate: 0 is "wait forever" in libpq, and here it is the default. pgx parses it to the
+	// same zero as a missing parameter, and an unbounded start is what the default exists to
+	// prevent. If pgx ever starts telling the two apart, this row is where that gets noticed.
+	cfg, err = poolConfig("postgres://app@db.example:5432/sluiceway?connect_timeout=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.ConnConfig.ConnectTimeout; got != 10*time.Second {
+		t.Errorf("with connect_timeout=0 in the URL, ConnectTimeout = %s, want the 10s default: 0 must not lift the bound", got)
+	}
 }
 
 func TestCheckVersion(t *testing.T) {

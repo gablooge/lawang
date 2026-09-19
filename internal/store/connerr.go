@@ -73,6 +73,9 @@ func connError(ctx context.Context, err error) error {
 // transaction body, a migration. An error is replaced only when it carries the connection target
 // (pgx's connect error, or a net error with its addresses); anything else, a constraint violation
 // for example, reaches the caller untouched, SQLSTATE and all.
+//
+// It judges the error and not its origin, so a net error that a transaction function produced by
+// itself is replaced as well, wrapping and sentinels included. That is deliberate: see begin.
 func scrub(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
