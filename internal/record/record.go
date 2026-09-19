@@ -80,6 +80,15 @@ const (
 // Record is the envelope. Every field that carries meaning is always present on the wire, with
 // null or "" for "none", so a sink never has to tell an absent field from an empty one. Only
 // Meta and what is inside it may be absent.
+//
+// A Record is a plain value with assignable fields, and what holds it to the format is its
+// methods: MarshalJSON validates and checks the seal (see Seal), UnmarshalJSON is strict. That
+// guards against accidents: a stage that reassigns a scope after sealing, a Record built by hand,
+// a record delivered under the wrong tenant (SealedFor). It does NOT defend against a caller
+// determined to get around it, and does not try to: a conversion to a type of the caller's own
+// (type w record.Record, then json.Marshal(w(r))) sheds the methods, and with them Validate and
+// the seal. So "cannot be marshalled" is a statement about the type Record, never about its
+// fields, and code that converts a Record away has taken the format's duties on itself.
 type Record struct {
 	// Format is FormatV1. Seal sets it.
 	Format string `json:"format"`
@@ -132,23 +141,49 @@ type Record struct {
 	// with a different Meta.
 	Meta Meta `json:"meta"`
 
-	// sealed is what the ID stands for, as Seal minted it or as UnmarshalJSON read it. The four
-	// fields beside it stay assignable, because a Record is a plain value, and MarshalJSON
+	// sealed is what the ID stands for, as Seal minted it or as UnmarshalJSON read it. The
+	// fields it copies stay assignable, because a Record is a plain value, and MarshalJSON
 	// refuses a record in which they no longer say what was sealed. No other package can set
 	// this, so outside this package the only ways to a record that can be marshalled are Seal
-	// and decoding one.
+	// and decoding one. The doc comment of Record says what that does not defend against.
 	sealed seal
+	// sealedFor is the tenant Seal minted the ID for, and empty in a decoded record, because
+	// the tenant is not on the wire. See SealedFor.
+	sealedFor tenancy.ID
 }
 
-// seal is the ID and the three fields of the envelope that are hashed into it. The provider and
-// the tenant are hashed too and are not in the envelope, which is why the check is a comparison
-// with what Seal saw and not a second hash.
+// seal is the ID, the three fields of the envelope that are hashed into it, and Op and Kind. The
+// provider and the tenant are hashed too and are not in the envelope, which is why the check is
+// a comparison with what Seal saw and not a second hash. Op and Kind are not hashed, and are
+// held for another reason: one id is one version of one entity, and an upsert turned into a
+// tombstone after sealing (or a message into a task) would go out under the id of what it was,
+// where a sink that is idempotent on the id drops it as a repeat. A tombstone is a new version
+// (ADR 4), so it is built as one and sealed as one.
 type seal struct {
 	id, externalID, version, scope string
+	op                             Op
+	kind                           Kind
 }
 
 func (r Record) currentSeal() seal {
-	return seal{id: r.ID, externalID: r.ExternalID, version: r.Version, scope: r.Visibility.Scope}
+	return seal{
+		id: r.ID, externalID: r.ExternalID, version: r.Version, scope: r.Visibility.Scope,
+		op: r.Op, kind: r.Kind,
+	}
+}
+
+// SealedFor reports whether Seal minted this record's ID for tenant, and the record still says
+// what was sealed. It is for the one place where a tenant and a record meet again after Seal: the
+// stage that writes the ledger and hands records to Sink.Deliver. The tenant is in no field of
+// the envelope, so a record sealed for tenant A marshals exactly the same when it is delivered
+// under tenant B, and neither MarshalJSON nor any sink can notice. That stage can: it calls
+// SealedFor with the tenant it is about to deliver under, and treats false as a refusal.
+//
+// It fails closed. It is false for a record that was decoded and not sealed here (a document
+// does not say whose it is), for the zero Record, for an empty tenant, and for a record whose
+// ID, ExternalID, Version, Visibility.Scope, Op or Kind was changed after Seal.
+func (r Record) SealedFor(tenant tenancy.ID) bool {
+	return tenant != "" && r.sealedFor == tenant && r.sealed == r.currentSeal()
 }
 
 // Author is who wrote the entity, in the source's own terms. Both fields may be empty when the
@@ -250,11 +285,13 @@ func (r *Ref) UnmarshalJSON(data []byte) error {
 type wire Record
 
 // MarshalJSON refuses a record that does not pass Validate, and a record whose ID is not the one
-// that was sealed for the ExternalID, Version and Visibility.Scope it now carries: one that was
-// never sealed, or one that was changed afterwards. A sink is promised that one id never appears
-// with two scopes, and without this a pipeline stage that reassigned the scope after sealing
-// would break the promise far from where anybody would look. Seal again after such a change.
-// Supersedes, Source and everything that is not in the id may be set after sealing.
+// that was sealed for the ExternalID, Version, Visibility.Scope, Op and Kind it now carries: one
+// that was never sealed, or one that was changed afterwards. A sink is promised that one id never
+// appears with two scopes, and without this a pipeline stage that reassigned the scope after
+// sealing would break the promise far from where anybody would look. Seal again after such a
+// change. Supersedes, Source, the content and everything else may be set after sealing.
+//
+// It cannot check the tenant, which is in no field: SealedFor does, where the tenant is known.
 //
 // The error says which field, never what was in it.
 func (r Record) MarshalJSON() ([]byte, error) {
@@ -262,7 +299,7 @@ func (r Record) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	if r.sealed != r.currentSeal() {
-		return nil, invalid("id", "was not sealed for the external_id, version and visibility.scope the record carries")
+		return nil, invalid("id", "was not sealed for the external_id, version, visibility.scope, op and kind the record carries")
 	}
 	return json.Marshal(wire(r))
 }
@@ -271,8 +308,9 @@ func (r Record) MarshalJSON() ([]byte, error) {
 // mints the ID, and validates the result. It is the only way to an ID, so an id always hashes
 // the scope the record carries, and a record with no tenant or no scope never gets one. Two
 // things hold that: a test in internal/ids fails when anything outside this package calls the id
-// recipe, and MarshalJSON refuses a record whose ID, ExternalID, Version or Visibility.Scope is
-// not what Seal left there.
+// recipe (a tripwire), and MarshalJSON refuses a record whose ID, ExternalID, Version,
+// Visibility.Scope, Op or Kind is not what Seal left there (the guard). Seal also remembers the
+// tenant, which is in no field, so that the stage that delivers can ask SealedFor.
 //
 // provider is the internal provider key (Provider.Key), never a wire name. Seal refuses a scope
 // that is not in that provider's namespace, so one provider cannot stamp a record into the scope
@@ -316,6 +354,7 @@ func (r Record) Seal(provider string, tenant tenancy.ID) (Record, error) {
 	r.Source = provider
 	r.ID = id
 	r.sealed = r.currentSeal()
+	r.sealedFor = tenant
 	if err := r.Validate(); err != nil {
 		return Record{}, err
 	}

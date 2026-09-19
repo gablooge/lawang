@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -188,6 +189,66 @@ func TestEveryAnchoredPatternHasACompanion(t *testing.T) {
 	visit("", schema)
 	if patterns < 6 {
 		t.Errorf("found %d anchored patterns, the walk is not seeing the schema", patterns)
+	}
+}
+
+// The schema is a contract for validators in any language, and each hands "pattern" to its own
+// regular expression engine. The escapes those engines share stop at ASCII: Ruby's engine refuses
+// a two-digit hex escape of 0x80 or above in a UTF-8 pattern ("invalid multibyte escape"), so a
+// schema that spelled U+009F that way could not be loaded there at all, and the brace form of a
+// hex escape, the four-digit form and a property class are each unknown to one of Go, Python and
+// ECMAScript. So a pattern escapes ASCII only and holds every other character as itself, which
+// the FILE spells with a JSON escape (ADR 4, "Portability of the patterns"). This pins the
+// spelling, so that the unportable one cannot come back. It reads the patterns as they are after
+// JSON decoding, which is what an engine is handed.
+func TestNoPatternUsesAnEscapeThatOnlySomeEnginesRead(t *testing.T) {
+	file, err := os.ReadFile("record.v1.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, b := range file {
+		if b >= 0x80 {
+			t.Fatalf("byte %d of the schema file is not ASCII: a character above U+007F is written as a JSON escape", i)
+		}
+	}
+	var schema any
+	if err := json.Unmarshal(Schema(), &schema); err != nil {
+		t.Fatal(err)
+	}
+	// A backslash, then: x and a hex byte of 0x80 or above, or x and a brace, or one of u, p, P.
+	unportable := regexp.MustCompile(`[\\](?:x[89A-Fa-f][0-9A-Fa-f]|x[{]|[upP])`)
+	patterns, literal := 0, 0
+	var visit func(path string, node any)
+	visit = func(path string, node any) {
+		switch n := node.(type) {
+		case []any:
+			for _, v := range n {
+				visit(path+"[]", v)
+			}
+		case map[string]any:
+			for k, v := range n {
+				visit(path+"/"+k, v)
+			}
+			pattern, ok := n["pattern"].(string)
+			if !ok {
+				return
+			}
+			patterns++
+			if found := unportable.FindString(pattern); found != "" {
+				t.Errorf("%s: the pattern uses the escape %s, which not every engine reads: write the character itself, as a JSON escape in the file", path, found)
+			}
+			if strings.ContainsRune(pattern, 0x0080) && strings.ContainsRune(pattern, 0x009F) {
+				literal++
+			}
+		}
+	}
+	visit("", schema)
+	if patterns < 16 {
+		t.Errorf("found %d patterns, the walk is not seeing the schema", patterns)
+	}
+	// identifier, displayName and oneLine name the C1 controls, and they do it with the characters.
+	if literal != 3 {
+		t.Errorf("%d patterns hold U+0080 and U+009F as themselves, want 3", literal)
 	}
 }
 

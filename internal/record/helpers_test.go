@@ -136,3 +136,10 @@ func sealed(t testing.TB) Record {
 	}
 	return r
 }
+
+// onTheWire is r as it comes back from a document: the same record in every field, sealed for no
+// tenant, because the tenant is not on the wire (see SealedFor).
+func onTheWire(r Record) Record {
+	r.sealedFor = ""
+	return r
+}

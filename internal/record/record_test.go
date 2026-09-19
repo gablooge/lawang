@@ -56,7 +56,7 @@ func TestSealMakesTheArchitectureExample(t *testing.T) {
 	if err := json.Unmarshal(exampleBytes(t), &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded != r {
+	if decoded != onTheWire(r) {
 		t.Errorf("decoded = %+v\nsealed  = %+v", decoded, r)
 	}
 }
@@ -327,7 +327,7 @@ func TestGolden(t *testing.T) {
 		var back Record
 		if err := json.Unmarshal(want, &back); err != nil {
 			t.Errorf("%s does not decode: %v", path, err)
-		} else if back != r {
+		} else if back != onTheWire(r) {
 			t.Errorf("%s round trip:\n got %+v\nwant %+v", path, back, r)
 		}
 	}
@@ -361,7 +361,7 @@ func TestEverythingTheTypesProduceValidatesAndRoundTrips(t *testing.T) {
 		if err := json.Unmarshal(data, &back); err != nil {
 			t.Fatalf("record %d: Unmarshal: %v\n%s", i, err, data)
 		}
-		if back != r {
+		if back != onTheWire(r) {
 			t.Fatalf("record %d round trip:\n got %+v\nwant %+v", i, back, r)
 		}
 	}

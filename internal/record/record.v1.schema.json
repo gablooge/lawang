@@ -196,17 +196,17 @@
     "identifier": {
       "description": "A string a program compares and an operator reads in a log. It holds none of: the control characters U+0000 to U+001F and U+007F to U+009F; the soft hyphen U+00AD; the Arabic letter mark U+061C; the zero-width and directional marks U+200B to U+200F; the line and paragraph separators and the bidirectional embeddings and overrides, U+2028 to U+202E; the word joiner, the invisible operators, the bidirectional isolates and the deprecated format characters, U+2060 to U+206F; the byte order mark U+FEFF. So it cannot break a log line or reorder what is shown next to it. The list is fixed and is not every invisible character of Unicode: a sink that shows an identifier to a person still treats it as foreign text. The characters above U+00FF are in the pattern as themselves, written with JSON escapes, because regular expression dialects do not agree on an escape for them.",
       "type": "string",
-      "not": { "pattern": "[\\x00-\\x1f\\x7f-\\x9f\\xad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]" }
+      "not": { "pattern": "[\\x00-\\x1f\\x7f\u0080-\u009f\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]" }
     },
     "displayName": {
       "description": "A name to show. The same as identifier, except that the zero-width non-joiner U+200C and joiner U+200D are allowed: Persian and Indic names are spelled with them and emoji are built with them. It cannot break a line or reorder the text around it. It can still imitate another name with look-alike letters, which no list of characters prevents.",
       "type": "string",
-      "not": { "pattern": "[\\x00-\\x1f\\x7f-\\x9f\\xad\u061c\u200b\u200e\u200f\u2028-\u202e\u2060-\u206f\ufeff]" }
+      "not": { "pattern": "[\\x00-\\x1f\\x7f\u0080-\u009f\u00ad\u061c\u200b\u200e\u200f\u2028-\u202e\u2060-\u206f\ufeff]" }
     },
     "oneLine": {
       "description": "Content on one line. It holds none of the control characters U+0000 to U+001F and U+007F to U+009F (so no tab, line feed, carriage return or next line) and neither the line separator U+2028 nor the paragraph separator U+2029. Everything else is content, the bidirectional formatting characters included, because right-to-left text uses them.",
       "type": "string",
-      "not": { "pattern": "[\\x00-\\x1f\\x7f-\\x9f\u2028\u2029]" }
+      "not": { "pattern": "[\\x00-\\x1f\\x7f\u0080-\u009f\u2028\u2029]" }
     },
     "externalId": {
       "description": "An identifier of 1 to 1,024 characters that begins with a provider key (a lowercase letter, then up to 31 of a-z 0-9 _), a colon, and at least one more character.",

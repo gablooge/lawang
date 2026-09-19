@@ -324,7 +324,8 @@ would keep its id, the ledger would skip it as already delivered, and the sink w
 deciding access on the old scope, with no error anywhere. `record.Seal` is the only caller of the
 recipe, and it hashes the scope the record carries. Both halves are enforced: a test fails when
 anything outside `internal/record` refers to `ids.RecordID`, and a record whose id, external id,
-version or scope was changed after `Seal` cannot be marshalled.
+version, scope, op or kind was changed after `Seal` cannot be marshalled. The tenant is in no
+field, so `Seal` remembers it and the stage that delivers asks `Record.SealedFor(tenant)`.
 
 One case the id cannot settle: an entity moved from scope A to B **and back to A**, with a
 provider version that changed at neither move, produces the first record's id again. The ledger

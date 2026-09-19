@@ -76,9 +76,11 @@ func DeliveryID(provider string, rawBody []byte) (string, error) {
 // would skip it as already delivered, and the sink would go on deciding access on the old scope.
 //
 // record.Seal is the only caller, and it hashes the scope the record carries and no other. That
-// is enforced, not only said: TestRecordIDHasNoCallerOutsideRecord fails when any file outside
-// internal/record refers to this function, and a record whose id, external id, version or scope
-// was changed after Seal cannot be marshalled.
+// is enforced, not only said. The guard is in record: a Record whose id, external id, version or
+// scope is not what Seal left there cannot be marshalled, whatever minted the id. The tripwire
+// is TestRecordIDHasNoCallerOutsideRecord, which fails when a file outside internal/record
+// refers to this function, when this package names it anywhere but here (so do not wrap it),
+// and on a go:linkname directive that reaches this package.
 func RecordID(provider, externalID, version, scope, tenant string) (string, error) {
 	parts := [...]struct{ name, value string }{
 		{"provider", provider},

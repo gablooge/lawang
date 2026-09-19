@@ -109,7 +109,8 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	// A decoded record was sealed by whoever wrote the document. What was read is pinned, so
-	// that writing it out again after a change to what the id stands for is refused.
+	// that writing it out again after a change to what the id stands for is refused. It is
+	// sealed for no tenant, because a document does not say whose it is: SealedFor is false.
 	decoded.sealed = decoded.currentSeal()
 	*r = decoded
 	return nil

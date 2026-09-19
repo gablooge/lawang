@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/gablooge/sluiceway/internal/ids"
+	"github.com/gablooge/sluiceway/internal/tenancy"
 )
 
 // A sink is promised that one id never appears with two scopes (ADR 4). The id hashes the scope,
@@ -21,6 +22,10 @@ func TestARecordChangedAfterSealCannotBeMarshalled(t *testing.T) {
 		"the external id": func(r *Record) { r.ExternalID = "slack:C0GENERAL:1752064245.000201" },
 		"the version":     func(r *Record) { r.Version = "1752064245.000201" },
 		"the id":          func(r *Record) { r.ID = otherID },
+		// Neither is in the id. An upsert turned into a tombstone would go out under the id of the
+		// version it was, and a sink that is idempotent on the id would drop it as a repeat.
+		"the op":   func(r *Record) { r.Op, r.Title, r.Text = OpDelete, "", "" },
+		"the kind": func(r *Record) { r.Kind = KindTask },
 	}
 	for name, change := range changes {
 		for _, from := range []string{"sealed", "decoded"} {
@@ -69,7 +74,7 @@ func TestWhatMayChangeAfterSeal(t *testing.T) {
 	if err := json.Unmarshal(out, &back); err != nil {
 		t.Fatal(err)
 	}
-	if back != r {
+	if back != onTheWire(r) {
 		t.Errorf("round trip:\n got %+v\nwant %+v", back, r)
 	}
 }
@@ -89,5 +94,90 @@ func TestARecordThatWasNeverSealedCannotBeMarshalled(t *testing.T) {
 	}
 	if out, err := json.Marshal(r); !errors.Is(err, ErrInvalid) {
 		t.Errorf("a record that was never sealed was marshalled: %s (%v)", out, err)
+	}
+}
+
+// The tenant is in no field of the envelope, so a record sealed for one tenant marshals the same
+// under another and no sink can tell. SealedFor is how the stage that delivers can.
+func TestSealedForIsTrueOnlyForTheTenantOfTheSeal(t *testing.T) {
+	const otherTenant = tenancy.ID("tenant_b")
+	r := sealed(t)
+	if !r.SealedFor(testTenant) {
+		t.Error("a sealed record is not sealed for the tenant it was sealed for")
+	}
+	if r.SealedFor(otherTenant) {
+		t.Error("a record sealed for tenant_a is sealed for tenant_b")
+	}
+	// The case the check exists for: nothing else notices.
+	if _, err := json.Marshal(r); err != nil {
+		t.Errorf("Marshal cannot see the tenant, and refused: %v", err)
+	}
+
+	// What may be set after sealing does not unseal the record, and a copy is still sealed.
+	r.Supersedes, r.Source, r.Text = goodID, "chat-eu", "redacted later"
+	if held := []Record{r}; !held[0].SealedFor(testTenant) || held[0].SealedFor(otherTenant) {
+		t.Error("a copy with supersedes, source and text set after sealing lost or changed its tenant")
+	}
+
+	// Sealing again for another tenant moves it, id and all.
+	draftAgain := r
+	draftAgain.ID, draftAgain.Source = "", ""
+	moved, err := draftAgain.Seal(testProvider, otherTenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !moved.SealedFor(otherTenant) || moved.SealedFor(testTenant) {
+		t.Error("a record sealed again for tenant_b is not sealed for tenant_b alone")
+	}
+	if moved.ID == r.ID {
+		t.Error("two tenants share an id")
+	}
+}
+
+// Fail closed: whatever is not known to be the tenant's is not the tenant's.
+func TestSealedForRefusesWhatWasNotSealedHere(t *testing.T) {
+	var decoded Record
+	if err := json.Unmarshal(exampleBytes(t), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	// Decoding into a record that was sealed must not leave the old tenant behind.
+	overwritten := sealed(t)
+	if err := json.Unmarshal(exampleBytes(t), &overwritten); err != nil {
+		t.Fatal(err)
+	}
+	byHand := draft()
+	byHand.Format, byHand.Source, byHand.ID = FormatV1, testProvider, sealed(t).ID
+
+	cases := map[string]Record{
+		"the zero Record":                       {},
+		"a decoded record":                      decoded,
+		"a record decoded over a sealed one":    overwritten,
+		"a record built by hand with a real id": byHand,
+	}
+	for name, r := range cases {
+		for _, tenant := range []tenancy.ID{testTenant, "", "tenant_b"} {
+			if r.SealedFor(tenant) {
+				t.Errorf("%s is sealed for %q", name, tenant)
+			}
+		}
+	}
+	if sealed(t).SealedFor("") {
+		t.Error("a sealed record is sealed for the empty tenant")
+	}
+
+	changes := map[string]func(*Record){
+		"the scope":       func(r *Record) { r.Visibility.Scope = "slack:channel:C0SECRET" },
+		"the external id": func(r *Record) { r.ExternalID = "slack:C0GENERAL:1752064245.000201" },
+		"the version":     func(r *Record) { r.Version = "1752064245.000201" },
+		"the id":          func(r *Record) { r.ID = goodID },
+		"the op":          func(r *Record) { r.Op, r.Title, r.Text = OpDelete, "", "" },
+		"the kind":        func(r *Record) { r.Kind = KindTask },
+	}
+	for name, change := range changes {
+		r := sealed(t)
+		change(&r)
+		if r.SealedFor(testTenant) {
+			t.Errorf("a record with %s changed after Seal is still sealed for its tenant", name)
+		}
 	}
 }

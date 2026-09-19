@@ -88,6 +88,16 @@ stays as it is. So within v1 the schema changes by added optional properties and
 and by nothing else, and every limit and pattern in it is final on the day v0.1.0 ships.
 [ADR 3](0003-scope-id-format.md) says the same of the scope id grammar.
 
+**Respelling a pattern without changing the set of strings it matches is wording, not a change
+to the format.** What is frozen is that set, not the characters the pattern is written with. It
+counts as wording only with an exhaustive proof: the old and the new spelling give the same
+verdict for every code point there is, in every dialect the schema claims (decision 9,
+"Portability of the patterns"). That has happened once, before v0.1.0: the C1 controls and the
+soft hyphen were first written as hex escapes, which Ruby's engine cannot compile, and are now
+in the pattern as themselves. The two spellings were compared over all 1,112,064 code points in
+Go, in Python and in ECMAScript with and without the `u` flag, with no disagreement, and a test
+refuses the old spelling.
+
 Field names are lowercase `a-z 0-9 _`, starting with a letter, now and in every addition, and a
 record with any other field name is refused by the schema (`propertyNames`) and by the Go
 decoder. Some JSON decoders match names without regard to case. Go's `encoding/json` does, and
@@ -273,16 +283,31 @@ it, this is enforced and not only said:
 
 - `ids.RecordID` has to be exported for `Seal` to call it, so a test in `internal/ids` parses
   every Go file of the repository and fails when anything outside `internal/record` refers to it
-  (a call, a function value, an aliased or a dot import).
+  (a call, a function value, an aliased or a dot import, a `go:linkname` directive), or when
+  `internal/ids` itself says its name anywhere but in its declaration (a wrapper would hand the
+  recipe on under another name). That scan is a tripwire: it reads source text, and it is there
+  to tell an honest second caller why there must not be one. The guard is the next point.
 - The fields the id stands for (`ID`, `ExternalID`, `Version`, `Visibility.Scope`) stay
   assignable after `Seal`, because a `Record` is a plain value and `Supersedes` and `Source` are
-  meant to be set afterwards. So `Seal` also keeps a private copy of the four, and **`Marshal`
+  meant to be set afterwards. So `Seal` also keeps a private copy of the four, and of `Op` and
+  `Kind` (an upsert turned into a tombstone after sealing would go out under the id of the
+  version it was, and a sink that is idempotent on `id` would drop it as a repeat), and **`Marshal`
   refuses a record in which they no longer say what was sealed**, or that was never sealed. A
   pipeline stage that reassigns the scope after sealing fails at once, where the mistake is, and
   not as a dead letter at a strict sink. Decoding pins what it read in the same way. The
   alternative, hashing again in `Marshal`, would need the provider key and the tenant, which are
   deliberately not in the envelope, and would cost a BLAKE3 per record. The comparison costs
-  four string compares: `Marshal` measured 2.5 microseconds per record before and after.
+  six string compares: `Marshal` measured 2.5 microseconds per record before and after.
+- **The tenant** is in no field, so a record sealed for tenant A marshals identically when it is
+  delivered under tenant B, and neither `Marshal` nor any sink can notice. `Seal` therefore
+  keeps the tenant privately as well, and `Record.SealedFor(tenant)` answers at the one place
+  where a tenant and a record meet again, the stage that writes the ledger and calls
+  `Sink.Deliver` (B08): it asserts it there and treats false as a refusal. It fails closed: a
+  decoded record is sealed for no tenant, because a document does not say whose it is.
+- **What none of this defends against** is a caller determined to get around it. A conversion
+  to a type of the caller's own (`type w record.Record`, then `json.Marshal(w(r))`) sheds the
+  methods, and with them `Validate` and the seal. The seal guards against accidents, which is
+  what a pipeline produces. It does not try to defeat the conversion.
 
 Nothing has been delivered yet, so re-keying costs nothing today. After v0.1.0 it would re-key
 every record at every sink. That is why it is decided here and not when the first provider with
@@ -385,8 +410,12 @@ terminals just as a line feed does, and a right-to-left override (U+202E) in a d
 a sink's UI show one person's name as another's, or `invoice<U+202E>gnp.exe` as
 `invoiceexe.png`. Tightening after v0.1.0 is a new format version, so it is decided now, field by
 field. Every rule is in the schema (`$defs` `identifier`, `displayName`, `oneLine`) and in
-`Record.Validate`, the two are held together by a test that runs about 1,800 code points through
-every field on both sides, and the same run was made with Python's `jsonschema`.
+`Record.Validate`. The two are held together by a test that compares the schema's patterns, the
+Go rule and the ranges of the table below for **every code point of Unicode** (1,112,064 for
+each of the four rules, a tenth of a second, or about six under the race detector), and by one
+that runs about 1,800 code points through every field on both sides, which proves that each
+field is wired to its own rule. The same run was made with Python's `jsonschema`, over the
+whole Basic Multilingual Plane.
 
 | Fields | Refused | Why |
 |---|---|---|
@@ -404,7 +433,11 @@ Four things follow, and a sink author should know them:
 - **The lists are fixed code points, never a Unicode category.** A category (`Cf`, say) grows
   with every Unicode version, and the format may not grow (decision 1). So they are not every
   invisible character there is: the Hangul fillers, the variation selectors and the tag
-  characters (U+E0000 to U+E007F, which can smuggle text past a human reader) are not refused.
+  characters (U+E0000 to U+E007F, which can smuggle text past a human reader) are not refused,
+  and neither is the ideographic space U+3000. Each of these is an accepted case with a name in
+  the tests, because each is an invitation to "close the gap" on one side later, and within v1
+  that is a break in either direction (decision 1): whoever tightens a rule deletes a named test
+  first.
   The tag characters were left out for a stated reason: regular expression dialects do not agree
   on how to name a character above U+FFFF (one needs surrogate pairs, where a range across them
   does not even compile), and a schema that only some validators can load is worse than a
@@ -416,12 +449,27 @@ Four things follow, and a sink author should know them:
   of a title into spaces, and cuts a text to its limit, before `Seal`. That belongs to the
   normalizer contract (B11 and every provider after it). A normalizer that forgets fails loudly
   on the first such record, which is a dead letter and not a leak.
-- **Portability of the patterns.** Characters up to U+00FF are written as regular expression
-  escapes (`\x9f`), which Go's, Python's and ECMAScript's dialects all read alike. For anything
-  above there is no escape they share (`\u2028` is not RE2, `\x{2028}` is not Python or
-  ECMAScript), so those characters are in the pattern **as themselves**, written in the schema
-  file with JSON escapes, which every JSON parser turns into the character before any regular
-  expression engine sees it. The file stays pure ASCII.
+- **Identifiers are never cleaned. Only `author.display` and `title` are.** Removing a character
+  from an `external_id`, a `version`, an `author.id` or a `container.id` merges two different
+  source ids into one: for `external_id` that is two entities under one key, and a tombstone
+  that deletes the wrong one. For an identifier refusal is the only right answer, and no id a
+  provider mints holds a refused character. An identifier a **sender** controls is another
+  matter: a mail `Message-ID` or `In-Reply-To` used for `edges.reply_parent` or an `external_id`
+  may hold tabs, control characters and raw 8-bit bytes (RFC 5322's obsolete syntax allows them,
+  and real spam carries them), so passed through raw it lets a stranger's mail dead-letter
+  itself. A normalizer prefers the provider's own id (Graph's message id is ASCII), and where a
+  header has to be used it escapes or hashes it **injectively** (the percent escaping of the
+  scope id is in the package): never cleaned, and never passed through raw.
+- **Portability of the patterns.** Only ASCII characters are written as regular expression
+  escapes (`\x00` to `\x1f`, `\x7f`), which Go's, Python's, ECMAScript's and Ruby's dialects all
+  read alike. For anything above there is no escape they share: `\x9f` is "invalid multibyte
+  escape" to Ruby's engine in a UTF-8 pattern, so a Ruby validator could not even load a schema
+  that used it, `\u2028` is not RE2, and `\x{2028}` is not Python or ECMAScript. So every
+  character from U+0080 up is in the pattern **as itself**, written in the schema file with a
+  JSON escape, which every JSON parser turns into the character before any regular expression
+  engine sees it. The file stays pure ASCII. A test refuses any other escape in any pattern of
+  the schema. All 16 patterns compile in the four dialects, and the three character classes
+  give the verdict of the table above for every code point in each of them.
 
 A container id inside a **scope id** is a different thing: it is carried as escaped bytes, the
 result is ASCII, and ADR 3 refuses only control bytes there. A provider id with a zero-width
@@ -468,9 +516,10 @@ null (plain `encoding/json` would read a missing `origin` as "trusted"), that fi
 lowercase, that `visibility` holds nothing unknown, and that `occurred_at` is spelled as above.
 About 330 documents, about 60 Go values and a fuzz target run through both and must get the same
 answer. Two parts of the grammar are small enough to run in full, and are: every `%XX` escape of
-a scope id, all 256 bytes in uppercase, lowercase and mixed hex (ADR 3), and about 1,800 code
-points in every field that has a character rule (decision 9). Both are judged against the rule
-as the ADRs state it and not against each other, because two halves that drift together agree.
+a scope id, all 256 bytes in uppercase, lowercase and mixed hex (ADR 3), and the four character
+rules over every code point of Unicode, the schema's compiled patterns against the Go rule
+(decision 9). Both are judged against the rule as the ADRs state it and not against each other,
+because two halves that drift together agree.
 
 Three rules only the Go side has, because no JSON Schema can state them. A sink that validates
 with the schema alone should add all three, and the schema's description lists them:
