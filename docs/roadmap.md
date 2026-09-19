@@ -167,8 +167,8 @@ Each becomes a short decision record under `docs/adr/` when it is settled.
 
 | # | Question | Leaning | Why it matters |
 |---|---|---|---|
-| 1 | Typed queries with `sqlc`, or hand-written pgx | `sqlc` | Most bugs in the predecessor's data layer were query-shape mistakes a generator catches at build time |
-| 2 | Migration tool | `goose`, embedded | Plain SQL files, runs inside the binary, no separate install |
+| 1 | Typed queries with `sqlc`, or hand-written pgx | **settled:** `sqlc`, see [ADR 1](adr/0001-queries-sqlc.md) | Most bugs in the predecessor's data layer were query-shape mistakes a generator catches at build time |
+| 2 | Migration tool | **settled:** `goose`, embedded, see [ADR 2](adr/0002-migrations-goose.md) | Plain SQL files, runs inside the binary, no separate install |
 | 3 | Scope id format | `{source}:{container_kind}:{container_id}` | Readable and deterministic; the tenant travels separately |
 | 4 | Final field names in the record format | the proposal in architecture section 6 | This is a public contract once v0.1 ships, so it should settle before M1 finishes |
 | 5 | Default hydration path | direct API clients | Three of five providers needed them anyway |

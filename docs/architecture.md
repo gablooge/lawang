@@ -79,7 +79,11 @@ else including poison, because providers retry non-2xx responses and a retry sto
 
 1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so all
    versions of one entity deliver in arrival order while different entities proceed in parallel.
-2. Re-bind row-level security to the row's own tenant before touching anything.
+2. Commit the claim, then open a **second transaction** as the application role, bound to the
+   row's own tenant, before touching anything that belongs to a tenant. The claim runs as
+   `sluiceway_worker`, and that transaction is cross-tenant for its whole life: Postgres ORs
+   permissive policies together, so binding a tenant inside it would take nothing away (see
+   [section 4](#4-trust-model)).
 3. Parse the stored raw body into changes. One delivery can produce several records (a comment and
    its parent task, for example).
 4. Hydrate each change into the full object. On failure, degrade to a minimal record built from the
@@ -127,10 +131,78 @@ on a transaction-local setting. If the setting is missing, a query returns zero 
 |---|---|
 | `sluiceway` | the application role; `NOSUPERUSER NOBYPASSRLS`, so RLS actually applies |
 | `sluiceway_resolver` | reads only the delivery-resolution columns of subscriptions, because it has to derive the tenant and so cannot be filtered by it |
-| `sluiceway_worker` | claims outbox rows across tenants, then re-binds to each row's tenant for the work itself |
+| `sluiceway_worker` | claims outbox rows across tenants, in a transaction that does nothing else; the work on each row then runs in a second transaction, as `sluiceway`, bound to that row's tenant |
 
 The resolver and worker roles are granted with `INHERIT FALSE` and entered explicitly with
 `SET LOCAL ROLE`, so the application role does not silently pick up their wider policies.
+
+**A helper-role transaction is cross-tenant until it ends.** Permissive policies are ORed together,
+so once a helper role's policy applies (`TO sluiceway_worker USING (true)`, for example), binding a
+tenant in the same transaction narrows nothing: every tenant's rows stay visible, and updatable
+where the role may update. A bind could only add rows, on tables where the role has no policy of
+its own. The rule is therefore two transactions: the cross-tenant step (resolve an owner, claim a
+row) under the helper role, and everything that belongs to a tenant in a second transaction as the
+application role bound to that tenant. The code enforces it: the transaction `store.RoleTx` hands
+out refuses `tenancy.Bind`, savepoints included.
+
+**Bootstrap and preflight.** The application role cannot create roles, so an administrator applies
+a one-time bootstrap script (`sluiceway migrate bootstrap` prints it) that creates the three roles
+and a `sluiceway` schema owned by the application role. The administrator is a superuser, or a
+non-superuser with `CREATEROLE` and `CREATE` on the database, which is what managed Postgres
+offers. The script is a single statement, so it applies completely or not at all, and it is safe
+to run again, also as a different administrator. It leaves the administrator's own role
+memberships exactly as it found them, and it refuses a database where a `sluiceway` schema already
+exists under another owner. Migrations then run as the application role itself. Every connection sets `search_path` to that schema explicitly, because the default
+`"$user"` entry follows `SET ROLE`.
+
+On every start, `serve`, `worker` and `migrate` run a preflight and refuse to continue if:
+
+- the login is `SUPERUSER` or `BYPASSRLS` (row-level security would silently not apply), or a
+  helper role is;
+- the login **inherits** a helper role, by any path. The preflight does not read membership rows,
+  because there is one per grantor and inheritance also arrives through intermediate roles. It asks
+  Postgres the effective question, `pg_has_role(helper, 'USAGE')`, which must be false: otherwise
+  a plain transaction with no tenant bound would run under the helper role's cross-tenant
+  policies;
+- the login holds **`ADMIN OPTION`** on a helper role, by any path, inherited or not
+  (`pg_has_role(helper, 'MEMBER WITH ADMIN OPTION')` must be false). That is the one membership
+  state the application role could turn into inheritance by itself, by granting the helper role
+  to itself `WITH INHERIT TRUE` while the process runs;
+- the login cannot `SET ROLE` to a helper role (`pg_has_role(helper, 'SET')` must be true);
+- the schema is missing (the bootstrap was not applied), or exists but is not owned by the login
+  role (it is not the one the bootstrap creates, and migrations would fail in it with a misleading
+  error), or the server is older than Postgres 16.
+
+The preflight runs once per process, at start. It guards against misconfiguration, not against an
+administrator: a membership or attribute changed while the process runs is not seen until the next
+start, and anyone able to make that change could read the tables directly anyway.
+
+**No part of the database URL reaches a log or an error**, not only the password. The driver and
+the server both quote the connection target when a connection fails (user, database, host, port,
+client address), so a failure to connect is reduced to its classification: the host name does not
+resolve, connection refused, timed out, authentication failed or no such database (with the
+SQLSTATE, and never the server's message), TLS failure, or other, always prefixed with
+`SLUICEWAY_DATABASE_URL`. The same holds for a connection that fails later, in the middle of a
+transaction or a migration, while an error from a statement that ran (a constraint violation, a
+failed migration) keeps the server's message. Preflight refusals say "the login role", not its
+name. One connection attempt is bounded at 10 seconds unless the URL sets `connect_timeout` to 1
+or more (seconds), so a host that silently drops packets is reported instead of holding the start
+for the TCP timeout of the operating system. `connect_timeout=0`, which means "wait forever" to
+libpq, does not lift the bound: the driver cannot tell it from a missing parameter, and a bounded
+start is the safe reading of the two. An operator who needs a long wait writes a large number.
+
+The replacement judges the error, not where it came from. A network error that a transaction
+function returns is reduced in the same way, along with anything the function wrapped around it,
+because a statement on a connection that has just died fails with exactly such an error. So a
+transaction function does database work only: no provider call, no sink delivery, no lookup inside
+it, which principle 6 of section 10 asks for anyway.
+
+See [ADR 2](adr/0002-migrations-goose.md).
+
+**Tenant ids** are 1 to 64 characters of `A-Z a-z 0-9 _ -`, enforced in Go and by a `tenant_id`
+domain that every tenant column uses. The policy compares against `current_tenant()`, which maps
+both an unset setting and the empty string to `NULL`: a transaction-local setting reads back as
+`''` on a pooled connection after its transaction ends, and neither may match a row.
 
 ---
 
@@ -277,7 +349,8 @@ internal/
   config/             environment config, fail-closed defaults
   ids/                ULIDs and the blake3 key recipes, golden-tested
   tenancy/            tenant context and RLS binding
-  store/              pgx pool, transaction helpers, embedded migrations
+  store/              pgx pool, preflight, transaction helpers, migrate
+  testdb/             a real Postgres for integration tests, as the application role
   outbox/             accept insert, FIFO-head claim, retry ladder, dead letters
   ingress/            the /ingress/{provider} HTTP edge
   hub/                handshake, verify, resolve owner, accept
@@ -290,7 +363,7 @@ internal/
   sink/               Sink interface and implementations
   provider/           Provider interfaces and the registry
     clickup/  slack/  teams/  outlook/  hubspot/
-migrations/           SQL, embedded into the binary
+migrations/           SQL, embedded into the binary; bootstrap/ is the one-time admin script
 docs/
 ```
 
@@ -374,6 +447,7 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 |---|---|
 | Postgres driver | `github.com/jackc/pgx/v5` |
 | Migrations | `github.com/pressly/goose/v3`, SQL files embedded in the binary |
+| Queries | `sqlc` generating `pgx/v5` code, checked in ([ADR 1](adr/0001-queries-sqlc.md)) |
 | Hashing | `github.com/zeebo/blake3` |
 | IDs | `github.com/oklog/ulid/v2` |
 | HTTP | standard library `net/http` with method and path patterns |

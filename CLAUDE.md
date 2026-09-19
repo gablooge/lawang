@@ -14,13 +14,17 @@ Go service: permission-aware SaaS connectors for AI memory. Pre-alpha, private u
 ## "Continue" means
 
 1. Open `docs/backlog.md` and take the first unchecked item.
-2. Branch `bNN-short-name` from `main`.
+2. Branch `bNN-short-name` from `main`, or from the previous item's branch if its pull request
+   has not merged yet (then open the new pull request against that branch, so the diff stays
+   clean; GitHub retargets it to `main` when the base merges).
 3. Build it with tests until the item's **Done when** line is true and `make check` is green.
 4. Tick the box and add a line to the log at the bottom of the backlog.
-5. Comment on the item's issue with what was done and anything that differs from the design
-   (`gh issue comment NN`). Do not close the issue by hand: the commit message ends with
-   `Closes #NN`, so it closes when the work reaches `main`.
-6. Stop at the item boundary and report. Do not commit or push unless asked.
+5. Commit (message ends with `Closes #NN`), push the branch, and open a pull request assigned to
+   `gablooge`, with the item's milestone and labels. Wait for CI and fix it if it is red.
+6. Comment on the item's issue with what was done and anything that differs from the design. Do
+   not close the issue by hand: it closes when the pull request reaches `main`.
+7. Stop at the item boundary and report. **Never merge a pull request or push to `main`**: merging
+   is the maintainer's review step.
 
 ## Rules for the code
 

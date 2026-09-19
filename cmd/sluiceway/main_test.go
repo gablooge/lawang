@@ -92,7 +92,8 @@ func TestRunRefusesExtraArguments(t *testing.T) {
 		{[]string{"serve", "--listen", ":9090"}, "serve takes no arguments"},
 		{[]string{"worker", extra}, "worker takes no arguments"},
 		// A command that grows a subcommand keeps its row and changes only what it says.
-		{[]string{"migrate", extra}, "migrate takes no arguments"},
+		{[]string{"migrate", extra}, "usage: sluiceway migrate [bootstrap]"},
+		{[]string{"migrate", "bootstrap", extra}, "usage: sluiceway migrate [bootstrap]"},
 		{[]string{"version", extra}, "version takes no arguments"},
 		{[]string{"help", extra}, "help takes no arguments"},
 		{[]string{"-h", extra}, "-h takes no arguments"},
@@ -485,11 +486,28 @@ func TestRunStubbedRolesExitNonZero(t *testing.T) {
 		}
 		return ""
 	}
-	for _, cmd := range []string{"worker", "migrate"} {
+	for _, cmd := range []string{"worker"} {
 		var out, errOut bytes.Buffer
 		if code := run(context.Background(), []string{cmd}, dev, &out, &errOut); code != 1 {
 			t.Errorf("%s: exit = %d, want 1", cmd, code)
 		}
+	}
+}
+
+func TestMigrateBootstrapPrintsTheScriptWithoutConfiguration(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"migrate", "bootstrap"}, noEnv, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	for _, want := range []string{"CREATE ROLE sluiceway ", "NOBYPASSRLS", "WITH INHERIT FALSE", "CREATE SCHEMA sluiceway AUTHORIZATION sluiceway"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("bootstrap script does not contain %q", want)
+		}
+	}
+
+	out.Reset()
+	if code := run(context.Background(), []string{"migrate", "sideways"}, noEnv, &out, &errOut); code != 2 {
+		t.Errorf("migrate sideways: exit = %d, want 2", code)
 	}
 }
 
