@@ -74,8 +74,42 @@ that reads or writes the key's rows, and holds it until it ends. Postgres makes 
 visible before it releases its locks, and under READ COMMITTED every statement takes a new
 snapshot. So each writer's statements see everything the writers before it committed, no writer of
 the key is open beside it, and any snapshot anyone takes sees, for each key, the work of the first
-so many writers and nothing of the rest. `store` opens transactions at the server's default
-isolation level, which this relies on.
+so many writers and nothing of the rest.
+
+**This needs READ COMMITTED, and `store` asks for it by name.** Everything below rests on the
+sentence above: the statement that follows the wait for the key's lock sees what the previous
+holder committed. That is true under READ COMMITTED only. Under REPEATABLE READ and SERIALIZABLE
+the snapshot belongs to the transaction and is taken by its first statement, which here is the
+`set_config` that binds the tenant, before the wait. A writer then waits for the lock as it should
+and decides on a picture from before the commit it waited for:
+
+- `Accept` of version 2 waits for an open `MarkDelivered` of version 1, still sees version 1
+  unfinished, and stores version 2 without the marker. The finish has already promoted nothing.
+- `MarkDelivered` of version 1 waits for an open `Accept` of version 2, cannot see version 2, and
+  promotes nothing.
+- `Replay` behind an open finish does what `Accept` does.
+
+Each leaves a key with unfinished rows and no head: `Claim` returns nothing for it, forever, and no
+error is raised anywhere. (Under SERIALIZABLE the same interleavings fail with a serialization
+error instead, which is at least loud. Safety is unaffected at any level: the unique index and the
+CHECK do not depend on a snapshot.) Every `Accept` that meets a finish of its entity would do this,
+which is the normal case for an entity that changes often.
+
+The level is not something to inherit. `default_transaction_isolation` can be set on the server,
+on the database or on the role, with one statement, by an administrator who has never heard of this
+package, and some sites set it as policy. So `store.begin`, the one place where the application
+opens a transaction, begins every transaction with `ISOLATION LEVEL READ COMMITTED`, and a default
+cannot change it. The claim depends on the same level for another reason: re-evaluating its
+conditions on the latest version of a locked row is what READ COMMITTED does, and the other two
+levels raise a serialization failure there instead. Nothing else opens a transaction that touches
+the outbox: the preflight runs single statements, for which the levels do not differ, and goose
+opens its own transactions for DDL, under the session lock that serializes `Migrate`.
+
+Tests: `TestEveryTransactionIsReadCommittedWhateverTheDefault` in `internal/store` (the default set
+on the database and on the role, both other levels, every transaction helper), and the three
+lost-promotion tests in `internal/outbox/interleaving_test.go`, which run the interleavings above
+on databases whose default is REPEATABLE READ and SERIALIZABLE. Before this was written down and
+enforced (it was found in review), they failed exactly as described.
 
 **The invariant.** On every snapshot: a key with unfinished rows has exactly one head, that head is
 its unfinished row with the lowest `seq`, and no finished row is a head. By induction over the
@@ -115,14 +149,23 @@ version. Postgres re-evaluates the conditions on that version under the row lock
 conditions are columns of the locked row, with no join whose other side could be stale. Between
 the snapshot and the lock, a chosen row r may have:
 
-| What happened to r | Its latest version | Outcome |
-|---|---|---|
-| finished (the old holder of an expired lease delivered it) | no marker | dropped |
-| been leased by another claimer | `due_at` in the future | dropped |
-| been given a backoff by its holder | `due_at` in the future | dropped |
-| died, the next version went in flight, r was replayed | no marker, it is behind that version | dropped |
-| died, everything else of the key finished, r was replayed | the marker, and due | leased, rightly: it is the head |
-| nothing, but another transaction holds its row lock | | skipped, never waited for |
+| What happened to r | Its latest version | Outcome | Test |
+|---|---|---|---|
+| finished (the old holder of an expired lease delivered it) | no marker | dropped | `TestClaimRechecksARowFinishedAfterItsSnapshot` |
+| been leased by another claimer | `due_at` in the future | dropped | `TestClaimRechecksARowLeasedAfterItsSnapshot` |
+| been given a backoff by its holder | no lease, `due_at` in the future | dropped | `TestClaimRechecksARowGivenABackoffAfterItsSnapshot` |
+| died, the next version went in flight, r was replayed | no marker, it is behind that version | dropped | `TestClaimRechecksARowReplayedAfterItsSnapshot` |
+| died, everything else of the key finished, r was replayed | the marker, and due | leased, rightly: it is the head | `TestClaimLeasesARowReplayedOntoAnEmptyKeyAfterItsSnapshot` |
+| nothing, but another transaction holds its row lock | | skipped, never waited for | `TestClaimSkipsARowSomeoneHasLocked` |
+
+The tests are in `internal/outbox/interleaving_test.go`. Each of the first five stops a claim
+between its snapshot and its first row lock, makes the change, lets the claim go on, and runs under
+five planner settings, because the re-check has to hold under any plan. The second and third rows
+rest on `due_at` being a STORED generated column: the value that is re-checked is the one the other
+transaction's UPDATE stored with the new row version. A claim that judges `due_at` through a join
+(the snapshot's value) fails both tests under every setting, and neither of the other gated tests.
+The random-load test cannot see a missing re-check at all (measured in review: 0 of 10 runs for
+`is_head`), so these tests are what holds the table up.
 
 A row that was promoted after the snapshot is not a candidate in this poll, and is one in the next.
 
@@ -170,12 +213,70 @@ and must take them in a stable order or retry a deadlock.
   index gets an entry for the new row version. (The review measured 0 HOT updates of 10,000 before
   this change as well, at the default fillfactor.)
 - Dead entries collect at the front of the index the claim walks: one for every lease, retry and
-  finish. The first poll to pass one marks it, later polls skip it, and the pages that hold them
-  (about 260 entries each) stay until a vacuum. A poll therefore costs the batch plus one page per
-  260 heads that moved since the last vacuum: 5.9 ms after 990,000 moves with no vacuum at all,
-  in the worst shape measured. A long-running transaction anywhere in the database stops both the
-  marking and the vacuum, and then every poll walks everything that moved since it began. That is
-  true of any queue in Postgres, and it is principle 6 of the architecture again.
+  finish, so two for every row delivered at the first attempt. The first poll to pass one marks it,
+  later polls skip it, and the pages that hold them stay until a vacuum. A poll therefore costs the
+  batch plus the pages of dead entries in front of it. How many entries a page holds depends on how
+  it was filled: about 260 where they went in in index order (90 percent full, the bulk move in the
+  table above: 5.9 ms after 990,000 moves with no vacuum at all), about 230 in a steady flow (74
+  percent full), about 180 in the review's run. The first version of this record gave 260 as if it
+  were the rate, and it is the best case. Measured one row at a time, as the application does it,
+  with autovacuum off: 8.7 pages per 1,000 deliveries here (rows arriving while 30,000 were
+  delivered, a 2 second lease, so that both entries of a delivered row end up in the range the
+  claim walks), and 11 per 1,000 in the review (200,000 deliveries on 5,100,000 rows: a batch of 10
+  went from 302 buffers and 0.44 ms to 2,511 and 3.9 ms). It is linear, it does not recover by
+  itself, and a vacuum brings it back at once. Where every waiting head falls due before any lease
+  does (a backlog loaded at one moment), only one of the two entries is ever walked: 3.8 pages per
+  1,000. A long-running transaction anywhere in the database stops both the marking and the
+  vacuum, and then every poll walks everything that moved since it began, with a heap visit each
+  (the review measured 50,871 buffers and 10 ms per poll after 50,000 deliveries under a held
+  snapshot). That is true of any queue in Postgres, and it is principle 6 of the architecture
+  again. When autovacuum gets to the table is a retention question, and belongs to B25.
+- The write path as a whole, which a capacity plan needs more than the per statement numbers
+  above: the review ran 8 acceptors and 8 workers over 200 keys (accept, claim, deliver, 1 KB
+  bodies, an otherwise empty table) and got 2,630 deliveries per second with the marker against
+  3,300 without it, about 20 percent less.
 - A row inserted behind this package's back, without the marker, into a key that has no head, is
   never delivered. It is also never delivered out of order, which is the failure that was chosen.
-  The invariant is one query (`headsBroken` in the tests), should an operator ever need it.
+  It is silent by construction (no error, no log, only a delivery that never happens), so it has
+  to be looked for. See the next section.
+
+## Finding and repairing a key with no head
+
+Nothing at runtime checks the invariant yet. What exists is the detection, `Outbox.StrandedKeys`
+(`StrandedKeys` in `internal/outbox/queries.sql`): the ordering keys of one tenant that have
+unfinished rows and no head. That is the only broken state that can exist silently. Two heads and
+a finished head are refused by the table, and a head that is not the earliest unfinished row of its
+key can only be made by writing `is_head` by hand. The query reads the tenant's unfinished rows
+from `outbox_unfinished` and probes `outbox_one_head` per row, so it costs the tenant's backlog and
+never the delivered history: 36 ms for a tenant with 99,100 unfinished rows in a table of
+4,000,000, 2 ms for one with 9,100. (The query that states the whole invariant, `headsBroken` in
+the tests, groups the entire table. The review measured 7.7 seconds and 440 MB of temporary files
+on 5,100,000 rows. It is for tests.) One statement is one snapshot and every writer leaves the
+invariant intact when it commits, so a key it reports is broken and not merely being written.
+
+It runs bound to a tenant, as the application role. It cannot run across tenants as
+`sluiceway_worker`: that role reads neither `state` nor `ordering_key`, on purpose (it never learns
+which entity a row belongs to), and both are needed. A sweep over all tenants therefore either
+calls it per tenant, or gets a role of its own with `SELECT (tenant_id, ordering_key, state,
+is_head)` and a select policy. That choice, the sweep and a metric are B25. This record only makes
+sure the query and the repair exist and are tested.
+
+The repair, for one key, as an administrator (or bound to the tenant as the application role):
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtextextended('<tenant>' || chr(31) || '<ordering key>', 0));
+UPDATE sluiceway.outbox SET is_head = true
+ WHERE id = (SELECT id FROM sluiceway.outbox
+              WHERE tenant_id = '<tenant>' AND ordering_key = '<ordering key>'
+                AND state IN ('pending', 'prepared')
+              ORDER BY seq LIMIT 1);
+COMMIT;
+```
+
+It is what a finishing writer does after its state change, under the same lock, so it is serial
+with the writers of the key and sees what they committed (it must run at READ COMMITTED, like
+them). It cannot make things worse: on a key whose head is its earliest unfinished row it changes
+nothing, on a key whose head is some other row the unique index refuses it, and on a key with
+nothing unfinished it matches no row. `TestStrandedKeysFindsAKeyWithWorkAndNoHead` breaks keys on
+purpose, finds them, runs this statement, and delivers the repaired key in queue order.

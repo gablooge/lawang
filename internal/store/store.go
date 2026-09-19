@@ -241,8 +241,8 @@ func (db *DB) Tx(ctx context.Context, fn func(pgx.Tx) error) error {
 	return db.begin(ctx, fn)
 }
 
-// begin is pgx.BeginFunc (commit when fn returns nil, roll back on an error or a panic) with one
-// addition. The pool connects lazily, so any transaction can be the one that meets an unreachable
+// begin is pgx.BeginTxFunc (commit when fn returns nil, roll back on an error or a panic) with a
+// fixed isolation level (see the end of this comment) and one addition. The pool connects lazily, so any transaction can be the one that meets an unreachable
 // server, and a network error in the middle of one carries addresses too: those errors are
 // replaced the way Open replaces them. Every other error, from fn or from the server, reaches the
 // caller untouched.
@@ -261,8 +261,19 @@ func (db *DB) Tx(ctx context.Context, fn func(pgx.Tx) error) error {
 // a transaction that waits on the far end of a network call holds a pooled connection and its row
 // locks for as long as that takes (docs/architecture.md section 10, principle 6). Do the call
 // before or after the transaction and pass in what it returned.
+//
+// The transaction is READ COMMITTED, asked for by name and not inherited. Callers depend on it:
+// a statement that follows a wait for a lock must see what the transaction it waited for
+// committed, and only READ COMMITTED takes a new snapshot per statement. The outbox is the first
+// such caller (docs/adr/0010-outbox-head-marker.md): under REPEATABLE READ its writers wait for the
+// ordering key's lock and then decide on a snapshot from before the wait, which leaves a row that
+// is never delivered, with no error anywhere. default_transaction_isolation can be set on the
+// server, the database or the role, by an administrator who has never heard of this package, so
+// the default is not something to rely on. This is the only place the application opens a
+// transaction. (The preflight runs single statements, for which the levels do not differ, and
+// goose opens its own transactions for DDL, which the session lock in Migrate already serializes.)
 func (db *DB) begin(ctx context.Context, fn func(pgx.Tx) error) error {
-	return scrub(ctx, pgx.BeginFunc(ctx, db.pool, fn))
+	return scrub(ctx, pgx.BeginTxFunc(ctx, db.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn))
 }
 
 // TenantTx runs fn in a transaction scoped to one tenant. It is the only way to do a tenant's

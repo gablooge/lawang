@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -48,12 +49,23 @@ type env struct {
 // whatever plan the claim gets.
 func setup(t *testing.T, plannerOff ...string) *env {
 	t.Helper()
+	settings := make([]string, len(plannerOff))
+	for i, setting := range plannerOff {
+		settings[i] = setting + " = off"
+	}
+	return setupWith(t, settings...)
+}
+
+// setupWith is setup for a database with settings of its own, each written as in ALTER DATABASE
+// ... SET: "name = value". The database is the test's own, so this changes nothing for any other.
+func setupWith(t *testing.T, settings ...string) *env {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	t.Cleanup(cancel)
 	tdb := testdb.New(t)
-	for _, setting := range plannerOff { // before the pool opens: a session reads these when it starts
+	for _, setting := range settings { // before the pool opens: a session reads these when it starts
 		testdb.Exec(t, tdb.AdminURL, fmt.Sprintf(
-			`DO $$ BEGIN EXECUTE format('ALTER DATABASE %%I SET %s = off', current_database()); END $$`, setting))
+			`DO $do$ BEGIN EXECUTE format($f$ALTER DATABASE %%I SET %s$f$, current_database()); END $do$`, setting))
 	}
 	db, err := store.Open(ctx, tdb.URL)
 	if err != nil {
@@ -143,9 +155,17 @@ func TestAcceptRefusesBadInput(t *testing.T) {
 	for name, d := range map[string]outbox.Delivery{
 		"no provider":     {OrderingKey: "k", RawBody: []byte("x")},
 		"no ordering key": {Provider: "fake", RawBody: []byte("x")},
+		// The provider is the connector's own constant, so these are bugs and have no sentinel.
+		// They are still refused by this package, in words, and not by the database in bytes.
+		"a NUL in the provider":         {Provider: "fa\x00ke", OrderingKey: "k", RawBody: []byte("x")},
+		"invalid UTF-8 in the provider": {Provider: "fa\xffke", OrderingKey: "k", RawBody: []byte("x")},
 	} {
-		if _, _, err := e.ob.Accept(e.ctx, tenantA, d); err == nil {
+		_, _, err := e.ob.Accept(e.ctx, tenantA, d)
+		if err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+		if sqlState(err) != "" {
+			t.Errorf("%s: the refusal came from the database (%v), want it made before the database is asked", name, err)
 		}
 	}
 	if _, _, err := e.ob.Accept(e.ctx, tenancy.ID(""), outbox.Delivery{Provider: "fake", OrderingKey: "k"}); err == nil {
@@ -166,21 +186,51 @@ func TestAcceptRefusesAnOrderingKeyItCannotStore(t *testing.T) {
 	if err := accept(strings.Repeat("k", outbox.MaxOrderingKeyLen)); err != nil {
 		t.Errorf("a key of MaxOrderingKeyLen bytes: %v, want accepted", err)
 	}
-	tooLong := map[string]string{
+	unstorable := map[string]string{
 		"one byte too long": strings.Repeat("k", outbox.MaxOrderingKeyLen+1),
 		// Bytes, not characters: 256 two-byte runes are 512 bytes, 257 are not.
 		"one rune too long": strings.Repeat("é", outbox.MaxOrderingKeyLen/2+1),
 		// 100,000 of one character compress into an index tuple, and used to be accepted.
 		"long but compressible": strings.Repeat("k", 100_000),
 		"empty":                 "",
+		// Postgres stores neither in text. A NUL is one JSON escape away: encoding/json decodes
+		// the escape for U+0000 inside an entity id into this byte without complaint.
+		"a NUL":                "task:\x001-secret",
+		"only a NUL":           "\x00",
+		"a NUL at the end":     "task:12-secret\x00",
+		"invalid UTF-8":        "task:\xff\xfe-secret",
+		"a truncated rune":     "task:12-secret\xc3",
+		"a surrogate, encoded": "task:\xed\xa0\x80-secret",
 	}
-	for name, key := range tooLong {
+	for name, key := range unstorable {
 		err := accept(key)
 		if !errors.Is(err, outbox.ErrBadOrderingKey) {
 			t.Errorf("%s: err = %v, want ErrBadOrderingKey", name, err)
 		}
-		if err != nil && len(key) > 0 && strings.Contains(err.Error(), key[:8]) {
+		if sqlState(err) != "" {
+			t.Errorf("%s: the refusal came from the database (%v), want it made before the database is asked", name, err)
+		}
+		if err != nil && (len(key) >= 8 && strings.Contains(err.Error(), key[:8]) || strings.Contains(err.Error(), "secret")) {
 			t.Errorf("%s: the error quotes the key: %v", name, err)
+		}
+	}
+	// Nothing of the refused deliveries is there, and the queue is as usable as before.
+	var stored int
+	if err := e.adminConn().QueryRow(e.ctx, "SELECT count(*) FROM sluiceway.outbox").Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 1 {
+		t.Errorf("%d rows stored, want only the one key that was accepted", stored)
+	}
+	// What is merely unusual is a key like any other: valid UTF-8 of any script, and control
+	// characters other than NUL.
+	for name, key := range map[string]string{
+		"four-byte runes":   "task:\U0001F600\U0001F600",
+		"a control byte":    "task:\x01\x1f\x7f",
+		"U+FFFD, as itself": "task:\uFFFD",
+	} {
+		if err := accept(key); err != nil {
+			t.Errorf("%s: %v, want accepted", name, err)
 		}
 	}
 	if err := accept(strings.Repeat("é", outbox.MaxOrderingKeyLen/2)); err != nil {
@@ -463,6 +513,10 @@ func TestAnErrorIsNotALostLease(t *testing.T) {
 	if _, _, err := e.ob.Accept(cancelled, tenantA, outbox.Delivery{Provider: "fake", OrderingKey: "k", RawBody: []byte("x")}); err == nil {
 		t.Error("Accept with a cancelled context: no error")
 	}
+	// "Nothing is stranded" is an answer too, and a failure must not read as that one.
+	if got, err := e.ob.StrandedKeys(cancelled, tenantA, 10); err == nil {
+		t.Errorf("StrandedKeys with a cancelled context = %q and no error", got)
+	}
 	if _, err := e.ob.Get(cancelled, tenantA, v1); err == nil || errors.Is(err, outbox.ErrNotFound) {
 		t.Errorf("Get with a cancelled context: err = %v, want an error that is not ErrNotFound", err)
 	}
@@ -590,6 +644,147 @@ func TestGetIsTenantScoped(t *testing.T) {
 	id := e.accept(tenantA, "task:1", 1)
 	if _, err := e.ob.Get(e.ctx, tenantB, id); !errors.Is(err, outbox.ErrNotFound) {
 		t.Errorf("another tenant's Get: err = %v, want ErrNotFound", err)
+	}
+}
+
+// repairKey is the repair statement of ADR 10, as written there: under the key's lock, hand the
+// marker to the earliest unfinished row. Where the key has a head already it changes nothing, or is
+// refused by the unique index if that head is not the earliest row.
+const repairKey = `
+	BEGIN;
+	SELECT pg_advisory_xact_lock(hashtextextended('%[1]s' || chr(31) || '%[2]s', 0));
+	UPDATE sluiceway.outbox SET is_head = true
+	 WHERE id = (SELECT id FROM sluiceway.outbox
+	              WHERE tenant_id = '%[1]s' AND ordering_key = '%[2]s' AND state IN ('pending', 'prepared')
+	              ORDER BY seq LIMIT 1);
+	COMMIT;`
+
+// TestStrandedKeysFindsAKeyWithWorkAndNoHead: a key whose unfinished rows have no head among them
+// is never claimed and never fails, so the only way to learn of it is to look. The keys here are
+// broken on purpose, by the superuser and behind the package's back, which is the way it happens.
+func TestStrandedKeysFindsAKeyWithWorkAndNoHead(t *testing.T) {
+	e := setup(t)
+	stranded := func(tenant tenancy.ID, limit int) []string {
+		t.Helper()
+		got, err := e.ob.StrandedKeys(e.ctx, tenant, limit)
+		if err != nil {
+			t.Fatalf("StrandedKeys(%s): %v", tenant, err)
+		}
+		return got
+	}
+
+	// Everything a healthy queue contains, none of which is stranded: a head with rows behind it,
+	// a head in flight, a head backing off, a key with nothing left, a dead letter, and a row
+	// replayed behind a newer version.
+	first := map[string]string{"healthy:queue": e.accept(tenantA, "healthy:queue", 1)}
+	second := map[string]string{"healthy:queue": e.accept(tenantA, "healthy:queue", 2)}
+	e.accept(tenantA, "healthy:queue", 3)
+	done := e.accept(tenantA, "healthy:done", 1)
+	dead := e.accept(tenantA, "healthy:dead", 1)
+	e.accept(tenantA, "healthy:dead", 2)
+	backoff := e.accept(tenantA, "healthy:backoff", 1)
+	e.accept(tenantA, "healthy:backoff", 2)
+	for _, c := range e.claim() {
+		var err error
+		switch c.ID() {
+		case done:
+			err = e.ob.MarkDelivered(e.ctx, c)
+		case dead:
+			err = e.ob.MarkDead(e.ctx, c, badShape)
+		case backoff:
+			err = e.ob.Fail(e.ctx, c, outbox.Ladder{time.Hour}, sink503)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.ob.Replay(e.ctx, tenantA, dead); err != nil {
+		t.Fatal(err)
+	}
+	if got := stranded(tenantA, 10); len(got) != 0 {
+		t.Fatalf("StrandedKeys of a healthy queue = %q, want none", got)
+	}
+
+	// Three broken keys of tenant A, and one of tenant B under a name tenant A also has.
+	for _, key := range []string{"lost:b", "lost:a", "lost:c"} {
+		first[key] = e.accept(tenantA, key, 1)
+		second[key] = e.accept(tenantA, key, 2)
+		e.admin("UPDATE sluiceway.outbox SET is_head = false WHERE id = '" + first[key] + "'")
+	}
+	e.accept(tenantA, "theirs", 1) // healthy for A
+	e.admin("UPDATE sluiceway.outbox SET is_head = false WHERE id = '" + e.accept(tenantB, "theirs", 1) + "'")
+
+	if got, want := stranded(tenantA, 10), []string{"lost:a", "lost:b", "lost:c"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("StrandedKeys(tenant A) = %q, want %q: each key once, in key order", got, want)
+	}
+	if got, want := stranded(tenantB, 10), []string{"theirs"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("StrandedKeys(tenant B) = %q, want %q", got, want)
+	}
+	if got, want := stranded(tenantA, 2), []string{"lost:a", "lost:b"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("StrandedKeys with a limit of 2 = %q, want %q", got, want)
+	}
+	for _, limit := range []int{0, -1} {
+		if got, err := e.ob.StrandedKeys(e.ctx, tenantA, limit); err == nil {
+			t.Errorf("StrandedKeys with a limit of %d = %q, want it refused", limit, got)
+		}
+	}
+
+	// However many there are and whatever is asked for, one call returns at most MaxBatch.
+	const tenantC = tenancy.ID("tenant_c")
+	e.admin(fmt.Sprintf(`
+		INSERT INTO sluiceway.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body)
+		SELECT 's' || g, '%s', 'fake', 's' || g, 'stranded:' || g, ''
+		  FROM generate_series(1, %d) g`, tenantC, outbox.MaxBatch+5))
+	if got := stranded(tenantC, 5*outbox.MaxBatch); len(got) != outbox.MaxBatch {
+		t.Errorf("StrandedKeys with a limit of %d returned %d keys, want MaxBatch = %d", 5*outbox.MaxBatch, len(got), outbox.MaxBatch)
+	}
+
+	// The documented repair makes a key deliverable again, in queue order, and takes it off the list.
+	e.admin(fmt.Sprintf(repairKey, tenantA, "lost:a"))
+	if got, want := stranded(tenantA, 10), []string{"lost:b", "lost:c"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("after the repair of lost:a, StrandedKeys = %q, want %q", got, want)
+	}
+	// Run on a key that was never broken, it changes nothing.
+	e.admin(fmt.Sprintf(repairKey, tenantA, "healthy:queue"))
+	for _, key := range []string{"lost:a", "healthy:queue"} {
+		if !e.isHead(first[key]) || e.isHead(second[key]) {
+			t.Errorf("%s after the repair: the first row is a head = %v, the second = %v, want the first and only the first",
+				key, e.isHead(first[key]), e.isHead(second[key]))
+		}
+	}
+	// And the repaired key delivers, in queue order. (This claim also leases the other heads that
+	// are due, so the one after it can only return what the delivery below makes claimable.)
+	var claimed []string
+	for _, c := range e.claim() {
+		if c.ID() == first["lost:a"] {
+			if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
+				t.Fatal(err)
+			}
+		}
+		claimed = append(claimed, c.ID())
+	}
+	if !slices.Contains(claimed, first["lost:a"]) || slices.Contains(claimed, second["lost:a"]) {
+		t.Errorf("Claim = %v, want the first row of the repaired key (%s) and not the second", claimed, first["lost:a"])
+	}
+	if got := claimedIDs(e.claim()); !reflect.DeepEqual(got, []string{second["lost:a"]}) {
+		t.Errorf("Claim after the first row was delivered = %v, want the second row (%s)", got, second["lost:a"])
+	}
+}
+
+// TestAnIDNoRowCanHaveIsNotFound: an id reaches Get and Replay from whoever operates the dead
+// letters. One that Postgres cannot even compare with (a NUL, invalid UTF-8) names no row, and the
+// answer to that is ErrNotFound, not the database's complaint about a byte sequence, which a caller
+// would have to take for an outage.
+func TestAnIDNoRowCanHaveIsNotFound(t *testing.T) {
+	e := setup(t)
+	id := e.accept(tenantA, "task:1", 1)
+	for name, bad := range map[string]string{"a NUL": id + "\x00", "invalid UTF-8": id + "\xff"} {
+		if _, err := e.ob.Get(e.ctx, tenantA, bad); !errors.Is(err, outbox.ErrNotFound) {
+			t.Errorf("Get of an id with %s: err = %v, want ErrNotFound", name, err)
+		}
+		if err := e.ob.Replay(e.ctx, tenantA, bad); !errors.Is(err, outbox.ErrNotFound) {
+			t.Errorf("Replay of an id with %s: err = %v, want ErrNotFound", name, err)
+		}
 	}
 }
 

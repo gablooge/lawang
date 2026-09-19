@@ -139,6 +139,13 @@ row (`SKIP LOCKED`), so nothing can deadlock on it. The price is that finishing 
 an accept of the same entity that is still open, which is one more reason to keep accepting
 transactions short.
 
+Waiting is only half of it: the writer that waited must also see what the one before it
+committed, and it does because its next statement takes a new snapshot. That is READ COMMITTED.
+Under REPEATABLE READ the same writers wait and then decide on a snapshot from before the wait,
+and version 2 is stranded exactly as above, silently. So the store begins every transaction
+`ISOLATION LEVEL READ COMMITTED` by name, and a `default_transaction_isolation` set on the server,
+the database or the role cannot change it (ADR 10).
+
 **Replay goes to the back.** Replaying a dead letter gives the row a fresh `seq`, under the same
 lock, as if it had just been accepted, and like an accepted row it is the head only if its entity
 has nothing unfinished. While it was dead, newer versions of its entity were free to move, and one
@@ -465,8 +472,9 @@ The worker runs each concern as its own goroutine under one cancellable context:
   so more pollers do not mean more scanning of the same waiting rows, and an idle poll is a few
   pages. What does not scale with replicas is one entity: its versions deliver one at a time by
   design, so a single hot entity drains at the speed of one worker. The one standing cost is
-  Postgres housekeeping: every lease and every retry leaves a dead entry at the front of the
-  index the claim walks, about one page per 260 of them, until autovacuum removes them. A
+  Postgres housekeeping: every lease, retry and finish leaves a dead entry at the front of the
+  index the claim walks, until autovacuum removes them. Measured, that is 9 to 11 more pages per
+  poll for every 1,000 rows delivered since the last vacuum (ADR 10). A
   long-running transaction anywhere in the database holds that cleanup back, which is one more
   reason for principle 6.
 - **Sweeps** (renewal, reconcile, access sync, retention, dead-letter re-resolution): each on its

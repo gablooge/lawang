@@ -66,10 +66,19 @@ var ErrLeaseLost = errors.New("outbox: lease lost")
 // ErrNotFound reports a row that does not exist for this tenant.
 var ErrNotFound = errors.New("outbox: not found")
 
-// ErrBadOrderingKey reports a delivery whose ordering key is empty or longer than
-// MaxOrderingKeyLen. It can never be stored, however often it is sent again, so a caller that
-// answers a provider must treat it as poison (park it, answer 2xx) and not as a failure to retry.
-var ErrBadOrderingKey = errors.New("outbox: ordering key must be 1 to 512 bytes")
+// ErrBadOrderingKey reports a delivery whose ordering key is not 1 to MaxOrderingKeyLen bytes of
+// valid UTF-8 with no NUL byte. (Postgres stores neither a NUL nor invalid UTF-8 in text, and a NUL
+// is one JSON escape away from any sender: encoding/json decodes the escape for U+0000 inside an
+// entity id into that byte.) Such a key can never be stored, however often it is sent again, so a
+// caller that answers a provider must treat it as poison (park it, answer 2xx) and not as a
+// failure to retry.
+var ErrBadOrderingKey = errors.New("outbox: ordering key must be 1 to 512 bytes of valid UTF-8 with no NUL")
+
+// errBadProvider is deliberately not exported: the provider is the connector's own name for
+// itself, a constant of this program and nothing a sender chooses, so a bad one is a bug to fix
+// and not a case for a caller to handle. It is still refused here, by name, because the
+// alternative is the database's "invalid byte sequence", which names nothing.
+var errBadProvider = errors.New("outbox: provider must be valid UTF-8 with no NUL")
 
 // Outbox reads and writes the outbox table.
 type Outbox struct {
@@ -134,13 +143,17 @@ func (o *Outbox) Accept(ctx context.Context, tenant tenancy.ID, d Delivery) (id 
 
 // acceptIn is Accept inside a transaction already bound to tenant.
 func acceptIn(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, d Delivery) (id string, fresh bool, err error) {
-	if d.OrderingKey == "" || len(d.OrderingKey) > MaxOrderingKeyLen {
-		// The length is reported, the key is not: it is derived from what a sender sent.
-		return "", false, fmt.Errorf("%w, got %d", ErrBadOrderingKey, len(d.OrderingKey))
+	if d.OrderingKey == "" || len(d.OrderingKey) > MaxOrderingKeyLen || !storable(d.OrderingKey) {
+		// The length is reported, the key is not, and neither is the byte that is wrong with it:
+		// all of it is derived from what a sender sent.
+		return "", false, fmt.Errorf("%w, got %d bytes", ErrBadOrderingKey, len(d.OrderingKey))
 	}
-	deliveryID, err := ids.DeliveryID(d.Provider, d.RawBody)
+	deliveryID, err := ids.DeliveryID(d.Provider, d.RawBody) // refuses an empty provider
 	if err != nil {
 		return "", false, err
+	}
+	if !storable(d.Provider) {
+		return "", false, errBadProvider
 	}
 	q := outboxdb.New(tx)
 	// Before the INSERT, which assigns seq and decides whether the row is the head of its key, and
@@ -207,6 +220,9 @@ func (o *Outbox) Claim(ctx context.Context, batch int, lease time.Duration) ([]C
 
 // Get returns a row as its tenant sees it.
 func (o *Outbox) Get(ctx context.Context, tenant tenancy.ID, id string) (Row, error) {
+	if !storable(id) {
+		return Row{}, ErrNotFound // no row has such an id, and the database would not say so
+	}
 	var row Row
 	err := o.db.TenantTx(ctx, tenant, func(tx pgx.Tx) (err error) {
 		row, err = outboxdb.New(tx).Get(ctx, id)
@@ -307,6 +323,9 @@ func (o *Outbox) markDead(ctx context.Context, c Claimed, reason string, cause C
 // delivered after every version accepted before the replay, as a late arrival of an old version.
 // A row that died after it was prepared comes back prepared, and is not prepared again.
 func (o *Outbox) Replay(ctx context.Context, tenant tenancy.ID, id string) error {
+	if !storable(id) {
+		return ErrNotFound // as in Get
+	}
 	var n int64
 	err := o.db.TenantTx(ctx, tenant, func(tx pgx.Tx) (err error) {
 		q := outboxdb.New(tx)
@@ -325,6 +344,38 @@ func (o *Outbox) Replay(ctx context.Context, tenant tenancy.ID, id string) error
 		return ErrNotFound
 	}
 	return nil
+}
+
+// StrandedKeys returns ordering keys of the tenant that have unfinished rows and no head, in key
+// order, at most limit of them and never more than MaxBatch. A limit that is not positive is
+// refused. An empty result is the healthy state.
+//
+// A stranded key is the one way the head marker can be broken without anybody noticing: nothing
+// of the key is ever claimed again, and no error is raised anywhere. No writer of this package
+// leaves a key like that (docs/adr/0010-outbox-head-marker.md has the argument, and the statement
+// that repairs one), so a key returned here was written behind the package's back, or by a bug.
+// This is detection only, for a sweep or an operator: nothing in the delivery path calls it. It
+// costs the tenant's unfinished rows, not the size of the table (tens of milliseconds for a
+// backlog of 100,000), so it is for a sweep that runs now and then, not for every poll.
+//
+// It is scoped to a tenant because it needs the state and the ordering key of a row, which only
+// the row's tenant may read. The worker role, which sees across tenants, sees neither.
+func (o *Outbox) StrandedKeys(ctx context.Context, tenant tenancy.ID, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, errors.New("outbox: stranded keys needs a positive limit")
+	}
+	var keys []string
+	err := o.db.TenantTx(ctx, tenant, func(tx pgx.Tx) (err error) {
+		keys, err = outboxdb.New(tx).StrandedKeys(ctx, outboxdb.StrandedKeysParams{
+			TenantID: tenant.String(),
+			MaxKeys:  int32(min(limit, MaxBatch)), //nolint:gosec // bounded just here
+		})
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("outbox: stranded keys: %w", err)
+	}
+	return keys, nil
 }
 
 // transition runs one lease-guarded state change bound to the row's own tenant. change returns
@@ -351,6 +402,13 @@ func held(rows int64, err error) error {
 		return ErrLeaseLost
 	}
 	return err
+}
+
+// storable reports whether Postgres takes s as a text value at all: it refuses a NUL byte and
+// anything that is not valid UTF-8 with SQLSTATE 22021, which a caller cannot tell from an outage.
+// Every text that reaches a statement from outside this package is asked this first.
+func storable(s string) bool {
+	return utf8.ValidString(s) && strings.IndexByte(s, 0) < 0
 }
 
 // clip makes s storable and bounded: valid UTF-8 with no NUL (Postgres rejects both in text, and a

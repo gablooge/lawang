@@ -27,6 +27,13 @@ import (
 // The choices (which key, deliver or dead-letter) come from a seed, logged so that a failure can be
 // run again with OUTBOX_STRESS_SEED. The scheduling of goroutines is not reproducible, the mix is.
 // A run that stops making progress fails within seconds instead of hanging.
+//
+// What it is NOT a test of: the claim's re-checks on the row it has locked. The window between a
+// claim's snapshot and its row lock is too short for random load to hit. With the is_head re-check
+// taken out, this test passed 10 runs of 10 in review, and a missing lock in the finishers gets
+// past it about every second run. Those properties belong to the TestClaimRechecks... tests and
+// the three lost-promotion tests in interleaving_test.go, which hold a transaction at the exact
+// point. This one is for what nobody thought of.
 func TestStressOrderingUnderRandomLoad(t *testing.T) {
 	const (
 		acceptors    = 6

@@ -204,8 +204,11 @@ type LockOrderingKeyParams struct {
 // never be claimable. With the lock, one of them runs entirely after the other has committed.
 //
 // It must be its own statement, before the one that reads or writes the key's rows: under READ
-// COMMITTED the next statement's snapshot is then taken after the previous holder committed. Two
-// keys that hash alike only wait for each other, which is harmless. The claim never takes it.
+// COMMITTED the next statement's snapshot is then taken after the previous holder committed. Under
+// any other level it is not (the snapshot is the transaction's, from before the wait), and the two
+// miss each other just the same. store begins every transaction READ COMMITTED by name for that
+// reason, whatever default_transaction_isolation says. Two keys that hash alike only wait for each
+// other, which is harmless. The claim never takes it.
 func (q *Queries) LockOrderingKey(ctx context.Context, arg LockOrderingKeyParams) error {
 	_, err := q.db.Exec(ctx, lockOrderingKey, arg.TenantID, arg.OrderingKey)
 	return err
@@ -386,4 +389,63 @@ func (q *Queries) Retry(ctx context.Context, arg RetryParams) (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const strandedKeys = `-- name: StrandedKeys :many
+SELECT u.ordering_key
+  FROM outbox u
+ WHERE u.tenant_id = $1::text
+   AND u.state IN ('pending', 'prepared')
+   AND NOT u.is_head
+   AND NOT EXISTS (
+         SELECT 1
+           FROM outbox h
+          WHERE h.tenant_id = u.tenant_id
+            AND h.ordering_key = u.ordering_key
+            AND h.is_head
+       )
+ GROUP BY u.ordering_key
+ ORDER BY u.ordering_key
+ LIMIT $2
+`
+
+type StrandedKeysParams struct {
+	TenantID string
+	MaxKeys  int32
+}
+
+// Detection, not part of any delivery path. The ordering keys of one tenant that have unfinished
+// rows and NO head: the one broken state that is silent, because nothing of such a key is ever
+// claimed and nothing fails. (The other ways to break the marker are refused by the table: two
+// heads, and a finished head.) This package never produces it. A writer that does not come through
+// this package can, and so could a bug in a later change. The repair is in ADR 10.
+//
+// Runs bound to the tenant, as the application role. It cannot run as the worker role, which
+// deliberately reads neither the state nor the ordering key of a row.
+//
+// It reads the tenant's unfinished rows from outbox_unfinished, in key order, and for each that is
+// not a head asks outbox_one_head whether the key has one. So it costs the tenant's backlog, not
+// the table, and never touches the delivered history. Measured on 4,000,000 rows: 36 ms and 67,631
+// buffers for a tenant with 99,100 unfinished rows, 90,000 of them behind 20 heads, and 2 ms for a
+// tenant with 9,100. One statement is one snapshot, and every writer of this package leaves the
+// invariant intact when it commits, so a key reported here is broken, not merely in the middle of
+// being written.
+func (q *Queries) StrandedKeys(ctx context.Context, arg StrandedKeysParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, strandedKeys, arg.TenantID, arg.MaxKeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var ordering_key string
+		if err := rows.Scan(&ordering_key); err != nil {
+			return nil, err
+		}
+		items = append(items, ordering_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
