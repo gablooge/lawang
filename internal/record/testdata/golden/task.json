@@ -1,0 +1,33 @@
+{
+  "format": "sluiceway.record/v1",
+  "id": "rec_ade6db19830dea60fd33576483b7f15a",
+  "op": "upsert",
+  "source": "clickup",
+  "kind": "task",
+  "external_id": "clickup:task:86a1xyz",
+  "version": "1752064245000",
+  "supersedes": null,
+  "occurred_at": "2026-07-09T12:30:45Z",
+  "title": "Ship the \u003crecord\u003e format \u0026 schema",
+  "text": "Acceptance:\n\t1. the schema validates the example\n\t2. \"quotes\" and a \\ survive",
+  "author": {
+    "id": "8812",
+    "display": "Ben"
+  },
+  "container": {
+    "kind": "list",
+    "id": "901100"
+  },
+  "visibility": {
+    "scope": "clickup:list:901100",
+    "audience": "group"
+  },
+  "origin": {
+    "automation": false,
+    "untrusted": false
+  },
+  "edges": {
+    "reply_parent": null
+  },
+  "meta": {}
+}

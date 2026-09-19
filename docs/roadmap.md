@@ -150,7 +150,8 @@ What carries over, what changes, and what is intentionally left behind.
 Roughly in priority order.
 
 - **Deletions.** Providers that report deletes, and reconciliation that notices absences, emit
-  `op: "delete"` records. The format already reserves the field.
+  `op: "delete"` records. Format v1 already defines them, so shipping this does not change the
+  format ([ADR 4](adr/0004-record-format-v1.md)).
 - **Untrusted-origin marking** populated per provider (inbound mail, external guests). The format
   already carries `origin.untrusted`.
 - **An MCP-backed hydrator** and a tool-calling facade for acting on providers.
@@ -169,8 +170,8 @@ Each becomes a short decision record under `docs/adr/` when it is settled.
 |---|---|---|---|
 | 1 | Typed queries with `sqlc`, or hand-written pgx | **settled:** `sqlc`, see [ADR 1](adr/0001-queries-sqlc.md) | Most bugs in the predecessor's data layer were query-shape mistakes a generator catches at build time |
 | 2 | Migration tool | **settled:** `goose`, embedded, see [ADR 2](adr/0002-migrations-goose.md) | Plain SQL files, runs inside the binary, no separate install |
-| 3 | Scope id format | `{source}:{container_kind}:{container_id}` | Readable and deterministic; the tenant travels separately |
-| 4 | Final field names in the record format | the proposal in architecture section 6 | This is a public contract once v0.1 ships, so it should settle before M1 finishes |
+| 3 | Scope id format | **settled:** `{provider}:{container_kind}:{container_id}` with the internal provider key, a percent-escaped container id and one canonical spelling, see [ADR 3](adr/0003-scope-id-format.md) | Readable and deterministic; the tenant travels separately. It is the join key between a record and the membership of its scope |
+| 4 | Final field names in the record format | **settled:** format v1, see [ADR 4](adr/0004-record-format-v1.md). The proposal's names are kept, a `format` version field is added, `meta.raw_ref` is dropped, and the scope is hashed into the record id | This is a public contract once v0.1 ships, so it should settle before M1 finishes |
 | 5 | Default hydration path | direct API clients | Three of five providers needed them anyway |
 | 6 | One binary with modes, or two binaries | one binary | Simpler releases; roles are just subcommands |
 | 7 | Vault encryption key source | environment master key for v0.1, a KMS interface later | Keeps the local setup dependency-free |

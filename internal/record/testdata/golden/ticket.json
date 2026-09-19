@@ -1,0 +1,33 @@
+{
+  "format": "sluiceway.record/v1",
+  "id": "rec_1f49e22f5d0dcc80d12e63805abd4667",
+  "op": "upsert",
+  "source": "hubspot",
+  "kind": "ticket",
+  "external_id": "hubspot:ticket:4417",
+  "version": "2026-07-09T12:30:45.120Z",
+  "supersedes": "rec_0123456789abcdef0123456789abcdef",
+  "occurred_at": "2026-07-09T12:30:45.12Z",
+  "title": "Cannot log in",
+  "text": "",
+  "author": {
+    "id": "",
+    "display": ""
+  },
+  "container": {
+    "kind": "portal",
+    "id": "62515"
+  },
+  "visibility": {
+    "scope": "hubspot:portal:62515",
+    "audience": "group"
+  },
+  "origin": {
+    "automation": false,
+    "untrusted": true
+  },
+  "edges": {
+    "reply_parent": null
+  },
+  "meta": {}
+}

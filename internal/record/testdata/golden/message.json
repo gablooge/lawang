@@ -1,0 +1,35 @@
+{
+  "format": "sluiceway.record/v1",
+  "id": "rec_c98df8eaa3bcd04d1651bdb0e1c8e981",
+  "op": "upsert",
+  "source": "clickup",
+  "kind": "message",
+  "external_id": "clickup:comment:90110012",
+  "version": "1752064300123",
+  "supersedes": null,
+  "occurred_at": "2026-07-09T12:31:40.123Z",
+  "title": "",
+  "text": "Done, see [EMAIL]",
+  "author": {
+    "id": "8813",
+    "display": "Ana"
+  },
+  "container": {
+    "kind": "task",
+    "id": "86a1xyz"
+  },
+  "visibility": {
+    "scope": "clickup:list:901100",
+    "audience": "group"
+  },
+  "origin": {
+    "automation": true,
+    "untrusted": false
+  },
+  "edges": {
+    "reply_parent": "clickup:task:86a1xyz"
+  },
+  "meta": {
+    "delivery": "01JZXA8Q2K4M7N9P0R3S5T6V8W"
+  }
+}

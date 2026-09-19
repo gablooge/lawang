@@ -1,0 +1,33 @@
+{
+  "format": "sluiceway.record/v1",
+  "id": "rec_d146d809087301939390dde1e81a3cb5",
+  "op": "delete",
+  "source": "clickup",
+  "kind": "task",
+  "external_id": "clickup:task:86a1xyz",
+  "version": "deleted:1752070000000",
+  "supersedes": "rec_ade6db19830dea60fd33576483b7f15a",
+  "occurred_at": "2026-07-09T14:06:40Z",
+  "title": "",
+  "text": "",
+  "author": {
+    "id": "",
+    "display": ""
+  },
+  "container": {
+    "kind": "list",
+    "id": "901100"
+  },
+  "visibility": {
+    "scope": "clickup:list:901100",
+    "audience": "group"
+  },
+  "origin": {
+    "automation": false,
+    "untrusted": false
+  },
+  "edges": {
+    "reply_parent": null
+  },
+  "meta": {}
+}

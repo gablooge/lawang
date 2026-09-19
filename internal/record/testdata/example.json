@@ -1,0 +1,19 @@
+{
+  "format": "sluiceway.record/v1",
+  "id": "rec_bb4dc9bd2347887adae051e72346bec6",
+  "op": "upsert",
+  "source": "slack",
+  "kind": "message",
+  "external_id": "slack:C0GENERAL:1752064245.000200",
+  "version": "1752064245.000200",
+  "supersedes": null,
+  "occurred_at": "2026-07-09T12:30:45Z",
+  "title": "",
+  "text": "Numbers are in, call me at [PHONE]",
+  "author": { "id": "U0BEN", "display": "ben" },
+  "container": { "kind": "channel", "id": "C0GENERAL" },
+  "visibility": { "scope": "slack:channel:C0GENERAL", "audience": "group" },
+  "origin": { "automation": false, "untrusted": false },
+  "edges": { "reply_parent": null },
+  "meta": { "delivery": "01JZXA8Q2K4M7N9P0R3S5T6V8W" }
+}

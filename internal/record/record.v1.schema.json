@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gablooge.github.io/sluiceway/schema/record/v1.json",
+  "title": "Sluiceway record, format v1",
+  "description": "The envelope a Sluiceway sink receives. One record is one version of one entity (a message, a task, a document) in one scope. Reading rules for a sink: check that format is exactly 'sluiceway.record/v1' and refuse anything else; be idempotent on id; decide access on visibility.scope and on nothing else (a person may see a record if they are a member of its scope, for the tenant the record was delivered for); compare id, external_id, version and visibility.scope for equality only, never parse them; ignore fields you do not know, except inside visibility, where an unknown field is a reason to refuse the record. See docs/adr/0003-scope-id-format.md and docs/adr/0004-record-format-v1.md.",
+  "$comment": "Two things here are deliberate. (1) Every anchored pattern has a companion that does not depend on the anchor: either a fixed length or a 'not' with an unanchored character class. In some regular expression dialects (Python's, for one) '$' also matches before a trailing newline, so an anchored pattern alone would accept 'rec_...\\n' in a validator built on them. (2) 'format: date-time' is an annotation unless the validator is told to assert formats, so occurred_at carries a pattern as well. The pattern cannot know the length of a month: assert formats if your validator can.",
+  "type": "object",
+  "propertyNames": { "$ref": "#/$defs/fieldName" },
+  "required": [
+    "format",
+    "id",
+    "op",
+    "source",
+    "kind",
+    "external_id",
+    "version",
+    "supersedes",
+    "occurred_at",
+    "title",
+    "text",
+    "author",
+    "container",
+    "visibility",
+    "origin",
+    "edges"
+  ],
+  "properties": {
+    "format": {
+      "description": "The format version. Fields a reader may ignore can be added within v1. Anything else (a field removed or renamed, a changed meaning, a new value of op, kind or visibility.audience, any change inside visibility) is a new format with a new value here.",
+      "const": "sluiceway.record/v1"
+    },
+    "id": {
+      "description": "The idempotency key: one id is one version of one entity in one scope, for one tenant. A sink that receives an id it already holds has received a repeat. Opaque.",
+      "$ref": "#/$defs/recordId"
+    },
+    "op": {
+      "description": "upsert: store this version, replacing the one named by supersedes if there is one. delete: a tombstone, the entity is gone and every stored version of external_id goes with it; title and text are empty. Sluiceway v0.1 never sends delete. A sink that cannot honour a delete refuses the record, it never ignores it.",
+      "enum": ["upsert", "delete"]
+    },
+    "source": {
+      "description": "The name the sink knows this source by. It is sink configuration and may change, so it is for display and filtering. It is not part of any id and need not equal the first segment of visibility.scope.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "not": { "pattern": "[^a-z0-9_-]" }
+    },
+    "kind": {
+      "description": "What the entity is. A closed set.",
+      "enum": ["task", "message", "ticket", "document", "page"]
+    },
+    "external_id": {
+      "description": "The entity's identity at the source, the same for every version of it. Opaque.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "not": { "pattern": "[\\x00-\\x1f\\x7f]" }
+    },
+    "version": {
+      "description": "Which version of the entity this is. Opaque: two records of one external_id are the same version exactly when their version strings are equal, and a sink learns their order from supersedes, never by comparing versions.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "not": { "pattern": "[\\x00-\\x1f\\x7f]" }
+    },
+    "supersedes": {
+      "description": "The id of the record this one replaces, or null. Links point forward only: a version that arrives late never names a newer one. A record that moved to another scope supersedes the record it was in the old scope.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/recordId" }]
+    },
+    "occurred_at": {
+      "description": "When it happened at the source, never when Sluiceway ingested it. RFC 3339, always UTC with the 'Z' suffix, second precision or up to nine fractional digits, years 1000 to 9999, never a leap second.",
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 30,
+      "pattern": "^[1-9][0-9]{3}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]{1,9})?Z$",
+      "not": { "pattern": "[^0-9TZ.:-]" }
+    },
+    "title": {
+      "description": "May be empty. PII-masked like text.",
+      "type": "string",
+      "maxLength": 1024,
+      "not": { "pattern": "\\x00" }
+    },
+    "text": {
+      "description": "The content, already PII-masked. May be empty. Untrusted: it is whatever somebody wrote at the source.",
+      "type": "string",
+      "maxLength": 1048576,
+      "not": { "pattern": "\\x00" }
+    },
+    "author": {
+      "description": "Who wrote it, in the source's own terms. Informational: access is never decided on it.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "required": ["id", "display"],
+      "properties": {
+        "id": {
+          "description": "The source's user id, or empty when unknown.",
+          "type": "string",
+          "maxLength": 256,
+          "not": { "pattern": "[\\x00-\\x1f\\x7f]" }
+        },
+        "display": {
+          "description": "A name to show, or empty when unknown. Not an identifier.",
+          "type": "string",
+          "maxLength": 256,
+          "not": { "pattern": "[\\x00-\\x1f\\x7f]" }
+        }
+      }
+    },
+    "container": {
+      "description": "Where the entity lives at the source (the channel of a message, the task of a comment). Informational: it is often the scope's container too, and need not be.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/containerKind" },
+        "id": {
+          "description": "The source's id of the container, exactly as the source spells it.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "not": { "pattern": "[\\x00-\\x1f\\x7f]" }
+        }
+      }
+    },
+    "visibility": {
+      "description": "Everything access is decided on. Closed: a field a sink does not know here could only be one it must not ignore.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "required": ["scope", "audience"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "description": "The ONE thing access is decided on: a person may see the record if they are a member of this scope. Membership arrives separately, through access sync, under the same scope id. The tenant is not in it: key memberships and records by tenant and scope together.",
+          "$ref": "#/$defs/scopeId"
+        },
+        "audience": {
+          "description": "direct: the scope is a conversation or a mailbox of named participants. group: the scope is a shared space. Informational only. It grants and denies nothing.",
+          "enum": ["direct", "group"]
+        }
+      }
+    },
+    "origin": {
+      "description": "Where the content came from, as far as it bears on how much to trust it.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "required": ["automation", "untrusted"],
+      "properties": {
+        "automation": {
+          "description": "Written by a bot or an integration.",
+          "type": "boolean"
+        },
+        "untrusted": {
+          "description": "Written by somebody outside the tenant (inbound mail, an external guest). Such text may be written to steer an AI agent that reads it.",
+          "type": "boolean"
+        }
+      }
+    },
+    "edges": {
+      "description": "Relations to other entities, taken from fields of the source and never inferred from text.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "required": ["reply_parent"],
+      "properties": {
+        "reply_parent": {
+          "description": "The external_id of the entity this one replies to, or null.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "not": { "pattern": "[\\x00-\\x1f\\x7f]" }
+            }
+          ]
+        }
+      }
+    },
+    "meta": {
+      "description": "Diagnostics. Not part of the record's content: the same id may arrive again with a different meta. May be absent.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "properties": {
+        "delivery": {
+          "description": "Sluiceway's id of the accepted delivery the record was made from, for support. Empty means the same as absent.",
+          "type": "string",
+          "maxLength": 128,
+          "not": { "pattern": "[\\x00-\\x1f\\x7f]" }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "A tombstone carries no content.",
+      "if": { "required": ["op"], "properties": { "op": { "const": "delete" } } },
+      "then": { "properties": { "title": { "const": "" }, "text": { "const": "" } } }
+    }
+  ],
+  "$defs": {
+    "fieldName": {
+      "description": "Every field name of the format, now and later, is lowercase a-z, 0-9 and underscore, and a record with any other field name is refused. Some JSON decoders match names without regard to case (Go's does, and it folds U+212A and U+017F to 'k' and 's' as well), so an 'ID' beside 'id' would be one field to them and two to this schema.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "not": { "pattern": "[^a-z0-9_]" }
+    },
+    "recordId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^rec_[0-9a-f]{32}$"
+    },
+    "containerKind": {
+      "description": "The source's word for a kind of container: channel, list, mailbox, dm. An open set.",
+      "type": "string",
+      "maxLength": 32,
+      "pattern": "^[a-z][a-z0-9_]{0,31}$",
+      "not": { "pattern": "[^a-z0-9_]" }
+    },
+    "scopeId": {
+      "description": "{provider}:{container_kind}:{container_id}. Exactly two colons. The container id keeps A-Z a-z 0-9 . _ ~ - as they are and carries every other byte as %XX with uppercase hex; control bytes are never carried. An escape of a character that needs none is refused, so one scope has exactly one spelling. Case-sensitive, ASCII, at most 512 characters. Opaque to a sink: compare for equality.",
+      "type": "string",
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_]{0,31}:[a-z][a-z0-9_]{0,31}:(?:[A-Za-z0-9._~-]|%(?:2[0-9A-CF]|3[A-F]|40|5[B-E]|60|7[B-D]|[89A-F][0-9A-F]))+$",
+      "not": { "pattern": "[^A-Za-z0-9._~%:-]" }
+    }
+  }
+}

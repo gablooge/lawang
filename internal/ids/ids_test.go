@@ -35,6 +35,7 @@ type goldenRecord struct {
 	Provider   string `json:"provider"`
 	ExternalID string `json:"external_id"`
 	Version    string `json:"version"`
+	Scope      string `json:"scope"`
 	Tenant     string `json:"tenant"`
 	Want       string `json:"want"`
 }
@@ -69,7 +70,7 @@ func TestGolden(t *testing.T) {
 	}
 
 	for i, v := range g.Record {
-		got, err := RecordID(v.Provider, v.ExternalID, v.Version, v.Tenant)
+		got, err := RecordID(v.Provider, v.ExternalID, v.Version, v.Scope, v.Tenant)
 		if err != nil {
 			t.Fatalf("record_id[%d]: %v", i, err)
 		}
@@ -144,16 +145,25 @@ func TestHashIsBLAKE3(t *testing.T) {
 }
 
 func TestSeparatorKeepsPartBoundaries(t *testing.T) {
-	a, err := RecordID("slack", "ab", "c", "tenant_1")
-	if err != nil {
-		t.Fatal(err)
+	// Every boundary between two neighbouring parts, the scope's two included.
+	shifted := [][2][5]string{
+		{{"ab", "c", "v", "s", "t"}, {"a", "bc", "v", "s", "t"}},
+		{{"p", "ab", "c", "s", "t"}, {"p", "a", "bc", "s", "t"}},
+		{{"p", "x", "ab", "c", "t"}, {"p", "x", "a", "bc", "t"}},
+		{{"p", "x", "v", "ab", "c"}, {"p", "x", "v", "a", "bc"}},
 	}
-	b, err := RecordID("slack", "a", "bc", "tenant_1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a == b {
-		t.Errorf(`("ab","c") and ("a","bc") share the id %s`, a)
+	for _, pair := range shifted {
+		a, err := RecordID(pair[0][0], pair[0][1], pair[0][2], pair[0][3], pair[0][4])
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := RecordID(pair[1][0], pair[1][1], pair[1][2], pair[1][3], pair[1][4])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a == b {
+			t.Errorf("%q and %q share the id %s", pair[0], pair[1], a)
+		}
 	}
 
 	d1, _ := DeliveryID("ab", []byte("c"))
@@ -164,11 +174,11 @@ func TestSeparatorKeepsPartBoundaries(t *testing.T) {
 }
 
 func TestTenantSaltsTheRecordID(t *testing.T) {
-	a, err := RecordID("clickup", "task:86a1", "1752064245000", "tenant_a")
+	a, err := RecordID("clickup", "task:86a1", "1752064245000", "clickup:list:901100", "tenant_a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := RecordID("clickup", "task:86a1", "1752064245000", "tenant_b")
+	b, err := RecordID("clickup", "task:86a1", "1752064245000", "clickup:list:901100", "tenant_b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,10 +187,28 @@ func TestTenantSaltsTheRecordID(t *testing.T) {
 	}
 }
 
+// A task moved to another list is decided on another scope. Its provider version may not change
+// with the move, and the record must still be a new one, or the ledger skips it as delivered and
+// the sink keeps the old scope (ADR 4).
+func TestScopeIsPartOfTheRecordID(t *testing.T) {
+	before, err := RecordID("clickup", "task:86a1", "1752064245000", "clickup:list:901100", "tenant_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := RecordID("clickup", "task:86a1", "1752064245000", "clickup:list:901200", "tenant_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Errorf("a move to another scope kept the record id %s", before)
+	}
+}
+
 func TestRecordIDIsDeterministicAndVersioned(t *testing.T) {
-	a, _ := RecordID("slack", "slack:C0GENERAL:1752064245.000200", "1752064245.000200", "tenant_a")
-	b, _ := RecordID("slack", "slack:C0GENERAL:1752064245.000200", "1752064245.000200", "tenant_a")
-	c, _ := RecordID("slack", "slack:C0GENERAL:1752064245.000200", "1752064300.000100", "tenant_a")
+	const scope = "slack:channel:C0GENERAL"
+	a, _ := RecordID("slack", "slack:C0GENERAL:1752064245.000200", "1752064245.000200", scope, "tenant_a")
+	b, _ := RecordID("slack", "slack:C0GENERAL:1752064245.000200", "1752064245.000200", scope, "tenant_a")
+	c, _ := RecordID("slack", "slack:C0GENERAL:1752064245.000200", "1752064300.000100", scope, "tenant_a")
 	if a != b {
 		t.Errorf("same input gave %s and %s", a, b)
 	}
@@ -211,18 +239,20 @@ func TestDeliveryIDHashesTheExactBytes(t *testing.T) {
 func TestBadPartsAreRefused(t *testing.T) {
 	tests := []struct {
 		name  string
-		parts [4]string
+		parts [5]string
 		want  error
 	}{
-		{"empty provider", [4]string{"", "x", "1", "t"}, ErrEmptyPart},
-		{"empty external id", [4]string{"slack", "", "1", "t"}, ErrEmptyPart},
-		{"empty version", [4]string{"slack", "x", "", "t"}, ErrEmptyPart},
-		{"empty tenant", [4]string{"slack", "x", "1", ""}, ErrEmptyPart},
-		{"separator in external id", [4]string{"slack", "a\x1fb", "1", "t"}, ErrSeparatorInPart},
-		{"separator in tenant", [4]string{"slack", "x", "1", "t\x1f"}, ErrSeparatorInPart},
+		{"empty provider", [5]string{"", "x", "1", "s", "t"}, ErrEmptyPart},
+		{"empty external id", [5]string{"slack", "", "1", "s", "t"}, ErrEmptyPart},
+		{"empty version", [5]string{"slack", "x", "", "s", "t"}, ErrEmptyPart},
+		{"empty scope", [5]string{"slack", "x", "1", "", "t"}, ErrEmptyPart},
+		{"empty tenant", [5]string{"slack", "x", "1", "s", ""}, ErrEmptyPart},
+		{"separator in external id", [5]string{"slack", "a\x1fb", "1", "s", "t"}, ErrSeparatorInPart},
+		{"separator in scope", [5]string{"slack", "x", "1", "s\x1f", "t"}, ErrSeparatorInPart},
+		{"separator in tenant", [5]string{"slack", "x", "1", "s", "t\x1f"}, ErrSeparatorInPart},
 	}
 	for _, tt := range tests {
-		got, err := RecordID(tt.parts[0], tt.parts[1], tt.parts[2], tt.parts[3])
+		got, err := RecordID(tt.parts[0], tt.parts[1], tt.parts[2], tt.parts[3], tt.parts[4])
 		if !errors.Is(err, tt.want) {
 			t.Errorf("%s: err = %v, want %v", tt.name, err, tt.want)
 		}
