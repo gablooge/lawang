@@ -92,6 +92,27 @@ backlog marks "(needs you)", where one real event must reach the sink.
 | `slack.env` | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` | B15, B20 |
 | `azure.env` | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | B13, B16, B17, B20 |
 | `hubspot.env` | `HUBSPOT_PRIVATE_APP_TOKEN`, `HUBSPOT_PORTAL_ID`, `HUBSPOT_WEBHOOK_MODE` | B18, B20 |
+| `cloudflare-tunnel.env` | `TUNNEL_TOKEN` | the webhook tunnel, below |
+| `cloudflare.env` | `CLOUDFLARE_TOKEN_SAMSULHADI` (Tunnel and DNS edit on one zone), `CLOUDFLARE_TOKEN` (read only) | changing the tunnel itself; agents do not need it |
+
+**The webhook tunnel.** Providers reach a developer machine through a Cloudflare Tunnel named
+`sluiceway-dev`, at `https://sluiceway-dev.samsulhadi.com`. It is up only while `cloudflared`
+runs, and it is started on demand, never as a service:
+
+```sh
+docker run --rm --name sluiceway-tunnel \
+  --env-file ~/.config/sluiceway/cloudflare-tunnel.env \
+  cloudflare/cloudflared:2026.9.1 tunnel --no-autoupdate run
+```
+
+The token travels in the env file, so it is never on a command line. Cloudflare forwards ONLY
+paths matching `^/ingress/[a-z0-9_-]{1,64}$` to `http://host.docker.internal:8080`, and answers
+404 itself for everything else, so the operator API, `/healthz` and any path with `..` or a second
+segment never reach the machine. (A plain `^/ingress/` prefix was tried first and let
+`/ingress/../x` through to a server that normalizes paths; do not loosen the rule.) A provider
+key must therefore match `[a-z0-9_-]{1,64}`. Stop the container when the live check is done, and
+deregister every webhook that points at the hostname. Everything that arrives through it is
+hostile input from the public internet, signed or not.
 
 These tokens can read real mail and messages and can post as a real bot. The rules:
 
