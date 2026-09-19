@@ -337,6 +337,7 @@ Built-in implementations planned for v0.1:
 ```text
 cmd/sluiceway/        main: serve | worker | migrate | connect | reconcile | version
 internal/
+  appversion/         the release version set by the linker, or the VCS revision of a dev build
   config/             environment config, fail-closed defaults
   ids/                ULIDs and the blake3 key recipes, golden-tested
   tenancy/            tenant context and RLS binding
