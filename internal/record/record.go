@@ -179,6 +179,11 @@ func (r Record) currentSeal() seal {
 // under tenant B, and neither MarshalJSON nor any sink can notice. That stage can: it calls
 // SealedFor with the tenant it is about to deliver under, and treats false as a refusal.
 //
+// A consequence to know about: a sealed Record and the same record decoded from its own document
+// are not equal under == or reflect.DeepEqual, because only the sealed one knows its tenant,
+// although they marshal to identical bytes. Compare documents, or compare field by field. Never
+// compare Record values.
+//
 // It fails closed. It is false for a record that was decoded and not sealed here (a document
 // does not say whose it is), for the zero Record, for an empty tenant, and for a record whose
 // ID, ExternalID, Version, Visibility.Scope, Op or Kind was changed after Seal.

@@ -108,6 +108,16 @@ func TestSealedForIsTrueOnlyForTheTenantOfTheSeal(t *testing.T) {
 	if r.SealedFor(otherTenant) {
 		t.Error("a record sealed for tenant_a is sealed for tenant_b")
 	}
+	// Tenant ids are case sensitive, in tenancy.Parse and in the tenant_id domain alike, so an id
+	// that differs only in case names another tenant.
+	for _, near := range []tenancy.ID{"Tenant_A", "TENANT_A", "tenant_A"} {
+		if near == testTenant {
+			t.Fatalf("the test tenant changed, %q no longer differs from it only in case", near)
+		}
+		if r.SealedFor(near) {
+			t.Errorf("a record sealed for %q is sealed for %q, which is another tenant", testTenant, near)
+		}
+	}
 	// The case the check exists for: nothing else notices.
 	if _, err := json.Marshal(r); err != nil {
 		t.Errorf("Marshal cannot see the tenant, and refused: %v", err)
