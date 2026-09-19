@@ -92,7 +92,8 @@ func TestRunRefusesExtraArguments(t *testing.T) {
 		{[]string{"serve", "--listen", ":9090"}, "serve takes no arguments"},
 		{[]string{"worker", extra}, "worker takes no arguments"},
 		// A command that grows a subcommand keeps its row and changes only what it says.
-		{[]string{"migrate", extra}, "migrate takes no arguments"},
+		{[]string{"migrate", extra}, "usage: sluiceway migrate [bootstrap]"},
+		{[]string{"migrate", "bootstrap", extra}, "usage: sluiceway migrate [bootstrap]"},
 		{[]string{"version", extra}, "version takes no arguments"},
 		{[]string{"help", extra}, "help takes no arguments"},
 		{[]string{"-h", extra}, "-h takes no arguments"},
