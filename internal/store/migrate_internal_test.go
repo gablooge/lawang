@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/gablooge/sluiceway/internal/testdb"
+	"github.com/gablooge/lawang/internal/testdb"
 )
 
 // TestMigrationsGoDownToZeroAndUpAgain runs every Down section, as the application role, on a
@@ -68,11 +68,11 @@ func TestMigrationsGoDownToZeroAndUpAgain(t *testing.T) {
 			t.Errorf("after down to zero the schema still holds %v", left)
 		}
 		var helperCanUseSchema bool
-		if err := tx.QueryRow(ctx, "SELECT has_schema_privilege('sluiceway_worker', $1, 'USAGE')", Schema).Scan(&helperCanUseSchema); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT has_schema_privilege('lawang_worker', $1, 'USAGE')", Schema).Scan(&helperCanUseSchema); err != nil {
 			return err
 		}
 		if helperCanUseSchema {
-			t.Error("after down to zero sluiceway_worker still has USAGE on the schema")
+			t.Error("after down to zero lawang_worker still has USAGE on the schema")
 		}
 		return nil
 	})

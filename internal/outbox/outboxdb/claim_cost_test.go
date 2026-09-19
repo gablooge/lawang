@@ -13,9 +13,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/gablooge/sluiceway/internal/outbox/outboxdb"
-	"github.com/gablooge/sluiceway/internal/store"
-	"github.com/gablooge/sluiceway/internal/testdb"
+	"github.com/gablooge/lawang/internal/outbox/outboxdb"
+	"github.com/gablooge/lawang/internal/store"
+	"github.com/gablooge/lawang/internal/testdb"
 )
 
 // The backlog the guard builds. It is large enough to tell a claim that costs what it returns from
@@ -136,17 +136,17 @@ func TestClaimCostFollowsTheBatchNotTheBacklog(t *testing.T) {
 
 	// Bulk inserts as the superuser: 225,000 rows in a few seconds. The hot keys go in version by
 	// version, so that version 1 of each has the lowest seq and is the head.
-	sql(`INSERT INTO sluiceway.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body, state, finished_at)
+	sql(`INSERT INTO lawang.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body, state, finished_at)
 	     SELECT 'd' || g, 'tenant_' || g % 5, 'fake', 'd' || g, 'done:' || g, '\x7b7d', 'delivered', now()
 	       FROM generate_series(1, $1::int) g`, deliveredRows)
-	sql(`INSERT INTO sluiceway.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body, is_head)
+	sql(`INSERT INTO lawang.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body, is_head)
 	     SELECT 'h' || k || 'v' || v, 'tenant_' || k % 5, 'fake', 'h' || k || 'v' || v, 'hot:' || k, '\x7b7d', v = 1
 	       FROM generate_series(1, $2::int) v, generate_series(1, $1::int) k
 	      ORDER BY v, k`, hotKeys, hotVersions)
-	sql(`INSERT INTO sluiceway.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body, is_head)
+	sql(`INSERT INTO lawang.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body, is_head)
 	     SELECT 'u' || g, 'tenant_' || g % 5, 'fake', 'u' || g, 'one:' || g, '\x7b7d', true
 	       FROM generate_series(1, $1::int) g`, distinctKeys)
-	sql("VACUUM sluiceway.outbox")
+	sql("VACUUM lawang.outbox")
 
 	var (
 		raw   []byte   // the last plan, for the failure message
@@ -154,7 +154,7 @@ func TestClaimCostFollowsTheBatchNotTheBacklog(t *testing.T) {
 	)
 	claim := func(batch int) (rows int, find, total int64) {
 		t.Helper()
-		sql("ANALYZE sluiceway.outbox")
+		sql("ANALYZE lawang.outbox")
 		err := db.RoleTx(ctx, store.RoleWorker, func(tx pgx.Tx) error {
 			err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+outboxdb.ClaimSQL, 60.0, "guard", int32(batch)).Scan(&raw) //nolint:gosec // batch is 10 or 100
 			if err != nil {
@@ -207,7 +207,7 @@ func TestClaimCostFollowsTheBatchNotTheBacklog(t *testing.T) {
 	// until a vacuum.
 	moveHeads := func(set string) {
 		t.Helper()
-		sql("UPDATE sluiceway.outbox SET " + set + " WHERE is_head")
+		sql("UPDATE lawang.outbox SET " + set + " WHERE is_head")
 		_, find, _ := claim(10)
 		t.Logf("the first poll after moving every head touched %d buffers, once", find)
 	}
@@ -218,7 +218,7 @@ func TestClaimCostFollowsTheBatchNotTheBacklog(t *testing.T) {
 
 	// The heads of the hot keys are backing off, and they are the oldest rows in the queue: a claim
 	// that walked the queue in seq order would wade through the 19,990 rows behind them.
-	sql(`UPDATE sluiceway.outbox SET next_attempt_at = now() + interval '1 hour' WHERE is_head AND ordering_key LIKE 'hot:%'`)
+	sql(`UPDATE lawang.outbox SET next_attempt_at = now() + interval '1 hour' WHERE is_head AND ordering_key LIKE 'hot:%'`)
 	check("hot keys backing off", 10, 10, maxFindBatch10, maxTotalBatch10)
 	check("hot keys backing off", 100, 100, maxFindBatch100, maxTotalBatch100)
 
@@ -232,6 +232,6 @@ func TestClaimCostFollowsTheBatchNotTheBacklog(t *testing.T) {
 
 	// What is left of the cost above is the pages of dead index entries in front of the index,
 	// which a vacuum removes.
-	sql("VACUUM sluiceway.outbox")
+	sql("VACUUM lawang.outbox")
 	check("every head leased, after a vacuum", 10, 0, maxVacuumed, maxVacuumed)
 }

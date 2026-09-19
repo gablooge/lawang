@@ -1,6 +1,6 @@
 # growth/
 
-Working notes and drafts of the `bizdev` agent (`.claude/agents/bizdev.md`): who needs Sluiceway,
+Working notes and drafts of the `bizdev` agent (`.claude/agents/bizdev.md`): who needs Lawang,
 what else exists, what stops a stranger from adopting it, and drafts of community files and launch
 material.
 

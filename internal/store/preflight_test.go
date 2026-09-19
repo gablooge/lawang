@@ -8,8 +8,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/gablooge/sluiceway/internal/store"
-	"github.com/gablooge/sluiceway/internal/testdb"
+	"github.com/gablooge/lawang/internal/store"
+	"github.com/gablooge/lawang/internal/testdb"
 )
 
 // The tests in this file change roles and memberships, which are cluster-wide. Each takes a
@@ -27,7 +27,7 @@ func TestOpenRefusesUnsafeHelperRoles(t *testing.T) {
 	// that ran the bootstrap. Postgres keeps one membership row per grantor.
 	testdb.Exec(t, tdb.AdminURL, `
 		CREATE ROLE second_admin NOLOGIN;
-		GRANT sluiceway_resolver, sluiceway_worker TO second_admin WITH ADMIN OPTION`)
+		GRANT lawang_resolver, lawang_worker TO second_admin WITH ADMIN OPTION`)
 
 	cases := []struct {
 		name    string
@@ -45,22 +45,22 @@ func TestOpenRefusesUnsafeHelperRoles(t *testing.T) {
 	}{
 		{
 			name:    "helper role is BYPASSRLS",
-			breakIt: "ALTER ROLE sluiceway_worker BYPASSRLS",
-			restore: "ALTER ROLE sluiceway_worker NOBYPASSRLS",
+			breakIt: "ALTER ROLE lawang_worker BYPASSRLS",
+			restore: "ALTER ROLE lawang_worker NOBYPASSRLS",
 			helper:  store.RoleWorker,
 			wantErr: store.ErrUnsafeRole,
 		},
 		{
 			name:    "helper role is SUPERUSER",
-			breakIt: "ALTER ROLE sluiceway_resolver SUPERUSER",
-			restore: "ALTER ROLE sluiceway_resolver NOSUPERUSER",
+			breakIt: "ALTER ROLE lawang_resolver SUPERUSER",
+			restore: "ALTER ROLE lawang_resolver NOSUPERUSER",
 			helper:  store.RoleResolver,
 			wantErr: store.ErrUnsafeRole,
 		},
 		{
 			name:     "membership is INHERIT TRUE",
-			breakIt:  "GRANT sluiceway_worker TO sluiceway WITH INHERIT TRUE",
-			restore:  "GRANT sluiceway_worker TO sluiceway WITH INHERIT FALSE",
+			breakIt:  "GRANT lawang_worker TO lawang WITH INHERIT TRUE",
+			restore:  "GRANT lawang_worker TO lawang WITH INHERIT FALSE",
 			helper:   store.RoleWorker,
 			inherits: true,
 			wantErr:  store.ErrUnsafeRole,
@@ -68,8 +68,8 @@ func TestOpenRefusesUnsafeHelperRoles(t *testing.T) {
 		{
 			name: "helper role is inherited through an intermediate role",
 			breakIt: `CREATE ROLE ops NOLOGIN;
-				GRANT sluiceway_worker TO ops;
-				GRANT ops TO sluiceway`,
+				GRANT lawang_worker TO ops;
+				GRANT ops TO lawang`,
 			restore:  "DROP ROLE ops",
 			helper:   store.RoleWorker,
 			inherits: true,
@@ -77,23 +77,23 @@ func TestOpenRefusesUnsafeHelperRoles(t *testing.T) {
 		},
 		{
 			name:     "a second grantor adds an INHERIT TRUE membership beside the correct one",
-			breakIt:  "GRANT sluiceway_resolver TO sluiceway WITH INHERIT TRUE GRANTED BY second_admin",
-			restore:  "REVOKE sluiceway_resolver FROM sluiceway GRANTED BY second_admin",
+			breakIt:  "GRANT lawang_resolver TO lawang WITH INHERIT TRUE GRANTED BY second_admin",
+			restore:  "REVOKE lawang_resolver FROM lawang GRANTED BY second_admin",
 			helper:   store.RoleResolver,
 			inherits: true,
 			wantErr:  store.ErrUnsafeRole,
 		},
 		{
 			name:    "membership is SET FALSE",
-			breakIt: "GRANT sluiceway_resolver TO sluiceway WITH SET FALSE",
-			restore: "GRANT sluiceway_resolver TO sluiceway WITH SET TRUE",
+			breakIt: "GRANT lawang_resolver TO lawang WITH SET FALSE",
+			restore: "GRANT lawang_resolver TO lawang WITH SET TRUE",
 			helper:  store.RoleResolver,
 			wantErr: store.ErrUnsafeRole,
 		},
 		{
 			name:    "membership is missing",
-			breakIt: "REVOKE sluiceway_worker FROM sluiceway",
-			restore: "GRANT sluiceway_worker TO sluiceway WITH INHERIT FALSE, SET TRUE",
+			breakIt: "REVOKE lawang_worker FROM lawang",
+			restore: "GRANT lawang_worker TO lawang WITH INHERIT FALSE, SET TRUE",
 			helper:  store.RoleWorker,
 			wantErr: store.ErrUnsafeRole,
 		},
@@ -102,33 +102,33 @@ func TestOpenRefusesUnsafeHelperRoles(t *testing.T) {
 			// SET stays true. But a role that administers a helper role can grant it to itself
 			// again WITH INHERIT TRUE, after the preflight has run.
 			name:     "membership carries ADMIN OPTION",
-			breakIt:  "GRANT sluiceway_worker TO sluiceway WITH ADMIN OPTION",
-			restore:  "REVOKE ADMIN OPTION FOR sluiceway_worker FROM sluiceway CASCADE",
+			breakIt:  "GRANT lawang_worker TO lawang WITH ADMIN OPTION",
+			restore:  "REVOKE ADMIN OPTION FOR lawang_worker FROM lawang CASCADE",
 			helper:   store.RoleWorker,
-			escalate: "GRANT sluiceway_worker TO sluiceway WITH INHERIT TRUE",
+			escalate: "GRANT lawang_worker TO lawang WITH INHERIT TRUE",
 			wantErr:  store.ErrUnsafeRole,
 		},
 		{
 			// The same through a role the login does not even inherit: it can SET ROLE to it.
 			name: "ADMIN OPTION is held through an intermediate role that is not inherited",
 			breakIt: `CREATE ROLE ops NOLOGIN;
-				GRANT sluiceway_resolver TO ops WITH ADMIN OPTION;
-				GRANT ops TO sluiceway WITH INHERIT FALSE, SET TRUE`,
-			restore: `REVOKE sluiceway_resolver FROM ops CASCADE;
+				GRANT lawang_resolver TO ops WITH ADMIN OPTION;
+				GRANT ops TO lawang WITH INHERIT FALSE, SET TRUE`,
+			restore: `REVOKE lawang_resolver FROM ops CASCADE;
 				DROP ROLE ops`,
 			helper: store.RoleResolver,
 			escalate: `SET ROLE ops;
-				GRANT sluiceway_resolver TO sluiceway WITH INHERIT TRUE`,
+				GRANT lawang_resolver TO lawang WITH INHERIT TRUE`,
 			wantErr: store.ErrUnsafeRole,
 		},
 		{
 			// Not a broken setup at all: two administrators have each run the bootstrap grants, so
 			// there are two correct membership rows per helper role. It must start.
 			name: "two grantors, every membership correct",
-			breakIt: `GRANT sluiceway_resolver TO sluiceway WITH INHERIT FALSE, SET TRUE GRANTED BY second_admin;
-				GRANT sluiceway_worker TO sluiceway WITH INHERIT FALSE, SET TRUE GRANTED BY second_admin`,
-			restore: `REVOKE sluiceway_resolver FROM sluiceway GRANTED BY second_admin;
-				REVOKE sluiceway_worker FROM sluiceway GRANTED BY second_admin`,
+			breakIt: `GRANT lawang_resolver TO lawang WITH INHERIT FALSE, SET TRUE GRANTED BY second_admin;
+				GRANT lawang_worker TO lawang WITH INHERIT FALSE, SET TRUE GRANTED BY second_admin`,
+			restore: `REVOKE lawang_resolver FROM lawang GRANTED BY second_admin;
+				REVOKE lawang_worker FROM lawang GRANTED BY second_admin`,
 			helper:  store.RoleWorker,
 			wantErr: nil,
 		},
@@ -194,7 +194,7 @@ func TestBootstrapRunsAsACreateroleAdmin(t *testing.T) {
 		t.Fatalf("bootstrap without CREATE on the database: err = %v, want permission denied (42501): the premise of this check is gone", err)
 	}
 	var leftBehind int
-	queryRow(t, tdb.AdminURL, "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'sluiceway%'", &leftBehind)
+	queryRow(t, tdb.AdminURL, "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'lawang%'", &leftBehind)
 	if leftBehind != 0 {
 		t.Fatalf("a failed bootstrap left %d roles behind, want it to apply completely or not at all", leftBehind)
 	}
@@ -228,16 +228,16 @@ func TestBootstrapRunsAsACreateroleAdmin(t *testing.T) {
 	err = conn.QueryRow(ctx, `
 		SELECT (SELECT r.rolname FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner
 		         WHERE n.nspname = $1),
-		       pg_has_role('sluiceway', 'SET'), pg_has_role('sluiceway', 'USAGE')`, store.Schema).
+		       pg_has_role('lawang', 'SET'), pg_has_role('lawang', 'USAGE')`, store.Schema).
 		Scan(&owner, &dbaCanSet, &dbaInherits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if owner != "sluiceway" {
-		t.Errorf("schema owner = %q, want sluiceway", owner)
+	if owner != "lawang" {
+		t.Errorf("schema owner = %q, want lawang", owner)
 	}
 	if dbaCanSet || dbaInherits {
-		t.Errorf("after the bootstrap the administrator can SET ROLE sluiceway (%v) or inherits it (%v), want neither",
+		t.Errorf("after the bootstrap the administrator can SET ROLE lawang (%v) or inherits it (%v), want neither",
 			dbaCanSet, dbaInherits)
 	}
 
@@ -247,8 +247,8 @@ func TestBootstrapRunsAsACreateroleAdmin(t *testing.T) {
 	var rows int
 	if err := conn.QueryRow(ctx, `
 		SELECT count(*) FROM pg_auth_members m
-		 WHERE m.member = 'sluiceway'::regrole
-		   AND m.roleid IN ('sluiceway_resolver'::regrole, 'sluiceway_worker'::regrole)`).Scan(&rows); err != nil {
+		 WHERE m.member = 'lawang'::regrole
+		   AND m.roleid IN ('lawang_resolver'::regrole, 'lawang_worker'::regrole)`).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
 	if rows != 4 {
@@ -258,7 +258,7 @@ func TestBootstrapRunsAsACreateroleAdmin(t *testing.T) {
 }
 
 // TestBootstrapLeavesTheAdministratorsMembershipAsItWas pins the promise in the script's header:
-// the administrator ends with exactly the membership in "sluiceway" it started with. The script
+// the administrator ends with exactly the membership in "lawang" it started with. The script
 // has to take SET on that role to create the schema, and Postgres keeps one membership row per
 // grantor, so taking SET rewrites a row the administrator already granted itself instead of
 // adding one. Giving it back must restore that row, not delete it.
@@ -273,14 +273,14 @@ func TestBootstrapLeavesTheAdministratorsMembershipAsItWas(t *testing.T) {
 		DO $$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO dba', current_database()); END $$`)
 
 	// The first run creates the roles, so there is no "before" to compare with. The helper roles
-	// are never borrowed, so their rows show what the row for "sluiceway" must still look like.
+	// are never borrowed, so their rows show what the row for "lawang" must still look like.
 	testdb.Bootstrap(t, testdb.As(t, tdb.AdminURL, "dba", "dba"))
 	const selfGrantedInheritOnly = "dba: inherit=t set=f; postgres: inherit=f set=f"
-	if got := membershipOf(t, tdb.AdminURL, "dba", "sluiceway_resolver"); got != selfGrantedInheritOnly {
-		t.Fatalf("dba in sluiceway_resolver = %q, want %q: the premise of this check is gone", got, selfGrantedInheritOnly)
+	if got := membershipOf(t, tdb.AdminURL, "dba", "lawang_resolver"); got != selfGrantedInheritOnly {
+		t.Fatalf("dba in lawang_resolver = %q, want %q: the premise of this check is gone", got, selfGrantedInheritOnly)
 	}
-	if got := membershipOf(t, tdb.AdminURL, "dba", "sluiceway"); got != selfGrantedInheritOnly {
-		t.Errorf("after the first bootstrap, dba in sluiceway = %q, want %q", got, selfGrantedInheritOnly)
+	if got := membershipOf(t, tdb.AdminURL, "dba", "lawang"); got != selfGrantedInheritOnly {
+		t.Errorf("after the first bootstrap, dba in lawang = %q, want %q", got, selfGrantedInheritOnly)
 	}
 	mustOpen(t, tdb.URL).Close()
 
@@ -292,12 +292,12 @@ func TestBootstrapLeavesTheAdministratorsMembershipAsItWas(t *testing.T) {
 		DO $$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO dba2', current_database()); END $$`)
 
 	// And one who was delegated exactly what the script needs and no more: ADMIN OPTION on the
-	// helper roles to grant them, SET on "sluiceway" to create its schema, and no way to grant
-	// "sluiceway" to anyone. If the script tried to borrow what it already has, it would fail here.
+	// helper roles to grant them, SET on "lawang" to create its schema, and no way to grant
+	// "lawang" to anyone. If the script tried to borrow what it already has, it would fail here.
 	testdb.Exec(t, tdb.AdminURL, `
 		CREATE ROLE delegate LOGIN NOSUPERUSER PASSWORD 'delegate';
-		GRANT sluiceway_resolver, sluiceway_worker TO delegate WITH ADMIN OPTION, INHERIT FALSE, SET FALSE;
-		GRANT sluiceway TO delegate WITH INHERIT FALSE, SET TRUE;
+		GRANT lawang_resolver, lawang_worker TO delegate WITH ADMIN OPTION, INHERIT FALSE, SET FALSE;
+		GRANT lawang TO delegate WITH INHERIT FALSE, SET TRUE;
 		DO $$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO delegate', current_database()); END $$`)
 
 	cases := []struct {
@@ -311,25 +311,25 @@ func TestBootstrapLeavesTheAdministratorsMembershipAsItWas(t *testing.T) {
 		{
 			name:  "own grant WITH INHERIT TRUE, SET FALSE",
 			admin: "dba",
-			setup: "GRANT sluiceway TO dba WITH INHERIT TRUE, SET FALSE",
+			setup: "GRANT lawang TO dba WITH INHERIT TRUE, SET FALSE",
 			want:  selfGrantedInheritOnly,
 		},
 		{
 			name:  "own grant that already has SET",
 			admin: "dba",
-			setup: "GRANT sluiceway TO dba WITH INHERIT FALSE, SET TRUE",
+			setup: "GRANT lawang TO dba WITH INHERIT FALSE, SET TRUE",
 			want:  "dba: inherit=f set=t; postgres: inherit=f set=f",
 		},
 		{
 			name:  "own grant with both",
 			admin: "dba",
-			setup: "GRANT sluiceway TO dba WITH INHERIT TRUE, SET TRUE",
+			setup: "GRANT lawang TO dba WITH INHERIT TRUE, SET TRUE",
 			want:  "dba: inherit=t set=t; postgres: inherit=f set=f",
 		},
 		{
 			name:  "no grant of its own",
 			admin: "dba",
-			setup: "REVOKE sluiceway FROM dba",
+			setup: "REVOKE lawang FROM dba",
 			want:  "postgres: inherit=f set=f",
 		},
 		{
@@ -349,24 +349,24 @@ func TestBootstrapLeavesTheAdministratorsMembershipAsItWas(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			adminURL := testdb.As(t, tdb.AdminURL, tc.admin, tc.admin)
 			// Only creating the schema needs SET, so it has to be missing for the script to borrow.
-			testdb.Exec(t, tdb.AdminURL, "DROP SCHEMA IF EXISTS sluiceway CASCADE")
+			testdb.Exec(t, tdb.AdminURL, "DROP SCHEMA IF EXISTS lawang CASCADE")
 			testdb.Exec(t, adminURL, tc.setup)
-			if got := membershipOf(t, tdb.AdminURL, tc.admin, "sluiceway"); got != tc.want {
-				t.Fatalf("before the bootstrap, %s in sluiceway = %q, want %q: the case does not build the state it names", tc.admin, got, tc.want)
+			if got := membershipOf(t, tdb.AdminURL, tc.admin, "lawang"); got != tc.want {
+				t.Fatalf("before the bootstrap, %s in lawang = %q, want %q: the case does not build the state it names", tc.admin, got, tc.want)
 			}
 
 			if err := testdb.TryBootstrap(t, adminURL); err != nil {
 				t.Fatalf("bootstrap as %s: %v", tc.admin, err)
 			}
 
-			if got := membershipOf(t, tdb.AdminURL, tc.admin, "sluiceway"); got != tc.want {
-				t.Errorf("after the bootstrap, %s in sluiceway = %q, want it unchanged: %q", tc.admin, got, tc.want)
+			if got := membershipOf(t, tdb.AdminURL, tc.admin, "lawang"); got != tc.want {
+				t.Errorf("after the bootstrap, %s in lawang = %q, want it unchanged: %q", tc.admin, got, tc.want)
 			}
 			var owner string
 			queryRow(t, tdb.AdminURL, `SELECT r.rolname FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner
-				WHERE n.nspname = 'sluiceway'`, &owner)
-			if owner != "sluiceway" {
-				t.Errorf("schema owner = %q, want sluiceway: the script did not create the schema", owner)
+				WHERE n.nspname = 'lawang'`, &owner)
+			if owner != "lawang" {
+				t.Errorf("schema owner = %q, want lawang: the script did not create the schema", owner)
 			}
 			mustOpen(t, tdb.URL).Close()
 		})

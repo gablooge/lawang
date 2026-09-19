@@ -14,7 +14,7 @@ import (
 )
 
 // setting is the transaction-local Postgres setting every row-level security policy reads.
-const setting = "sluiceway.tenant"
+const setting = "lawang.tenant"
 
 const maxIDLen = 64
 

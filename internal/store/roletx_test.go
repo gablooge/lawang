@@ -8,8 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/gablooge/sluiceway/internal/store"
-	"github.com/gablooge/sluiceway/internal/tenancy"
+	"github.com/gablooge/lawang/internal/store"
+	"github.com/gablooge/lawang/internal/tenancy"
 )
 
 // scratchJobs builds what B04 onwards really build: a tenant table that a helper role may read
@@ -24,8 +24,8 @@ func scratchJobs(t *testing.T, db *store.DB) {
 			"ALTER TABLE scratch_jobs ENABLE ROW LEVEL SECURITY",
 			"ALTER TABLE scratch_jobs FORCE ROW LEVEL SECURITY",
 			"CREATE POLICY tenant_isolation ON scratch_jobs USING (tenant = current_tenant()) WITH CHECK (tenant = current_tenant())",
-			"CREATE POLICY worker_claims ON scratch_jobs FOR SELECT TO sluiceway_worker USING (true)",
-			"GRANT SELECT ON scratch_jobs TO sluiceway_worker",
+			"CREATE POLICY worker_claims ON scratch_jobs FOR SELECT TO lawang_worker USING (true)",
+			"GRANT SELECT ON scratch_jobs TO lawang_worker",
 		} {
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return err
@@ -91,7 +91,7 @@ func TestAHelperRoleTransactionIsCrossTenantWhateverIsBound(t *testing.T) {
 
 		// The reason for the refusal, shown by going around it: with tenant_a bound the hard way,
 		// tenant_b's row is still there.
-		if _, err := tx.Exec(ctx, "SELECT set_config('sluiceway.tenant', $1, true)", tenantA.String()); err != nil {
+		if _, err := tx.Exec(ctx, "SELECT set_config('lawang.tenant', $1, true)", tenantA.String()); err != nil {
 			return err
 		}
 		if got := visibleJobs(ctx, t, tx); len(got) != 2 {
@@ -126,10 +126,10 @@ func assertCleanConnection(t *testing.T, db *store.DB, after string) {
 	err := db.Tx(ctx, func(tx pgx.Tx) error {
 		var user string
 		var tenant *string
-		if err := tx.QueryRow(ctx, "SELECT current_user, current_setting('sluiceway.tenant', true)").Scan(&user, &tenant); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT current_user, current_setting('lawang.tenant', true)").Scan(&user, &tenant); err != nil {
 			return err
 		}
-		if user != "sluiceway" {
+		if user != "lawang" {
 			t.Errorf("after %s, the next transaction runs as %q", after, user)
 		}
 		if tenant != nil && *tenant != "" {
@@ -148,7 +148,7 @@ func assertCleanConnection(t *testing.T, db *store.DB, after string) {
 // bindAround binds a tenant inside RoleTx the way tenancy.Bind refuses to, so that the leak tests
 // below leave both a role and a tenant behind for the next transaction to find.
 func bindAround(ctx context.Context, tx pgx.Tx) error {
-	_, err := tx.Exec(ctx, "SELECT set_config('sluiceway.tenant', $1, true)", tenantA.String())
+	_, err := tx.Exec(ctx, "SELECT set_config('lawang.tenant', $1, true)", tenantA.String())
 	return err
 }
 

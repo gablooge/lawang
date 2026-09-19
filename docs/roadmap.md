@@ -17,7 +17,7 @@ Sizes are relative effort: **S** is a few days, **M** about a week, **L** more t
 
 The skeleton everything else hangs on.
 
-- `cmd/sluiceway` with the `serve`, `worker`, `migrate` and `version` subcommands
+- `cmd/lawang` with the `serve`, `worker`, `migrate` and `version` subcommands
 - environment config with fail-closed defaults (production unless development is explicit)
 - `internal/ids`: ULIDs and the three blake3 key recipes, with golden test vectors
 - Postgres via pgx, goose migrations embedded in the binary, the three roles
@@ -54,7 +54,7 @@ webhook for an unknown workspace is parked, never routed.
 
 - the `Vault` interface; `local` (AES-GCM, key from the environment, refuses to store plaintext);
   `nango` (self-hosted, HTTP only); `azureapp` (client credentials for Microsoft Graph)
-- `sluiceway connect <provider>`, reading secrets from the environment, never from arguments
+- `lawang connect <provider>`, reading secrets from the environment, never from arguments
 - `/v1` operator API: providers, the connection lifecycle, capabilities, health
 
 **Done when:** a connection can be created, completed and deleted through `/v1`; deleting it
