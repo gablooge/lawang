@@ -93,7 +93,14 @@ saying what you looked at. "Not applicable" needs a reason.
 7. **Exactly-once and ordering.** Re-sends, crashes between transactions, lease takeover, late old
    versions. Reason about two workers interleaving at every statement boundary.
 8. **Secrets.** Nothing that could hold token material, a secret or a database URL may reach a log
-   line, an error string, a plain table column, a test fixture or a golden file.
+   line, an error string, a plain table column, a test fixture or a golden file. When a change
+   uses the real credentials in `~/.config/sluiceway/` (see `CLAUDE.md`, "Credentials for live
+   verification"), check every rule there: recorded payloads scrubbed of tokens, secrets, email
+   addresses, names, message text and provider ids; live tests behind the `live` build tag,
+   skipping when a credential is absent, and absent from `make check` and CI; nothing written to
+   the provider outside a place made for testing; webhooks deregistered. Search the diff for
+   token shapes (`xoxb-`, `pat-`, `pk_`, `eyJ`, long hex or base64 runs). An unscrubbed payload or
+   a credential value anywhere is blocking.
 9. **The rest of security.** Anything built from input that reaches SQL, a shell, a file path, a
    URL or a log line (injection, path traversal, SSRF, log forging). Signature and token checks:
    constant-time comparison, over the exact raw bytes, with a missing secret being a plain

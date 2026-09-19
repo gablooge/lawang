@@ -132,6 +132,11 @@ You usually run in an isolated git worktree while other agents run in theirs.
 - **Never use an em dash** (the long dash character), anywhere: code, comments, SQL, commit
   messages, documentation, pull requests, review replies. Use a comma, parentheses, a colon, or
   two sentences. `git grep` for it before you commit.
+- Real provider credentials live in `~/.config/sluiceway/`. Read the "Credentials for live
+  verification" section of `CLAUDE.md` before you touch them, and follow every rule there: values
+  never leave that directory, live tests are opt-in behind the `live` build tag and never part of
+  `make check` or CI, read-only against the provider unless the item says otherwise, recorded
+  payloads scrubbed before they are committed.
 - If an item needs something only the maintainer has (a provider account, a secret, a decision),
   build everything else, leave that check unticked, and say so plainly.
 

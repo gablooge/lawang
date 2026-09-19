@@ -80,6 +80,41 @@ remote ref, never a possibly stale local branch), run `make check`, push.
 Finished agents leave worktrees under `.claude/worktrees/`; remove them with `git worktree remove`
 when their agent is done.
 
+## Credentials for live verification
+
+The maintainer keeps real provider credentials **outside the repository**, in
+`~/.config/sluiceway/` (owner-only files, one per provider). They are for the live checks that the
+backlog marks "(needs you)", where one real event must reach the sink.
+
+| File | Variables (names only) | For |
+|---|---|---|
+| `clickup.env` | `CLICKUP_TOKEN` | B11, B12 |
+| `slack.env` | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` | B15, B20 |
+| `azure.env` | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | B13, B16, B17, B20 |
+| `hubspot.env` | `HUBSPOT_PRIVATE_APP_TOKEN`, `HUBSPOT_PORTAL_ID`, `HUBSPOT_WEBHOOK_MODE` | B18, B20 |
+
+These tokens can read real mail and messages and can post as a real bot. The rules:
+
+- **Values never leave that directory.** Never print one, never put one in a commit, a test
+  fixture, a golden file, a log, an error, an issue, a pull request, a review, a commit message, a
+  search query or a URL you fetch. Refer to a credential by its variable name only. Never copy the
+  files, and never write to that directory.
+- **Never on a command line** (arguments are visible to every process on the machine). Load the
+  file into the environment of the one process that needs it.
+- **Live tests are opt-in and never part of `make check` or CI.** They sit behind a build tag
+  (`live`) and an explicit variable, read the directory from `SLUICEWAY_CREDENTIALS_DIR` (default
+  `~/.config/sluiceway`), and **skip with a clear message** when a file or a variable is absent.
+  CI has none of these secrets, and must stay that way.
+- **Read-only against the provider unless the backlog item says otherwise**, and then only in a
+  place made for testing (a test channel, a test list, a test mailbox). Never post to, or read
+  from, anything that belongs to real people. Register webhooks only with a name that says it is a
+  Sluiceway test, and deregister what you registered.
+- **Recorded payloads are scrubbed before they are committed**: tokens, signing secrets, email
+  addresses, names, message text, and workspace, channel and user ids are replaced with obvious
+  placeholders. The reviewer treats an unscrubbed payload as blocking.
+- `implementer` may use them, for the item it is building. `pr-reviewer` may re-run a live test
+  and must check every rule above. **`bizdev` never reads that directory**, for any reason.
+
 ## Rewriting history
 
 Agents never force-push and never rewrite history. The one exception is the orchestrator, and only
