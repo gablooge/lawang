@@ -15,8 +15,8 @@ and nothing that points at a machine of theirs.
 - GitHub (`gablooge/lawang`): item BNN is issue #NN, and M0 to M6 are milestones with due dates.
   Status lives there; order, dates and the log live in the backlog file.
 - `growth/`: the `bizdev` agent's working notes and drafts (landscape, positioning, launch
-  drafts). Nothing in it is published by being committed. The maintainer reviews it before the
-  repository becomes public.
+  drafts). Nothing in it is published by being committed, but the repository is public, so anyone
+  can read it. Write it for the people it describes.
 - `.claude/agents/`: the `implementer`, `pr-reviewer` and `bizdev` agents. Their files are the full rules
   for writing and for reviewing; the section below is only how they fit together.
 
