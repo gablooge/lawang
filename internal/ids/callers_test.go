@@ -62,13 +62,13 @@ func TestTheImportPathNamesAPackageSomethingImports(t *testing.T) {
 		case !strings.HasSuffix(path, ".go"):
 			return nil
 		}
-		f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
-		if err != nil {
-			return nil // a file the scan cannot parse is the other test's problem, not this one
-		}
-		for _, spec := range f.Imports {
-			if p, err := strconv.Unquote(spec.Path.Value); err == nil && p == idsImportPath {
-				importers = append(importers, path)
+		// A file this cannot parse is the other test's problem, not this one: it only needs one
+		// file that does import the path, and a broken file cannot be that.
+		if f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly); err == nil {
+			for _, spec := range f.Imports {
+				if p, err := strconv.Unquote(spec.Path.Value); err == nil && p == idsImportPath {
+					importers = append(importers, path)
+				}
 			}
 		}
 		return nil
