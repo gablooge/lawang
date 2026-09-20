@@ -29,17 +29,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gablooge/sluiceway/internal/ids"
-	"github.com/gablooge/sluiceway/internal/tenancy"
+	"github.com/gablooge/lawang/internal/ids"
+	"github.com/gablooge/lawang/internal/tenancy"
 )
 
 // FormatV1 is the value of Record.Format. A sink learns which format it is reading from this
 // field, because it is the only thing that is still there when a record sits in a file or a
-// queue. Within v1 every record Sluiceway produces validates against every earlier v1 schema. So
+// queue. Within v1 every record Lawang produces validates against every earlier v1 schema. So
 // only fields a reader may ignore are added, and anything else is a new format with a new value:
 // a field removed, renamed or made optional, a changed meaning, a limit or a pattern changed in
 // either direction, a new Op, Kind or Audience, any change inside Visibility.
-const FormatV1 = "sluiceway.record/v1"
+const FormatV1 = "lawang.record/v1"
 
 // Op says what the sink does with the record.
 type Op string
@@ -226,7 +226,7 @@ type Visibility struct {
 	Audience Audience `json:"audience"`
 }
 
-// Origin is what Sluiceway knows about where the content came from. Both fields are signals and
+// Origin is what Lawang knows about where the content came from. Both fields are signals and
 // never clearances: true means there is a positive signal, false means there is NO SIGNAL (the
 // source did not say, the provider cannot tell, or this version does not look). False is never
 // the opposite of true. A sink treats every text as untrusted content whatever Origin says, and
@@ -252,7 +252,7 @@ type Edges struct {
 
 // Meta is diagnostics.
 type Meta struct {
-	// Delivery is Sluiceway's id of the accepted delivery the record was made from. Optional,
+	// Delivery is Lawang's id of the accepted delivery the record was made from. Optional,
 	// at most MaxDelivery characters.
 	Delivery string `json:"delivery,omitempty"`
 }

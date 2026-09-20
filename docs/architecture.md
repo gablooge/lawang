@@ -352,7 +352,7 @@ file a sink author takes, and the binary embeds the same bytes. The Go types are
 
 ```json
 {
-  "format": "sluiceway.record/v1",
+  "format": "lawang.record/v1",
   "id": "rec_bb4dc9bd2347887adae051e72346bec6",
   "op": "upsert",
   "source": "slack",
@@ -377,7 +377,7 @@ always a record the schema accepts and the Go types produce.
 
 | Field | | What it is |
 |---|---|---|
-| `format` | required | `sluiceway.record/v1`, exactly. How a sink learns what it is reading, also from a file or a queue. |
+| `format` | required | `lawang.record/v1`, exactly. How a sink learns what it is reading, also from a file or a queue. |
 | `id` | required | The idempotency key, `rec_` and 32 hex characters ([section 5](#5-idempotency)). One id is one version of one entity in one scope, for one tenant. |
 | `op` | required | `upsert`, or `delete`: a tombstone with empty `title` and `text`. `delete` is part of v1 so that shipping deletions does not change the format; v0.1 never sends one. |
 | `source` | required | The name the sink knows the source by. Sink configuration (principle 4), so it is in no id and need not match the first segment of the scope. |
@@ -414,7 +414,7 @@ refuse such a document, or silently replace the bad part, or keep it, and then t
 read two different records), no field name occurs twice in one object, and `supersedes` is never
 the record's own `id`.
 
-**What may change.** Within v1, every record Sluiceway produces validates against every earlier
+**What may change.** Within v1, every record Lawang produces validates against every earlier
 v1 schema. So only fields a reader may ignore are added, and nothing that exists moves, in either
 direction: a field removed, renamed or made optional, a changed meaning, a limit or a pattern
 changed (raised or lowered, widened or narrowed), a new `op`, `kind` or `audience`, and any change
@@ -454,7 +454,7 @@ roadmap after v0.1), so in v0.1 even mail from a stranger says `false`. A sink t
 every text as untrusted content, uses `true` to be stricter, and never uses `false` to be laxer.
 `origin.automation` is read the same way. The field stays two-valued: a third value, "known to
 be inside", could only be used to relax a guard, and an insider's message can quote an
-outsider's, so that is a statement Sluiceway can never make (ADR 4, decision 10).
+outsider's, so that is a statement Lawang can never make (ADR 4, decision 10).
 
 ---
 
@@ -643,5 +643,5 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Crypto | standard library `crypto/hmac`, `crypto/aes`, `crypto/cipher` |
 | Metrics | `github.com/prometheus/client_golang` |
 | Tests | standard `testing`, `testcontainers-go` for Postgres |
-| JSON Schema validation | `github.com/santhosh-tekuri/jsonschema/v6`, in tests only: pure Go, draft 2020-12, asserts formats on request, and the one module it builds with (`golang.org/x/text`) was already in the module graph. The `sluiceway` binary does not link it. Production code validates with `record.Validate`, which the tests hold equal to the schema. It becomes a runtime dependency only if the strict stub sink (B09) validates with the schema itself |
+| JSON Schema validation | `github.com/santhosh-tekuri/jsonschema/v6`, in tests only: pure Go, draft 2020-12, asserts formats on request, and the one module it builds with (`golang.org/x/text`) was already in the module graph. The `lawang` binary does not link it. Production code validates with `record.Validate`, which the tests hold equal to the schema. It becomes a runtime dependency only if the strict stub sink (B09) validates with the schema itself |
 | MCP (later) | `github.com/modelcontextprotocol/go-sdk` |

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://gablooge.github.io/sluiceway/schema/record/v1.json",
-  "title": "Sluiceway record, format v1",
-  "description": "The envelope a Sluiceway sink receives. One record is one version of one entity (a message, a task, a document) in one scope. Reading rules for a sink: check that format is exactly 'sluiceway.record/v1' and refuse anything else; be idempotent on id; decide access on visibility.scope and on nothing else (a person may see a record if they are a member of its scope, for the tenant the record was delivered for); key an entity by tenant and external_id together, never by source; compare id, external_id, version and visibility.scope for equality only, never parse them; ignore fields you do not know, except inside visibility, where an unknown field is a reason to refuse the record. Three rules of the format are beyond what a JSON Schema can state, and a sink that validates with this schema alone checks them itself: a record document is UTF-8 and holds no escape for half of a surrogate pair (check the bytes before parsing: parsers refuse such a document, or silently replace the bad part, or keep it, and then two consumers read two different records); no field name occurs twice in one object; supersedes is never the record's own id. See docs/adr/0003-scope-id-format.md and docs/adr/0004-record-format-v1.md.",
+  "$id": "https://gablooge.github.io/lawang/schema/record/v1.json",
+  "title": "Lawang record, format v1",
+  "description": "The envelope a Lawang sink receives. One record is one version of one entity (a message, a task, a document) in one scope. Reading rules for a sink: check that format is exactly 'lawang.record/v1' and refuse anything else; be idempotent on id; decide access on visibility.scope and on nothing else (a person may see a record if they are a member of its scope, for the tenant the record was delivered for); key an entity by tenant and external_id together, never by source; compare id, external_id, version and visibility.scope for equality only, never parse them; ignore fields you do not know, except inside visibility, where an unknown field is a reason to refuse the record. Three rules of the format are beyond what a JSON Schema can state, and a sink that validates with this schema alone checks them itself: a record document is UTF-8 and holds no escape for half of a surrogate pair (check the bytes before parsing: parsers refuse such a document, or silently replace the bad part, or keep it, and then two consumers read two different records); no field name occurs twice in one object; supersedes is never the record's own id. See docs/adr/0003-scope-id-format.md and docs/adr/0004-record-format-v1.md.",
   "$comment": "Two things here are deliberate. (1) Every anchored pattern has a companion that does not depend on the anchor: either a fixed length or a 'not' with an unanchored character class. In some regular expression dialects (Python's, for one) '$' also matches before a trailing newline, so an anchored pattern alone would accept 'rec_...\\n' in a validator built on them. (2) 'format: date-time' is an annotation unless the validator is told to assert formats, so occurred_at carries a pattern as well. The pattern cannot know the length of a month: assert formats if your validator can.",
   "type": "object",
   "propertyNames": { "$ref": "#/$defs/fieldName" },
@@ -26,15 +26,15 @@
   ],
   "properties": {
     "format": {
-      "description": "The format version. The promise within v1: every record Sluiceway produces validates against every earlier v1 schema, so a sink that validates with the file it took keeps working. Fields a reader may ignore can therefore be added, and nothing that exists changes, in either direction: no limit raised or lowered, no pattern or character set widened or narrowed, no field removed, renamed or made optional, no new value of op, kind or visibility.audience, no change of meaning, nothing at all inside visibility. Any of those is a new format with a new value here.",
-      "const": "sluiceway.record/v1"
+      "description": "The format version. The promise within v1: every record Lawang produces validates against every earlier v1 schema, so a sink that validates with the file it took keeps working. Fields a reader may ignore can therefore be added, and nothing that exists changes, in either direction: no limit raised or lowered, no pattern or character set widened or narrowed, no field removed, renamed or made optional, no new value of op, kind or visibility.audience, no change of meaning, nothing at all inside visibility. Any of those is a new format with a new value here.",
+      "const": "lawang.record/v1"
     },
     "id": {
       "description": "The idempotency key: one id is one version of one entity in one scope, for one tenant. A sink that receives an id it already holds has received a repeat. Opaque.",
       "$ref": "#/$defs/recordId"
     },
     "op": {
-      "description": "upsert: store this version, replacing the one named by supersedes if there is one. delete: a tombstone, the entity is gone and every stored version of external_id goes with it; title and text are empty. Sluiceway v0.1 never sends delete. A sink that cannot honour a delete refuses the record, it never ignores it.",
+      "description": "upsert: store this version, replacing the one named by supersedes if there is one. delete: a tombstone, the entity is gone and every stored version of external_id goes with it; title and text are empty. Lawang v0.1 never sends delete. A sink that cannot honour a delete refuses the record, it never ignores it.",
       "enum": ["upsert", "delete"]
     },
     "source": {
@@ -49,7 +49,7 @@
       "enum": ["task", "message", "ticket", "document", "page"]
     },
     "external_id": {
-      "description": "The entity's identity, the same for every version of it. It is unique within one tenant, across all of the tenant's sources: it begins with Sluiceway's internal key of the provider and a colon ('slack:', 'clickup:'), which is what keeps the entities of two providers apart. A sink keys an entity by tenant and external_id together, and never by source, which is a name that may change. A delete removes what is stored under that key, and edges.reply_parent refers to it. Opaque beyond that: compare for equality.",
+      "description": "The entity's identity, the same for every version of it. It is unique within one tenant, across all of the tenant's sources: it begins with Lawang's internal key of the provider and a colon ('slack:', 'clickup:'), which is what keeps the entities of two providers apart. A sink keys an entity by tenant and external_id together, and never by source, which is a name that may change. A delete removes what is stored under that key, and edges.reply_parent refers to it. Opaque beyond that: compare for equality.",
       "$ref": "#/$defs/externalId"
     },
     "version": {
@@ -63,7 +63,7 @@
       "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/recordId" }]
     },
     "occurred_at": {
-      "description": "When it happened at the source, never when Sluiceway ingested it. RFC 3339, always UTC with the 'Z' suffix, second precision or up to nine fractional digits, years 1000 to 9999, never a leap second.",
+      "description": "When it happened at the source, never when Lawang ingested it. RFC 3339, always UTC with the 'Z' suffix, second precision or up to nine fractional digits, years 1000 to 9999, never a leap second.",
       "type": "string",
       "format": "date-time",
       "minLength": 20,
@@ -133,17 +133,17 @@
       }
     },
     "origin": {
-      "description": "What Sluiceway knows about where the content came from. Both fields are signals and never clearances: true means Sluiceway has a positive signal, false means it has NO SIGNAL, because the source did not say, the provider cannot tell, or this version of Sluiceway does not look. false never means the opposite of true. Every text is untrusted content whatever these say: use true to be stricter, never false to be laxer.",
+      "description": "What Lawang knows about where the content came from. Both fields are signals and never clearances: true means Lawang has a positive signal, false means it has NO SIGNAL, because the source did not say, the provider cannot tell, or this version of Lawang does not look. false never means the opposite of true. Every text is untrusted content whatever these say: use true to be stricter, never false to be laxer.",
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/fieldName" },
       "required": ["automation", "untrusted"],
       "properties": {
         "automation": {
-          "description": "true: Sluiceway has a positive signal that a bot or an integration wrote it (the source marks the author as one). false: no signal. It is never a statement that a person wrote it.",
+          "description": "true: Lawang has a positive signal that a bot or an integration wrote it (the source marks the author as one). false: no signal. It is never a statement that a person wrote it.",
           "type": "boolean"
         },
         "untrusted": {
-          "description": "true: Sluiceway has a positive signal that the author is outside the tenant (inbound mail from a stranger, an external guest). Such text may be written to steer an AI agent that reads it. false: no signal. It is never a statement that the author is inside the tenant or that the text is safe to follow. Sluiceway v0.1 sets it for no provider, so every v0.1 record says false, mail from a stranger included.",
+          "description": "true: Lawang has a positive signal that the author is outside the tenant (inbound mail from a stranger, an external guest). Such text may be written to steer an AI agent that reads it. false: no signal. It is never a statement that the author is inside the tenant or that the text is safe to follow. Lawang v0.1 sets it for no provider, so every v0.1 record says false, mail from a stranger included.",
           "type": "boolean"
         }
       }
@@ -166,7 +166,7 @@
       "propertyNames": { "$ref": "#/$defs/fieldName" },
       "properties": {
         "delivery": {
-          "description": "Sluiceway's id of the accepted delivery the record was made from, for support. Empty means the same as absent.",
+          "description": "Lawang's id of the accepted delivery the record was made from, for support. Empty means the same as absent.",
           "$ref": "#/$defs/identifier",
           "maxLength": 128
         }

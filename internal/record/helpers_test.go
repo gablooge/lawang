@@ -11,7 +11,7 @@ import (
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 
-	"github.com/gablooge/sluiceway/internal/tenancy"
+	"github.com/gablooge/lawang/internal/tenancy"
 )
 
 const examplePath = "testdata/example.json"

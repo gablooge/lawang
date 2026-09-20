@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	idsImportPath = "github.com/gablooge/sluiceway/internal/ids"
+	idsImportPath = "github.com/gablooge/lawang/internal/ids"
 	// recordPackage is the one package that may call RecordID: record.Seal hashes the scope the
 	// record carries, and no other.
 	recordPackage = "internal/record"
@@ -92,7 +92,7 @@ import _ "unsafe"
 func part(name, value string) error`, true},
 		{"a linkname in this package, which can push the recipe out", "internal/ids/push.go", `package ids
 import _ "unsafe"
-//go:linkname New github.com/gablooge/sluiceway/internal/worker.mint`, true},
+//go:linkname New github.com/gablooge/lawang/internal/worker.mint`, true},
 		{"a linkname to something else", "internal/worker/i.go", `package worker
 import _ "unsafe"
 //go:linkname nanotime runtime.nanotime
@@ -112,7 +112,7 @@ var _ = 1`, false},
 	}
 	for path, want := range map[string]bool{
 		"internal/worker/ledger.go":      true,
-		"cmd/sluiceway/main.go":          true,
+		"cmd/lawang/main.go":             true,
 		"internal/worker/ledger_test.go": false,
 		"internal/record/record.go":      false,
 		"internal/ids/ids.go":            true,

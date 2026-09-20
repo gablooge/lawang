@@ -14,8 +14,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gablooge/sluiceway/internal/ids"
-	"github.com/gablooge/sluiceway/internal/tenancy"
+	"github.com/gablooge/lawang/internal/ids"
+	"github.com/gablooge/lawang/internal/tenancy"
 )
 
 var update = flag.Bool("update", false, "rewrite the files in testdata/golden")

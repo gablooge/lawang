@@ -142,7 +142,7 @@ rule, for a stronger reason:
 So a record delivered to a sink that calls Slack `chat` has `"source": "chat"` and
 `"scope": "slack:channel:C0GENERAL"`. The first segment of a scope id is not the record's
 `source`, and a sink must not expect them to match. **To a sink a scope id is opaque: it compares
-for equality and never parses.** Parsing is for Sluiceway, which needs the container back (access
+for equality and never parses.** Parsing is for Lawang, which needs the container back (access
 sync, diagnostics).
 
 `Record.Seal` refuses a scope whose first segment is not the sealing provider's key, so one
@@ -159,7 +159,7 @@ that connect the same Slack workspace (architecture section 5) get the same scop
   memberships (`Sink.Deliver(ctx, tenant, records)`). A tenant inside a payload string would be
   a second source of truth that could disagree with the first, which is how data crosses tenants
   (principle 2).
-- Tenant ids are Sluiceway's internal names. They have no business in a string that is stored in
+- Tenant ids are Lawang's internal names. They have no business in a string that is stored in
   every record and every index entry at the sink.
 - Where the tenant has to make two things differ, it already does: it is hashed into the record
   id (principle 3).
@@ -176,7 +176,7 @@ let tenant B's members of `slack:channel:C0GENERAL` see tenant A's records.
   each provider assembled with `fmt.Sprintf` would hold until the first id with a colon in it.
 - Percent-encoding is a rule every language already implements, and the canonical form (one fixed
   unreserved set, uppercase hex) is the normalized form RFC 3986 section 6.2.2 recommends, so a
-  sink author who does need to take one apart needs no Sluiceway code.
+  sink author who does need to take one apart needs no Lawang code.
 - Refusing instead of normalizing (lowercase hex, redundant escapes) keeps the parser from being
   more generous than the builder. A parser that accepted and canonicalized would make "equal as
   strings" and "equal as scopes" two different relations again.

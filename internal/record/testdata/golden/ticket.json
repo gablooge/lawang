@@ -1,5 +1,5 @@
 {
-  "format": "sluiceway.record/v1",
+  "format": "lawang.record/v1",
   "id": "rec_1f49e22f5d0dcc80d12e63805abd4667",
   "op": "upsert",
   "source": "hubspot",

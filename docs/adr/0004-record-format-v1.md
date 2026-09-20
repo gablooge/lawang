@@ -29,27 +29,27 @@ review, because each of them is something that cannot be tightened or redefined 
 ### 1. The format version
 
 ```json
-"format": "sluiceway.record/v1"
+"format": "lawang.record/v1"
 ```
 
 A required field with one allowed value. A sink checks it first and refuses anything else.
 
-The alternatives were a media type (`application/vnd.sluiceway.record.v1+json`) and the schema's
+The alternatives were a media type (`application/vnd.lawang.record.v1+json`) and the schema's
 `$id`. Both describe a transport or a file, and a record outlives both: it sits in a JSONL file,
 a queue, a vector store's metadata column. The field is the only version that is still attached
 to the record wherever it ends up. The `http` sink (B09) may advertise a media type as well. The
 field stays the authority.
 
-The schema's `$id` is `https://gablooge.github.io/sluiceway/schema/record/v1.json`. It is a
+The schema's `$id` is `https://gablooge.github.io/lawang/schema/record/v1.json`. It is a
 name, not a promise that the URL resolves: take the schema from the repository. It was chosen
 under a host name the maintainer controls, so that nobody else can ever serve a different schema
 at the address a validator might fetch. **The maintainer should confirm or replace it before
 v0.1.0**, because it freezes with the release.
 
-**The promise, in the reader's terms: within v1, every record Sluiceway produces validates
+**The promise, in the reader's terms: within v1, every record Lawang produces validates
 against every earlier v1 schema.** A sink author takes the schema file once, validates with it,
 sizes columns by its limits, and keeps working for as long as the records say
-`sluiceway.record/v1`. Sluiceway is the only writer, so the promise is about what it writes, and
+`lawang.record/v1`. Lawang is the only writer, so the promise is about what it writes, and
 everything below is derived from it.
 
 **What may change within v1:** fields that a reader may safely ignore are added, at the top
@@ -58,7 +58,7 @@ additional properties there, so it still accepts the record, and a sink written 
 ignores what it does not know. A new field comes with its own limits, and those freeze with the
 release that adds it.
 
-**What forces a new version** (`sluiceway.record/v2`, a new schema file, a new `$id`) is
+**What forces a new version** (`lawang.record/v2`, a new schema file, a new `$id`) is
 whatever could make an earlier v1 schema refuse a record, or a sink built on it misread one:
 
 - a field removed or renamed, or a required field made optional or nullable: the earlier schema
@@ -69,7 +69,7 @@ whatever could make an earlier v1 schema refuse a record, or a sink built on it 
   lists of decision 9, a new spelling of `occurred_at`, a longer scope id: every sink that
   validates refuses the new records, and one that sized a column by the documented maximum
   overflows. This is the direction that is easy to mistake for harmless, because it breaks no
-  producer, and the only producer is Sluiceway;
+  producer, and the only producer is Lawang;
 - a new value of `op`, `kind` or `visibility.audience`. These are closed sets, and a sink that
   validates would refuse the new value, so adding one is not additive;
 - **anything at all inside `visibility`.** A sink that ignored a new field there (a deny list,
@@ -82,7 +82,7 @@ whatever could make an earlier v1 schema refuse a record, or a sink built on it 
 **The schema file's constraints on what exists do not move in the other direction either.** A
 limit lowered or a pattern narrowed would keep the promise above (new records still pass every
 earlier schema), but records a sink has already stored would stop validating against the newer
-file, and two v1 schema files that disagree about one record are a trap. If Sluiceway ever needs
+file, and two v1 schema files that disagree about one record are a trap. If Lawang ever needs
 to produce less than the schema allows (shorter texts, say), it produces less and the schema
 stays as it is. So within v1 the schema changes by added optional properties and by wording,
 and by nothing else, and every limit and pattern in it is final on the day v0.1.0 ships.
@@ -126,7 +126,7 @@ an unknown extra. With lowercase-only names there is no second spelling to smugg
 | `origin.automation`, `origin.untrusted` | keep, meaning made exact | Both required. A missing `untrusted` must never read as "trusted", which is what a lenient decoder would make of it, and neither must `false`: see decision 10. |
 | `edges.reply_parent` | keep, meaning made exact | The **`external_id`** of the entity this one replies to, or `null`, with the same grammar as `external_id`. Not a record id: the parent has many records, one per version, and a reply hangs under the entity. Further edges are additive (B11 may add one for a comment's task). |
 | `meta.raw_ref` | **dropped** | It pointed into a raw payload store (`fs://raw/...`) that the design does not have: raw bodies live in the outbox table and are deleted by retention. A reference a sink cannot resolve is noise, and an internal storage path is not something to publish. |
-| `meta.delivery` | keep, optional | Sluiceway's id of the accepted delivery, for support. |
+| `meta.delivery` | keep, optional | Lawang's id of the accepted delivery, for support. |
 
 #### The external id
 
@@ -189,12 +189,12 @@ version by this document's own rule. So it is in the enum now, and its shape is 
 - the same envelope, with `title` and `text` empty (the schema enforces this with `if`/`then`,
   and `Record.Validate` does too);
 - `version` differs from every upsert version of the entity, so the tombstone has its own `id`;
-- `supersedes` names the last record of the entity, where Sluiceway knows it;
+- `supersedes` names the last record of the entity, where Lawang knows it;
 - `visibility.scope` is the scope the entity was last in;
 - the sink removes or hides **every** stored version of the `external_id`, for that tenant: what
   it holds under the key (tenant, `external_id`), whatever `source` those records carried.
 
-Sluiceway v0.1 never sends one (deletions are "After v0.1" in the roadmap). A sink written today
+Lawang v0.1 never sends one (deletions are "After v0.1" in the roadmap). A sink written today
 knows that one can come. A sink that cannot honour a delete **refuses the record** (which
 dead-letters it, visibly), and never accepts and ignores it.
 
@@ -383,7 +383,7 @@ Two relatives of this case, recorded so that B08 and B11 meet them knowingly:
 
 **A record document is UTF-8, and no `\u` escape in it names half of a surrogate pair.** An
 escaped pair (`\uD83D\uDE00`) is fine, and so is the astral character itself. This is a rule of
-the format that a sink may rely on, and Sluiceway never writes a document that breaks it.
+the format that a sink may rely on, and Lawang never writes a document that breaks it.
 
 It has to be said because JSON parsers do three different things with such bytes, and the format
 exists so that two consumers never read two different records in one document:
@@ -480,10 +480,10 @@ record is refused, loudly, which is the right failure.
 
 Both fields are **signals, never clearances**:
 
-- `origin.untrusted: true` means Sluiceway has a **positive signal** that the author is outside
+- `origin.untrusted: true` means Lawang has a **positive signal** that the author is outside
   the tenant: inbound mail from a stranger, an external guest in a shared channel.
 - `origin.untrusted: false` means **no signal.** The source did not say, the provider cannot
-  tell, or this version of Sluiceway does not look. It never means that the author is inside
+  tell, or this version of Lawang does not look. It never means that the author is inside
   the tenant, and never that the text is safe to follow.
 - `origin.automation` likewise: `true` is a positive signal that a bot or an integration wrote
   it (the source marks the author as one), `false` is no signal, never "a person wrote it".
@@ -501,10 +501,10 @@ positive signal from the source, leave it `false` otherwise.
 
 **Why two values and not three** (`true`, `false`, `unknown`). A third value would earn its
 place only if a sink could do something with "known to be inside" that it cannot do with "no
-signal", and the only such thing is to relax its guard. Sluiceway can never license that: an
+signal", and the only such thing is to relax its guard. Lawang can never license that: an
 insider's message quotes an outsider's mail, a forwarded thread, a pasted web page, and the
 author's membership says nothing about where the words came from. A value that means "safe" is
-one Sluiceway cannot honestly send, so the field has no use for a way to say it, and the
+one Lawang cannot honestly send, so the field has no use for a way to say it, and the
 two-valued form already says everything true: "we saw a reason for extra care" or "we saw none".
 
 ### The Go side and the schema agree
@@ -527,7 +527,7 @@ with the schema alone should add all three, and the schema's description lists t
 - **`supersedes` is not the record's own `id`.** JSON Schema cannot compare two fields.
 - **No field name twice in one object.** Decoders disagree on which one counts, so a validator
   that keeps the first `visibility` and a consumer that keeps the last would see two different
-  scopes in one record. Sluiceway never writes such a document. The Go decoder refuses one.
+  scopes in one record. Lawang never writes such a document. The Go decoder refuses one.
 - **The bytes of the document** (decision 8): UTF-8, and no escape for half of a surrogate pair.
   The tests state the expected outcome of these cases themselves, because the schema validator
   they use parses with `encoding/json` and so judges a document that has already been rewritten.
@@ -566,7 +566,7 @@ an error ends up in a log or an outbox row.
 - Closed sets mean a sixth `kind` after v0.1.0 is a v2. The alternative, an open `kind`, would
   push "what do I do with a kind I have never seen" onto every sink.
 - Decoding is strict and makes several passes (about 25 microseconds for the example record).
-  That is the consumer's side. On Sluiceway's side a record costs a `Validate`: about 0.25
+  That is the consumer's side. On Lawang's side a record costs a `Validate`: about 0.25
   microseconds and no allocation for a short message, and about 0.02 milliseconds for the
   largest text the format allows, which is only searched for NUL and checked for UTF-8.
 - `delete` is defined before anything sends it. If deletions turn out to need more (a whole

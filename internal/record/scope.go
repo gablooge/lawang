@@ -82,7 +82,7 @@ func ScopeID(provider, containerKind, containerID string) (string, error) {
 // a character that needs none, a lowercase hex digit and an escaped control character are all
 // refused.
 //
-// Sluiceway parses its own scope ids. A sink does not need to: to a sink a scope id is opaque,
+// Lawang parses its own scope ids. A sink does not need to: to a sink a scope id is opaque,
 // and two of them name the same scope exactly when they are equal byte for byte.
 func ParseScopeID(s string) (Scope, error) {
 	if err := checkScopeID(s); err != nil {

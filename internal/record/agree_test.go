@@ -129,7 +129,7 @@ func docCases() []docCase {
 
 	refused := []docCase{
 		// format
-		{name: "another format version", edit: set("format", "sluiceway.record/v2")},
+		{name: "another format version", edit: set("format", "lawang.record/v2")},
 		{name: "empty format", edit: set("format", "")},
 		{name: "format a number", edit: set("format", 1)},
 
@@ -524,7 +524,7 @@ type recordCase struct {
 func recordCases() []recordCase {
 	return []recordCase{
 		{name: "no format", edit: func(r *Record) { r.Format = "" }},
-		{name: "another format", edit: func(r *Record) { r.Format = "sluiceway.record/v2" }},
+		{name: "another format", edit: func(r *Record) { r.Format = "lawang.record/v2" }},
 		{name: "no id", edit: func(r *Record) { r.ID = "" }},
 		{name: "an id that is a ULID", edit: func(r *Record) { r.ID = "01JZXA8Q2K4M7N9P0R3S5T6V8W" }},
 		{name: "no op", edit: func(r *Record) { r.Op = "" }},

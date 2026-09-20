@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/gablooge/sluiceway/internal/ids"
-	"github.com/gablooge/sluiceway/internal/tenancy"
+	"github.com/gablooge/lawang/internal/ids"
+	"github.com/gablooge/lawang/internal/tenancy"
 )
 
 // A sink is promised that one id never appears with two scopes (ADR 4). The id hashes the scope,

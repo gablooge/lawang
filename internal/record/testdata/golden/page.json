@@ -1,5 +1,5 @@
 {
-  "format": "sluiceway.record/v1",
+  "format": "lawang.record/v1",
   "id": "rec_787e8dfa8545a560d1ca802c05c099ca",
   "op": "upsert",
   "source": "teams",

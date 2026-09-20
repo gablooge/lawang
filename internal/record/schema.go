@@ -4,7 +4,7 @@ import _ "embed" // the schema is part of the binary
 
 // SchemaID is the "$id" of the v1 schema. It names the schema and is not promised to resolve:
 // take the file from the repository, not from the network.
-const SchemaID = "https://gablooge.github.io/sluiceway/schema/record/v1.json"
+const SchemaID = "https://gablooge.github.io/lawang/schema/record/v1.json"
 
 //go:embed record.v1.schema.json
 var schemaV1 []byte

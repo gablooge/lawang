@@ -7,7 +7,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gablooge/sluiceway/internal/ids"
+	"github.com/gablooge/lawang/internal/ids"
 )
 
 // ErrInvalid reports a record, or a part of one, that the format forbids. The message names the

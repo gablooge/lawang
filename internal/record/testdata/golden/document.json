@@ -1,5 +1,5 @@
 {
-  "format": "sluiceway.record/v1",
+  "format": "lawang.record/v1",
   "id": "rec_7be93b8a233e264daab4d21529264b87",
   "op": "upsert",
   "source": "outlook",
