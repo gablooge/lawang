@@ -43,7 +43,7 @@ type Scope struct {
 // has exactly two colons), and an id that is empty or holds a control character is refused. The
 // result is ASCII and at most MaxScopeID bytes. The tenant is deliberately not part of it.
 func ScopeID(provider, containerKind, containerID string) (string, error) {
-	if !validName(provider, maxKind, false) {
+	if !ValidProviderKey(provider) {
 		return "", fmt.Errorf("%w: the provider key", ErrBadScopeID)
 	}
 	if !validName(containerKind, maxKind, false) {
@@ -110,7 +110,7 @@ func checkScopeID(s string) error {
 		return fmt.Errorf("%w: longer than %d bytes", ErrBadScopeID, MaxScopeID)
 	}
 	first := strings.IndexByte(s, ':')
-	if first < 0 || !validName(s[:first], maxKind, false) {
+	if first < 0 || !ValidProviderKey(s[:first]) {
 		return fmt.Errorf("%w: the provider key", ErrBadScopeID)
 	}
 	rest := s[first+1:]

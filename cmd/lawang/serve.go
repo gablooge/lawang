@@ -63,14 +63,35 @@ func listenError(ctx context.Context, err error) error {
 	return errors.New(prefix + ": the address is not valid for a TCP listener")
 }
 
-func serveOn(ctx context.Context, ln net.Listener, logger *slog.Logger) error {
-	srv := &http.Server{
-		Handler:           newMux(),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+// The timeouts every request on this server is held to. They are what stops a slow-loris client
+// from holding a connection, and they matter most for the webhook edge, which faces the public
+// internet: readHeaderTimeout cuts a client that dribbles headers and readTimeout one that
+// dribbles a body, whatever the path.
+//
+// readTimeout covers the headers and the body together, so it is the larger of the two.
+// writeTimeout is above the accept path's own bound (ingress.DefaultAcceptTimeout), so a slow
+// accept is answered by the handler with a status a provider understands rather than cut off
+// mid-response.
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 15 * time.Second
+	writeTimeout      = 30 * time.Second
+	idleTimeout       = 60 * time.Second
+)
+
+// newServer builds the HTTP server every role shares, so the timeouts are written once.
+func newServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
 	}
+}
+
+func serveOn(ctx context.Context, ln net.Listener, logger *slog.Logger) error {
+	srv := newServer(newMux())
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()

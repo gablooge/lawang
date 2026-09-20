@@ -213,7 +213,7 @@ func checkExternalID(field, s string) error {
 		return err
 	}
 	colon := strings.IndexByte(s, ':')
-	if colon < 0 || colon == len(s)-1 || !validName(s[:colon], maxKind, false) {
+	if colon < 0 || colon == len(s)-1 || !ValidProviderKey(s[:colon]) {
 		return invalid(field, "does not begin with a provider key and a colon")
 	}
 	return nil
@@ -257,3 +257,14 @@ func validName(s string, maxLen int, hyphen bool) bool {
 	}
 	return true
 }
+
+// ValidProviderKey reports whether s is an internal provider key: a lowercase letter followed by
+// up to 31 of a-z, 0-9 and underscore, so at most 32 bytes, and never a hyphen
+// ([ADR 3](../../docs/adr/0003-scope-id-format.md)).
+//
+// This function owns that rule for the whole program. The provider key is the first segment of
+// every scope id and of every external id, so a key this refuses produces records that all fail
+// in Seal, and a second copy of the pattern anywhere else is a way for the two to drift apart:
+// the provider registry calls this, and a test holds the two to the same verdict on every
+// candidate. ADR 3 freezes the grammar at v0.1.0 in both directions, hyphen included.
+func ValidProviderKey(s string) bool { return validName(s, maxKind, false) }

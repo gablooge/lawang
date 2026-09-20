@@ -326,7 +326,7 @@ func (r Record) MarshalJSON() ([]byte, error) {
 // Supersedes is usually set after sealing, once the ledger has been asked which record the new
 // ID replaces. Nothing is lost by that order: marshalling validates again.
 func (r Record) Seal(provider string, tenant tenancy.ID) (Record, error) {
-	if !validName(provider, maxKind, false) {
+	if !ValidProviderKey(provider) {
 		return Record{}, invalid("provider", "is not a provider key")
 	}
 	if r.Source != "" && r.Source != provider {

@@ -73,8 +73,11 @@ func Variables() []Variable {
 			Default: string(Production),
 		},
 		{
-			Name:    "LAWANG_DATABASE_URL",
-			Doc:     "Postgres URL (postgres:// or postgresql://) of the non-superuser application role.",
+			Name: "LAWANG_DATABASE_URL",
+			Doc: "Postgres URL (postgres:// or postgresql://) of the non-superuser application role. " +
+				"Pool and connection settings travel in the URL: pool_max_conns (the default is " +
+				"max(4, NumCPU), shared by every in-flight webhook and worker row), pool_min_conns, " +
+				"pool_max_conn_lifetime and connect_timeout (seconds).",
 			Default: "none, it is required in production. Development connects to localhost:5432, database lawang.",
 		},
 		{

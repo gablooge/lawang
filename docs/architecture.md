@@ -59,6 +59,8 @@ sequenceDiagram
   participant E as /ingress/{provider}
   participant DB as Postgres
   P->>E: POST (signed, often a thin body)
+  E->>E: registered provider? 404 if not, before anything is read
+  E->>E: capture the raw body under the size cap
   E->>E: handshake? answer and stop
   E->>DB: candidate subscriptions for the delivery keys (resolver role)
   E->>E: verify signature over the EXACT raw bytes, per candidate
@@ -75,6 +77,52 @@ sequenceDiagram
 
 Response codes are part of the contract: **401 only for a signature failure**, 2xx for everything
 else including poison, because providers retry non-2xx responses and a retry storm helps nobody.
+The full table, which `internal/ingress` implements:
+
+| Status | When |
+|---|---|
+| 202 | stored |
+| 200 | a re-send of something already stored, a delivery nobody owns, or poison that was parked |
+| 401 | **only** a signature that did not verify |
+| 404 | no such provider, answered before anything is read or stored |
+| 413 | the body is over the cap |
+| 400 | the body could not be read: a `Content-Length` that lies, a connection that stopped |
+| 503 | the accept path did not finish in time, for example a saturated connection pool |
+| 500 | a bug or an outage on our side |
+
+**The 404 is the one deliberate exception** to "2xx for everything else", and it is safe because
+nothing has happened by the time it is answered: no body read, no tenant resolved, nothing stored.
+No provider can storm on it either, since a provider only ever posts to the URL Lawang gave it,
+which names a registered provider. What reaches that branch is a scanner. The same answer covers a
+registered provider that is not a `WebhookSource`, so a registered provider and an unregistered one
+are indistinguishable from outside.
+
+**The path segment is request text.** `net/http` percent-decodes it, so `/ingress/%00` arrives as a
+NUL byte and a 500 byte segment arrives whole. The segment is used for exactly one thing, a lookup
+in the provider registry, and everything downstream is handed **the registry's own key**, which is
+a constant of the program: `outbox.Delivery.Provider` must never be text a sender chose
+([section 5](#5-idempotency) hashes it into the delivery id, and `outbox.Accept` treats an
+unstorable provider as a caller bug rather than as poison).
+
+**The body is captured once, under a cap** (`ingress.DefaultMaxBody`, 1 MiB), by an
+`http.MaxBytesReader` in front of everything that touches it, hashing included. Those exact bytes
+go to the handshake hook, to verification, to the delivery id and into the outbox row. Nothing on
+this path parses or re-serializes them (principle 1).
+
+**The handshake hook** (`WebhookSource.Handshake`) runs before any tenant exists to resolve,
+because a challenge arrives before any subscription does. Its reply is bytes and a content type,
+not JSON: Slack echoes a challenge inside a JSON object and Microsoft Graph echoes a
+`validationToken` as `text/plain`.
+
+**The accept is bounded** (`ingress.DefaultAcceptTimeout`, 2 seconds, an order of magnitude over
+the 200 ms target). Every accept holds one pool connection for its resolve and its insert, and the
+pool is `pgxpool`'s default of `max(4, NumCPU)` connections shared by every in-flight webhook, so
+past that number the requests queue inside the pool. Without a bound they would queue until the
+provider's own client gave up, and the provider would see a timeout, which many treat as an
+outage. With it they get a 503 and a `Retry-After`, which is a retry instruction every provider
+already understands. Four to eight concurrent accepts of a few milliseconds each are hundreds of
+deliveries a second, which is far past what v0.1 needs; an operator who needs more raises
+`pool_max_conns` in `LAWANG_DATABASE_URL` (see [section 4](#4-trust-model)).
 
 ### 3.2 Drain path (inside `worker`)
 
@@ -282,6 +330,16 @@ function returns is reduced in the same way, along with anything the function wr
 because a statement on a connection that has just died fails with exactly such an error. So a
 transaction function does database work only: no provider call, no sink delivery, no lookup inside
 it, which principle 6 of section 10 asks for anyway.
+
+**Pool size.** The pool is `pgxpool`'s default, `max(4, NumCPU)` connections, shared by every
+in-flight request of the process. An accept holds one for its resolve and its insert, a worker
+holds one per claimed row for each of its two transactions. That is sized for v0.1: a few
+milliseconds per accept over four to eight connections is hundreds of deliveries a second. An
+operator who needs more sets `pool_max_conns` in `LAWANG_DATABASE_URL`, which `pgxpool` reads from
+the URL, and the same URL takes `pool_min_conns` and `pool_max_conn_lifetime`. What must never
+happen is a wait with no end, so every path that acquires a connection is under a deadline and
+answers rather than hangs: the webhook edge answers 503 with a `Retry-After`
+([section 3.1](#31-accept-path-inside-serve-target-under-200-ms)).
 
 See [ADR 2](adr/0002-migrations-goose.md).
 
@@ -506,6 +564,23 @@ type AccessSink interface {
 }
 ```
 
+**The registry.** `provider.NewRegistry(providers...)` is built once, from a list known at compile
+time, and never changes, so every read of it on the accept path is safe with no lock. It validates
+each `Key()` by calling `record.ValidProviderKey`, the one function that owns
+[ADR 3](adr/0003-scope-id-format.md)'s grammar (`[a-z][a-z0-9_]{0,31}`, no hyphen), and not by
+carrying a copy of the pattern: a registry that accepted `ms-graph` would register a provider
+whose every record fails in `Seal`. It calls `Key()` exactly once, at registration, and hands back
+its own copy of the string from then on, which is what makes `outbox.Delivery.Provider` a constant
+of the program rather than a decoded path segment.
+
+**What lands when.** `Provider` and `WebhookSource` are in `internal/provider` from B06, because
+the ingress edge is built on them. `Registrar`, `Reconciler` and `MemberSource` arrive with the
+items that decide the types they take, and not before: `Subscription` is B07's (the hub and the
+subscription table), `Credential` is B13's and B14's (the vault and `connect`), `Cursor` is B19's
+(reconciliation) and `ScopeMembers` is B23's (access sync). An interface written before its types
+are settled is a shape every later item has to rewrite, and the rewrite is not free once a
+provider package implements it.
+
 Built-in implementations planned for v0.1:
 
 | Seam | Implementations |
@@ -531,8 +606,8 @@ internal/
   store/              pgx pool, preflight, transaction helpers, migrate
   testdb/             a real Postgres for integration tests, as the application role
   outbox/             accept insert, FIFO-head claim, retry ladder, dead letters
-  ingress/            the /ingress/{provider} HTTP edge
-  hub/                handshake, verify, resolve owner, accept
+  ingress/            the /ingress/{provider} HTTP edge: raw body, size cap, handshake
+  hub/                verify, resolve owner, accept
   pipeline/           normalize, gate, ledger, supersede, mask, deliver
   worker/             drain and sweeps as independent goroutines
   reconcile/          cursors and chunked replay
@@ -541,6 +616,7 @@ internal/
   vault/              Vault interface and implementations
   sink/               Sink interface and implementations
   provider/           Provider interfaces and the registry
+    fake/             a strict test double of a webhook provider, imported by tests only
     clickup/  slack/  teams/  outlook/  hubspot/
 migrations/           SQL, embedded into the binary; bootstrap/ is the one-time admin script
 docs/
@@ -618,6 +694,9 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 
 | Failure | Class | Action |
 |---|---|---|
+| No such provider on the path | unroutable | 404, before anything is read, nothing stored |
+| Body over the size cap | unstorable | 413, the body is never accumulated |
+| Body could not be read (a `Content-Length` that lies) | unstorable | 400, nothing stored |
 | Signature invalid | untrusted | 401, nothing stored |
 | Unknown workspace or ambiguous owner | unattributable | parked under a sentinel tenant, re-resolved periodically, deleted after retention |
 | Hydration fails | degradable | deliver a minimal record, the change is still tracked |
@@ -626,6 +705,7 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered; ops is alerted |
 | Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; replay is always safe |
 | Vault unreachable | fail closed | retry on the ladder; nothing is delivered unverified |
+| Accept path out of time (a saturated pool, a slow database) | retryable | 503 with a `Retry-After`, nothing stored |
 
 ---
 
