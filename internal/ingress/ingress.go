@@ -86,6 +86,10 @@ const pathValue = "provider"
 // it. It is derived from routePath rather than written down a second time, so the two cannot
 // drift apart. Route.check refuses a caller's route under it, because such a route is more
 // specific than routePath and would answer deliveries in the edge's place.
+//
+// The +1 keeps the trailing slash, and it is load bearing: without it the prefix would be
+// "/ingress" and a caller's "/ingress", "/ingressive" or "/ingressX/y" would be refused, none of
+// which can ever match a path the webhook pattern answers.
 var edgePrefix = routePath[:strings.LastIndex(routePath, "/")+1]
 
 // notFoundBody is the only thing this package says to a request it refuses before the hub: an
@@ -203,6 +207,11 @@ func (v Verdict) status() int {
 // now, the operator API when it lands. Routes are given to New rather than registered by the
 // caller on a mux of its own, because both of the redirects net/http.ServeMux answers have to be
 // stopped where the routing table is built, and New is where it is built (see New).
+//
+// Because New adds routes of its own to stop those redirects, a set of Routes that a bare
+// net/http.ServeMux would accept can still be refused at start: see "A routing table net/http
+// would accept can still be refused here" on New for the one shape this happens to, and for the
+// way out (name the Method on the subtree route).
 type Route struct {
 	// Method is the one method the route answers, spelled as net/http spells it ("GET"). Empty
 	// means every method. Method matching is case sensitive, so a lower case spelling would
@@ -210,9 +219,18 @@ type Route struct {
 	Method string
 	// Path is the pattern's path and must start with a slash: "/healthz", "/v1/tenants/{id}",
 	// or "/v1/" for a subtree. A host is not part of it, because everything here is served on
-	// whatever host reaches the listener. A path under the webhook endpoint's own prefix
-	// ("/ingress/") is refused, whatever it is spelled as: such a route is more specific than
-	// the webhook pattern, so it would answer deliveries in the edge's place.
+	// whatever host reaches the listener.
+	//
+	// It must be spelled the way net/http stores it, which means no percent-escape anywhere in
+	// it. net/http's pattern parser decodes a literal segment before it stores it, so
+	// "/%69ngress/fake" is the pattern "/ingress/fake" and no check that reads this string can
+	// see that. An escape is refused rather than decoded, because nothing this program wires
+	// needs one: a Route is a Go string literal in Lawang's own source.
+	//
+	// A path under the webhook endpoint's own prefix ("/ingress/") is refused: such a route is
+	// more specific than the webhook pattern, so it would answer deliveries in the edge's
+	// place. The escape rule above is what makes that test on the written path a test on the
+	// pattern net/http ends up matching with.
 	Path string
 	// Handler answers the route. It is served behind the path guard, like the edge itself.
 	Handler http.Handler
@@ -238,6 +256,19 @@ func (r Route) check() error {
 	}
 	if strings.ContainsAny(r.Path, " \t") {
 		return errors.New("the path must not contain a space")
+	}
+	// Everything below this line, and the redirect probe in newMux, reads the path as it is
+	// written. net/http reads the path as its pattern parser stored it, which is not the same
+	// string when a literal segment carries a percent-escape, and the gap between the two is a
+	// defect in both directions. "/%69ngress/fake" and "/ingres%73/fake" are stored as the
+	// pattern "/ingress/fake", so they walk past the prefix check below and answer deliveries in
+	// the edge's place. "/a/%7Bx%7D" is stored as the literal segment {x}, which is the text a
+	// wildcard pattern is probed with, so newMux reads "no redirect" for a family of paths that
+	// all still redirect. Refusing the escape closes both at once and costs a caller nothing,
+	// since no route this program wires needs one.
+	if strings.Contains(r.Path, "%") {
+		return errors.New("the path must be spelled the way net/http stores it, with no percent-escape: " +
+			"the pattern parser decodes a literal segment, so the path that is matched would not be the path that is written")
 	}
 	// A literal under the webhook prefix is more specific than routePath, so net/http.ServeMux
 	// would hand it every delivery for that provider and the edge would never see one. The
@@ -306,6 +337,21 @@ type edge struct {
 // mode that a caller who wrote mux.Handle(pattern, h) themselves, or who dropped the return value,
 // got the unguarded mux and all three redirects back, with nothing in go build, go vet or
 // golangci-lint to say so. Other routes go in Options.Routes, so they are behind the guard too.
+//
+// # A routing table net/http would accept can still be refused here
+//
+// The route New adds to take a redirect away carries the method of the route that needed it, so a
+// Route with no Method gets a guard with no method, and in net/http a method-less literal
+// conflicts with a method-specific wildcard at the same depth. A table of
+//
+//	{Path: "/v1/tenants/"} and {Method: "GET", Path: "/v1/{name}"}
+//
+// is legal for a bare net/http.ServeMux and is refused here: nothing answers /v1/tenants, so the
+// guard "/v1/tenants" is needed, and it conflicts with GET /v1/{name}. The error says which
+// pattern is this package's own, because the caller never wrote it. The way out is to name the
+// method on the subtree route ({Method: "GET", Path: "/v1/tenants/"}), which makes the guard
+// method-specific too and leaves nothing to conflict. This is the only shape known to be refused,
+// and a caller that gives every route a Method never meets it.
 func New(reg *provider.Registry, hub Hub, opts Options) (http.Handler, error) {
 	if reg == nil {
 		return nil, errors.New("ingress: a provider registry is required")
@@ -440,6 +486,12 @@ func newMux(h *edge, routes []Route) (_ *http.ServeMux, err error) {
 		// probe learns it too, so a second route with the same root sees an exact match here and
 		// asks for no route of its own. That is the whole of the deduplication.
 		probe.Handle(guarding, nothing)
+		// Cleared so that guarding names a route in flight and nothing else. Deleting this line
+		// changes no message and no answer, so that mutation is equivalent: guarding is assigned
+		// unconditionally just above, immediately before the only two calls in this function that
+		// can panic while it is read, and nothing between one guard and the next can panic. It
+		// stays because the invariant is what the deferred recover above is written against, and
+		// a panic site added after this loop would read a stale name without it.
 		guarding = ""
 	}
 	return mux, nil
@@ -455,7 +507,10 @@ func newMux(h *edge, routes []Route) (_ *http.ServeMux, err error) {
 // deliberately is not read: an earlier version enumerated the spellings that can match the empty
 // segment a trailing slash leaves (a trailing slash, {name...}, {$}) and missed a fourth, since
 // net/http stores a literal segment written %2F as the same segment as {$}, so POST /a answered
-// 307 to /a/ for a route the enumeration said had no root.
+// 307 to /a/ for a route the enumeration said had no root. Route.check refuses that fourth
+// spelling outright now, but reading the last segment is still the wrong shape of answer: it puts
+// this function in the business of knowing what net/http does with a segment, which is the
+// business the whole mechanism exists to get out of.
 //
 // Whether the redirect really fires is for redirects to answer, because that depends on every
 // other pattern in the table. A pattern with a single segment ("/healthz", "/", "/{$}",
@@ -473,17 +528,30 @@ func redirectRoot(p string) (string, bool) {
 // the mux rather than predicting the answer from the pattern strings. Every handler in the mux it
 // is given does nothing (see newMux), so asking cannot run a caller's handler, cannot reach the
 // edge, and cannot touch anything outside this call.
+//
+// # One path stands for a whole family
+//
+// The path asked about is one representative of everything the pattern matches, and a wildcard
+// segment is asked about as the literal text it is written as: the question put for POST /a/{x}/
+// is "does POST /a/{x} redirect". The answer generalises to every path in the family because no
+// pattern in the table can single that text out. Matching a segment exactly needs a literal
+// pattern segment equal to it, net/http reads a bare "{" as the start of a wildcard, and
+// Route.check refuses the percent-escape that is the only other way to write one. Without that
+// rule a table of POST /a/{x}/ plus POST /a/%7Bx%7D answers POST /a/b with a 307.
+//
+// The same rule is why url.URL.Path alone is enough to build the request. The mux matches on
+// EscapedPath, which is computed from Path when RawPath is unset, and with no escape in the path
+// to preserve the segments it yields are the ones the pattern parser stored either way.
 func redirects(mux *http.ServeMux, method, path string) bool {
-	u := &url.URL{Path: path}
-	if decoded, err := url.PathUnescape(path); err == nil {
-		// The mux matches on EscapedPath, which returns RawPath only when RawPath is a valid
-		// encoding of Path, so a path carrying a percent-escape needs both fields set. When it
-		// cannot be decoded, Path alone is right: net/http's own pattern parser leaves an
-		// undecodable segment as it is written, and so does EscapedPath.
-		u.Path, u.RawPath = decoded, path
-	}
 	var answered statusOnly
-	mux.ServeHTTP(&answered, &http.Request{Method: method, URL: u, Header: make(http.Header)})
+	// Header is a nil-map guard and nothing else: nothing on this path reads it, so dropping it
+	// changes no answer.
+	req := &http.Request{Method: method, URL: &url.URL{Path: path}, Header: make(http.Header)}
+	mux.ServeHTTP(&answered, req)
+	// The upper bound is load bearing. A 404 or a 405 is not a redirect, and reading one as a
+	// redirect would register a guard where none belongs: the mux's own 405 with its Allow
+	// header would become this package's "no such provider" 404, on a path that has nothing to
+	// do with a provider.
 	return answered.code >= 300 && answered.code < 400
 }
 
@@ -503,6 +571,10 @@ func (s *statusOnly) Header() http.Header {
 
 func (s *statusOnly) Write(b []byte) (int, error) { return len(b), nil }
 
+// WriteHeader keeps the first status, as a real http.ResponseWriter does. Keeping the last one
+// instead changes no answer here, because nothing the probe runs ever writes a header twice, so
+// that mutation is equivalent; first-wins stays because it is what the real thing does and a
+// double must not be looser than what it stands in for.
 func (s *statusOnly) WriteHeader(code int) {
 	if s.code == 0 {
 		s.code = code

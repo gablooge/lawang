@@ -127,10 +127,27 @@ would redirect is a property of the whole table and not of any one pattern, so `
 predict it from the pattern strings: it builds the table, builds a second mux carrying the same
 patterns and handlers that do nothing, and puts the question to that one. Predicting it was wrong
 in both directions, burying a route the mux already answered exactly and refusing a table
-`net/http` accepts. A `Route` under the webhook endpoint's own prefix (`/ingress/`) is refused at
-start, because such a route is more specific than the webhook pattern and would answer deliveries
-in the edge's place. No bare mux exists for a caller to serve by mistake, which is what an earlier
-`Mount(mux)` shape allowed with nothing in `go build`, `go vet` or `golangci-lint` to say so.
+`net/http` accepts. The question is put for one representative path per pattern, and a wildcard
+segment is asked about as the text it is written as (`{x}`), which generalises to the whole family
+only because nothing in the table can single that text out. A `Route` under the webhook endpoint's
+own prefix (`/ingress/`) is refused at start, because such a route is more specific than the
+webhook pattern and would answer deliveries in the edge's place. Both of those depend on a
+`Route.Path` being spelled the way `net/http` stores it, so **a percent-escape in a `Route.Path`
+is refused**: the pattern parser decodes a literal segment, so `/%69ngress/fake` is the pattern
+`/ingress/fake` and `/a/%7Bx%7D` is the literal segment `{x}`, and a check that reads the written
+string sees neither. No route this program wires needs one. No bare mux exists for a caller to
+serve by mistake, which is what an earlier `Mount(mux)` shape allowed with nothing in `go build`,
+`go vet` or `golangci-lint` to say so.
+
+**A routing table `net/http` would accept can still be refused at start**, because the route `New`
+adds to take a redirect away is a route like any other. It carries the method of the route that
+needed it, so a `Route` with no `Method` gets a method-less guard, and in `net/http` a method-less
+literal conflicts with a method-specific wildcard at the same depth: `{Path: "/v1/tenants/"}` plus
+`{Method: "GET", Path: "/v1/{name}"}` is legal for a bare `ServeMux` and is refused here, with a
+message naming the pattern `ingress` tried to add rather than one the caller wrote. Naming the
+method on the subtree route makes the guard method-specific too and removes the conflict, so a
+caller that gives every `Route` a `Method` never meets it. The `/v1` operator API (B08) is the
+caller this applies to.
 
 **The body is captured once, under a cap** (`ingress.DefaultMaxBody`, 1 MiB), by an
 `http.MaxBytesReader` in front of everything that touches it, hashing included. Those exact bytes

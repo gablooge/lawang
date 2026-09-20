@@ -1314,25 +1314,46 @@ func TestNoRouteIsEverAnsweredWithARedirect(t *testing.T) {
 				"/v1/a/": http.StatusTeapot,
 			},
 		},
-		// A last segment written %2F. net/http unescapes a literal segment when it parses a
-		// pattern, so this one is stored as the segment {$} is stored as, and the mux answers
-		// POST /a with 307 Location: /a/. The enumeration of "three spellings" this test used to
-		// assert said there was no path to redirect from here.
-		"a last segment that percent-decodes to a slash": {
-			routes: []ingress.Route{{Method: http.MethodPost, Path: "/a/%2F", Handler: teapot}},
+		// Two routes whose only relation to the webhook prefix is that they start with the same
+		// letters. None of them can match a path POST /ingress/{provider} answers, so all three
+		// are legitimate and must keep working: the prefix Route.check refuses is "/ingress/"
+		// with its slash, not the word. Dropping the slash refuses every route here, and no
+		// other case would notice, because the rest of the suite only ever asserts what is
+		// refused.
+		"paths that only begin like the webhook prefix": {
+			routes: []ingress.Route{
+				{Method: http.MethodPost, Path: "/ingress", Handler: teapot},
+				{Method: http.MethodPost, Path: "/ingressive", Handler: ok},
+				{Method: http.MethodPost, Path: "/ingressX/y", Handler: ok},
+			},
 			want: map[string]int{
-				"/a":  http.StatusNotFound,
-				"/a/": http.StatusTeapot,
+				"/ingress":    http.StatusTeapot,
+				"/ingressive": http.StatusOK,
+				"/ingressX/y": http.StatusOK,
+				"/ingressX":   http.StatusNotFound,
 			},
 		},
-		// A subtree whose slash-less path carries a percent-escape. The mux matches on the
-		// escaped path and unescapes a segment at a time, so the question put to it has to be
-		// asked in the spelling the sender would use, not in the decoded one.
-		"a subtree whose root carries a percent-escape": {
-			routes: []ingress.Route{{Method: http.MethodPost, Path: "/a%2Fb/", Handler: teapot}},
+		// A parent path that the mux answers with something that is neither 2xx nor a redirect.
+		// The probe for GET /v1/a/b asks about GET /v1/a, which the mux answers 405 because
+		// POST /v1/a exists, and the probe for POST /v1/a asks about POST /v1, which is 404.
+		// Neither is a redirect, so neither gets a route. Reading any status over 299 as a
+		// redirect puts a 404 handler at GET /v1/a and at POST /v1 instead, which turns the
+		// mux's own 405 and its Allow header into this package's "no such provider", on paths
+		// that have nothing to do with a provider.
+		"a parent the mux refuses rather than redirects": {
+			routes: []ingress.Route{
+				{Method: http.MethodGet, Path: "/v1/a/b", Handler: teapot},
+				{Method: http.MethodPost, Path: "/v1/a", Handler: ok},
+			},
 			want: map[string]int{
-				"/a%2Fb":  http.StatusNotFound,
-				"/a%2Fb/": http.StatusTeapot,
+				"/v1":     http.StatusNotFound,
+				"/v1/a":   http.StatusOK,
+				"/v1/a/b": http.StatusMethodNotAllowed,
+			},
+			wantGET: map[string]int{
+				"/v1":     http.StatusNotFound,
+				"/v1/a":   http.StatusMethodNotAllowed,
+				"/v1/a/b": http.StatusTeapot,
 			},
 		},
 		// A rooted pattern has no slash-less path to redirect from: the mux cleans an empty path
@@ -1410,6 +1431,21 @@ func TestARouteNewCannotServeIsRefusedAtStart(t *testing.T) {
 		"a literal under the webhook endpoint": {Method: http.MethodPost, Path: "/ingress/fake", Handler: nothing},
 		"a subtree under the webhook endpoint": {Path: "/ingress/{rest...}", Handler: nothing},
 		"the webhook pattern itself":           {Method: http.MethodPost, Path: "/ingress/{provider}", Handler: nothing},
+		// A percent-escape anywhere in the path. net/http decodes a literal segment when it
+		// parses the pattern, so the string a check reads here is not the pattern the mux
+		// matches with, and both of these used to walk past the prefix check above and answer
+		// every delivery for that provider in the edge's place, with nothing logged.
+		"the webhook prefix with an escaped letter":       {Method: http.MethodPost, Path: "/%69ngress/fake", Handler: nothing},
+		"the webhook prefix with a second escaped letter": {Method: http.MethodPost, Path: "/ingres%73/fake", Handler: nothing},
+		// The same rule from the other side: a literal segment written as an escaped brace is
+		// stored as the text a wildcard pattern is probed with, so a table of POST /a/{x}/ plus
+		// this route made newMux read "no redirect" for a family where POST /a/b still answered
+		// 307 Location: /a/b/ over a real socket.
+		"a literal segment written as an escaped brace": {Method: http.MethodPost, Path: "/a/%7Bx%7D", Handler: nothing},
+		// Two spellings that were accepted before the rule and are refused by it rather than
+		// decoded. Neither is a path this program would ever wire.
+		"a last segment that percent-decodes to a slash": {Method: http.MethodPost, Path: "/a/%2F", Handler: nothing},
+		"a percent-escape that decodes to nothing legal": {Method: http.MethodPost, Path: "/a/%zz", Handler: nothing},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1467,6 +1503,29 @@ func TestARouteNewCannotServeIsRefusedAtStart(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "redirect") || !strings.Contains(err.Error(), `"/v1/tenants"`) {
 		t.Fatalf("the refusal does not say which route is this package's own: %v", err)
+	}
+
+	// The same, with two routes that each need one of these package's own routes and the SECOND
+	// one being the route net/http refuses. /a/x gets in, /b/y conflicts with GET /b/{z}. The
+	// message has to name /b/y: naming /a/x would send a developer to a route that registered
+	// perfectly well, which is what happens if the name of the route in flight is not cleared
+	// once that route is in.
+	_, err = ingress.New(reg, &testHub{}, ingress.Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Routes: []ingress.Route{
+			{Path: "/a/x/", Handler: nothing},
+			{Path: "/b/y/", Handler: nothing},
+			{Method: http.MethodGet, Path: "/b/{z}", Handler: nothing},
+		},
+	})
+	if err == nil {
+		t.Fatal("New accepted a table whose second guard route conflicts")
+	}
+	if !strings.Contains(err.Error(), `"/b/y"`) {
+		t.Fatalf("the refusal does not name the route that was refused: %v", err)
+	}
+	if strings.Contains(err.Error(), `"/a/x"`) {
+		t.Fatalf("the refusal names a route that registered fine: %v", err)
 	}
 }
 
