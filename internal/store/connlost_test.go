@@ -16,8 +16,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/gablooge/sluiceway/internal/store"
-	"github.com/gablooge/sluiceway/internal/testdb"
+	"github.com/gablooge/lawang/internal/store"
+	"github.com/gablooge/lawang/internal/testdb"
 )
 
 // forwarder is a TCP listener on the loopback that relays every connection to target. It stands
@@ -268,7 +268,7 @@ func TestALostDatabaseNeverEchoesTheURL(t *testing.T) {
 			continue
 		}
 		assertNoLeakAtAnyDepth(t, entry.name, err, markers...)
-		if !strings.Contains(err.Error(), "SLUICEWAY_DATABASE_URL") || !strings.Contains(err.Error(), "refused") {
+		if !strings.Contains(err.Error(), "LAWANG_DATABASE_URL") || !strings.Contains(err.Error(), "refused") {
 			t.Errorf("%s: the error does not name the variable and the cause: %v", entry.name, err)
 		}
 		// What a caller may match on has to survive: a retry loop tells "refused" from the rest.
@@ -300,7 +300,7 @@ func TestANetErrorFromTheTransactionFunctionIsReplacedToo(t *testing.T) {
 		"RoleTx":   func(fn func(pgx.Tx) error) error { return db.RoleTx(ctx, store.RoleWorker, fn) },
 	} {
 		err := run(func(pgx.Tx) error { return ownNetErr })
-		if err == nil || !strings.HasPrefix(err.Error(), "SLUICEWAY_DATABASE_URL: ") {
+		if err == nil || !strings.HasPrefix(err.Error(), "LAWANG_DATABASE_URL: ") {
 			t.Errorf("%s: err = %v, want the net error replaced", name, err)
 			continue
 		}

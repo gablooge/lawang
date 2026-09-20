@@ -1,6 +1,6 @@
-// Package config reads Sluiceway's configuration from the environment.
+// Package config reads Lawang's configuration from the environment.
 //
-// Defaults fail closed: an unset SLUICEWAY_ENV means production, and production refuses to start
+// Defaults fail closed: an unset LAWANG_ENV means production, and production refuses to start
 // on anything it would otherwise have to guess.
 package config
 
@@ -27,7 +27,7 @@ const (
 // devDatabaseURL is where the compose stack of backlog item B27 will put Postgres. Until that item
 // lands nothing in this repository starts such a database. It is only ever used when development
 // is explicit.
-const devDatabaseURL = "postgres://sluiceway:sluiceway@localhost:5432/sluiceway?sslmode=disable" //nolint:gosec // local development only, never reachable in production
+const devDatabaseURL = "postgres://lawang:lawang@localhost:5432/lawang?sslmode=disable" //nolint:gosec // local development only, never reachable in production
 
 // Config is the full process configuration.
 type Config struct {
@@ -38,7 +38,7 @@ type Config struct {
 	LogFormat   string // "json" or "text"
 }
 
-// defaultListenAddr is where serve listens when SLUICEWAY_LISTEN_ADDR is unset.
+// defaultListenAddr is where serve listens when LAWANG_LISTEN_ADDR is unset.
 const defaultListenAddr = ":8080"
 
 // The values of the enumerated variables. Load validates against these slices and Variables
@@ -67,29 +67,29 @@ type Variable struct {
 func Variables() []Variable {
 	return []Variable{
 		{
-			Name:    "SLUICEWAY_ENV",
+			Name:    "LAWANG_ENV",
 			Doc:     "The deployment environment. Anything unrecognized is refused, never treated as development.",
 			Values:  slices.Clone(envValues),
 			Default: string(Production),
 		},
 		{
-			Name:    "SLUICEWAY_DATABASE_URL",
+			Name:    "LAWANG_DATABASE_URL",
 			Doc:     "Postgres URL (postgres:// or postgresql://) of the non-superuser application role.",
-			Default: "none, it is required in production. Development connects to localhost:5432, database sluiceway.",
+			Default: "none, it is required in production. Development connects to localhost:5432, database lawang.",
 		},
 		{
-			Name:    "SLUICEWAY_LISTEN_ADDR",
+			Name:    "LAWANG_LISTEN_ADDR",
 			Doc:     "host:port or :port for serve. The port is a number from 0 to 65535, not a service name.",
 			Default: defaultListenAddr,
 		},
 		{
-			Name:    "SLUICEWAY_LOG_LEVEL",
+			Name:    "LAWANG_LOG_LEVEL",
 			Doc:     "The lowest level that is logged. Case does not matter.",
 			Values:  slices.Clone(logLevelValues),
 			Default: strings.ToLower(slog.LevelInfo.String()),
 		},
 		{
-			Name:    "SLUICEWAY_LOG_FORMAT",
+			Name:    "LAWANG_LOG_FORMAT",
 			Doc:     "The encoding of the log on stderr. Case does not matter.",
 			Values:  slices.Clone(logFormatValues),
 			Default: "json in production, text in development",
@@ -130,7 +130,7 @@ func (c Config) GoString() string { return "config.Config" + c.String() }
 //
 // No error echoes a received value, for any variable. Load cannot know which variable a secret was
 // pasted into: a manifest with two entries swapped puts the database URL, password included, into
-// SLUICEWAY_ENV, and the refusal is printed to the container log.
+// LAWANG_ENV, and the refusal is printed to the container log.
 func Load(getenv func(string) string) (Config, error) {
 	var errs []error
 
@@ -140,41 +140,41 @@ func Load(getenv func(string) string) (Config, error) {
 		LogLevel:   slog.LevelInfo,
 	}
 
-	if v := getenv("SLUICEWAY_ENV"); v != "" {
+	if v := getenv("LAWANG_ENV"); v != "" {
 		if slices.Contains(envValues, v) {
 			cfg.Env = Env(v)
 		} else {
 			// An unrecognized value stays production. A typo must never relax anything.
-			errs = append(errs, notOneOf("SLUICEWAY_ENV", envValues))
+			errs = append(errs, notOneOf("LAWANG_ENV", envValues))
 		}
 	}
 
-	cfg.DatabaseURL = getenv("SLUICEWAY_DATABASE_URL")
+	cfg.DatabaseURL = getenv("LAWANG_DATABASE_URL")
 	switch {
 	case cfg.DatabaseURL != "":
 		if err := checkDatabaseURL(cfg.DatabaseURL); err != nil {
-			errs = append(errs, fmt.Errorf("SLUICEWAY_DATABASE_URL: %w", err))
+			errs = append(errs, fmt.Errorf("LAWANG_DATABASE_URL: %w", err))
 		}
 	case cfg.Env == Development:
 		cfg.DatabaseURL = devDatabaseURL
 	default:
-		errs = append(errs, errors.New("SLUICEWAY_DATABASE_URL: required in production"))
+		errs = append(errs, errors.New("LAWANG_DATABASE_URL: required in production"))
 	}
 
-	if v := getenv("SLUICEWAY_LISTEN_ADDR"); v != "" {
+	if v := getenv("LAWANG_LISTEN_ADDR"); v != "" {
 		if err := checkListenAddr(v); err != nil {
-			errs = append(errs, fmt.Errorf("SLUICEWAY_LISTEN_ADDR: %w", err))
+			errs = append(errs, fmt.Errorf("LAWANG_LISTEN_ADDR: %w", err))
 		} else {
 			cfg.ListenAddr = v
 		}
 	}
 
-	if v := strings.ToLower(getenv("SLUICEWAY_LOG_LEVEL")); v != "" {
+	if v := strings.ToLower(getenv("LAWANG_LOG_LEVEL")); v != "" {
 		// Only the documented names. slog on its own would also take offsets such as "info+2",
 		// which the usage text does not list. Its parse error quotes its input, so it is
 		// deliberately not wrapped.
 		if !slices.Contains(logLevelValues, v) || cfg.LogLevel.UnmarshalText([]byte(v)) != nil {
-			errs = append(errs, notOneOf("SLUICEWAY_LOG_LEVEL", logLevelValues))
+			errs = append(errs, notOneOf("LAWANG_LOG_LEVEL", logLevelValues))
 		}
 	}
 
@@ -182,11 +182,11 @@ func Load(getenv func(string) string) (Config, error) {
 	if cfg.Env == Development {
 		cfg.LogFormat = "text"
 	}
-	if v := strings.ToLower(getenv("SLUICEWAY_LOG_FORMAT")); v != "" {
+	if v := strings.ToLower(getenv("LAWANG_LOG_FORMAT")); v != "" {
 		if slices.Contains(logFormatValues, v) {
 			cfg.LogFormat = v
 		} else {
-			errs = append(errs, notOneOf("SLUICEWAY_LOG_FORMAT", logFormatValues))
+			errs = append(errs, notOneOf("LAWANG_LOG_FORMAT", logFormatValues))
 		}
 	}
 

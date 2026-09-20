@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gablooge/sluiceway/internal/appversion"
-	"github.com/gablooge/sluiceway/internal/config"
+	"github.com/gablooge/lawang/internal/appversion"
+	"github.com/gablooge/lawang/internal/config"
 )
 
 const shutdownGrace = 15 * time.Second
@@ -35,7 +35,7 @@ func serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 // error is never returned, wrapped or formatted: only the parts of it that cannot carry the address
 // are kept, which is enough to tell "in use" from "not permitted" from "does not resolve".
 func listenError(ctx context.Context, err error) error {
-	const prefix = "SLUICEWAY_LISTEN_ADDR: cannot listen"
+	const prefix = "LAWANG_LISTEN_ADDR: cannot listen"
 
 	// An errno's text comes from the operating system's table ("address already in use",
 	// "permission denied", "can't assign requested address"), never from the input. Wrapping it

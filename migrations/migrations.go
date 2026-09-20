@@ -1,9 +1,9 @@
-// Package migrations embeds the SQL that defines Sluiceway's database.
+// Package migrations embeds the SQL that defines Lawang's database.
 package migrations
 
 import "embed"
 
-// FS holds the goose migrations, applied by "sluiceway migrate" as the application role.
+// FS holds the goose migrations, applied by "lawang migrate" as the application role.
 //
 //go:embed *.sql
 var FS embed.FS

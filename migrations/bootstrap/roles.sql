@@ -1,7 +1,7 @@
--- Sluiceway database bootstrap.
+-- Lawang database bootstrap.
 --
 -- Run ONCE per database, connected to that database, as an administrator. Everything after this
--- (migrations, serve, worker) runs as the non-superuser role "sluiceway". Requires Postgres 16 or
+-- (migrations, serve, worker) runs as the non-superuser role "lawang". Requires Postgres 16 or
 -- newer.
 --
 -- The administrator is either a superuser, or, as on most managed Postgres, a non-superuser role
@@ -15,16 +15,16 @@
 -- The script is a single statement, so it applies completely or not at all, whatever client
 -- sends it. Keep it that way. It is safe to run again, also as a different administrator, and it
 -- leaves the administrator's own role memberships exactly as it found them. It refuses a database
--- that already has a schema "sluiceway" owned by any other role.
+-- that already has a schema "lawang" owned by any other role.
 --
---   sluiceway migrate bootstrap | psql "$ADMIN_DATABASE_URL"
---   psql "$ADMIN_DATABASE_URL" -c "ALTER ROLE sluiceway PASSWORD '...'"
+--   lawang migrate bootstrap | psql "$ADMIN_DATABASE_URL"
+--   psql "$ADMIN_DATABASE_URL" -c "ALTER ROLE lawang PASSWORD '...'"
 --
 -- Three roles (docs/architecture.md, section 4):
---   sluiceway           the application role. NOSUPERUSER NOBYPASSRLS, so row-level security
---                       actually applies to it.
---   sluiceway_resolver  reads the delivery-resolution columns of subscriptions across tenants.
---   sluiceway_worker    claims outbox rows across tenants, then re-binds to each row's tenant.
+--   lawang           the application role. NOSUPERUSER NOBYPASSRLS, so row-level security
+--                    actually applies to it.
+--   lawang_resolver  reads the delivery-resolution columns of subscriptions across tenants.
+--   lawang_worker    claims outbox rows across tenants, then re-binds to each row's tenant.
 --
 -- The two helper roles cannot log in. The application role is a member of both WITH INHERIT
 -- FALSE, so it never picks up their wider policies silently: it has to enter one explicitly with
@@ -45,27 +45,27 @@ BEGIN
   -- nothing, instead of reporting success and leaving the service to fail later.
   SELECT r.rolname INTO schema_owner
     FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner
-   WHERE n.nspname = 'sluiceway';
-  IF FOUND AND schema_owner <> 'sluiceway' THEN
-    RAISE EXCEPTION 'schema "sluiceway" already exists and is owned by "%", not by the role "sluiceway"', schema_owner
+   WHERE n.nspname = 'lawang';
+  IF FOUND AND schema_owner <> 'lawang' THEN
+    RAISE EXCEPTION 'schema "lawang" already exists and is owned by "%", not by the role "lawang"', schema_owner
       USING ERRCODE = 'object_not_in_prerequisite_state',
-            HINT = 'If it is meant for Sluiceway, run ALTER SCHEMA sluiceway OWNER TO sluiceway as a superuser and apply this script again. Otherwise use another database.';
+            HINT = 'If it is meant for Lawang, run ALTER SCHEMA lawang OWNER TO lawang as a superuser and apply this script again. Otherwise use another database.';
   END IF;
 
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'sluiceway') THEN
-    CREATE ROLE sluiceway LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'lawang') THEN
+    CREATE ROLE lawang LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
   END IF;
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'sluiceway_resolver') THEN
-    CREATE ROLE sluiceway_resolver NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'lawang_resolver') THEN
+    CREATE ROLE lawang_resolver NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
   END IF;
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'sluiceway_worker') THEN
-    CREATE ROLE sluiceway_worker NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'lawang_worker') THEN
+    CREATE ROLE lawang_worker NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
   END IF;
 
-  GRANT sluiceway_resolver TO sluiceway WITH INHERIT FALSE, SET TRUE;
-  GRANT sluiceway_worker TO sluiceway WITH INHERIT FALSE, SET TRUE;
+  GRANT lawang_resolver TO lawang WITH INHERIT FALSE, SET TRUE;
+  GRANT lawang_worker TO lawang WITH INHERIT FALSE, SET TRUE;
 
-  -- Sluiceway keeps everything in its own schema, owned by the application role, so migrations
+  -- Lawang keeps everything in its own schema, owned by the application role, so migrations
   -- need no rights on "public". If the schema is already there, the rest has nothing to do.
   IF schema_owner IS NOT NULL THEN
     RETURN;
@@ -81,28 +81,28 @@ BEGIN
   -- 'inherit' makes one), the GRANT below rewrites that row instead of adding one, and a REVOKE
   -- would then delete what the administrator had before. So remember the rows as they were, and
   -- afterwards put back whichever one changed, or remove the one that is new.
-  borrow := NOT pg_has_role(current_user, 'sluiceway', 'SET');
+  borrow := NOT pg_has_role(current_user, 'lawang', 'SET');
   IF borrow THEN
     SELECT coalesce(jsonb_object_agg(a.grantor::text, jsonb_build_object('inherit', a.inherit_option, 'set', a.set_option)), '{}')
       INTO before
       FROM pg_auth_members a
-     WHERE a.roleid = 'sluiceway'::regrole AND a.member = me;
-    GRANT sluiceway TO CURRENT_USER WITH INHERIT FALSE, SET TRUE;
+     WHERE a.roleid = 'lawang'::regrole AND a.member = me;
+    GRANT lawang TO CURRENT_USER WITH INHERIT FALSE, SET TRUE;
   END IF;
 
-  CREATE SCHEMA sluiceway AUTHORIZATION sluiceway;
+  CREATE SCHEMA lawang AUTHORIZATION lawang;
 
   IF borrow THEN
     FOR m IN
       SELECT g.rolname AS grantor, a.grantor::text AS key, a.inherit_option, a.set_option
         FROM pg_auth_members a JOIN pg_roles g ON g.oid = a.grantor
-       WHERE a.roleid = 'sluiceway'::regrole AND a.member = me
+       WHERE a.roleid = 'lawang'::regrole AND a.member = me
     LOOP
       IF NOT before ? m.key THEN
-        EXECUTE format('REVOKE sluiceway FROM CURRENT_USER GRANTED BY %I', m.grantor);
+        EXECUTE format('REVOKE lawang FROM CURRENT_USER GRANTED BY %I', m.grantor);
       ELSIF (before -> m.key ->> 'inherit')::boolean IS DISTINCT FROM m.inherit_option
          OR (before -> m.key ->> 'set')::boolean IS DISTINCT FROM m.set_option THEN
-        EXECUTE format('GRANT sluiceway TO CURRENT_USER WITH INHERIT %s, SET %s GRANTED BY %I',
+        EXECUTE format('GRANT lawang TO CURRENT_USER WITH INHERIT %s, SET %s GRANTED BY %I',
                        upper(before -> m.key ->> 'inherit'), upper(before -> m.key ->> 'set'), m.grantor);
       END IF;
     END LOOP;

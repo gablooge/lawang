@@ -86,11 +86,11 @@ CREATE POLICY tenant_isolation ON outbox
 -- work itself happens afterwards, as the application role bound to the claimed row's own tenant.
 -- It writes lease_token but cannot read it back: the token guards every transition. It cannot
 -- write is_head, so it can never make a row claimable.
-CREATE POLICY worker_claim_select ON outbox FOR SELECT TO sluiceway_worker USING (true);
-CREATE POLICY worker_claim_update ON outbox FOR UPDATE TO sluiceway_worker USING (true) WITH CHECK (true);
+CREATE POLICY worker_claim_select ON outbox FOR SELECT TO lawang_worker USING (true);
+CREATE POLICY worker_claim_update ON outbox FOR UPDATE TO lawang_worker USING (true) WITH CHECK (true);
 
-GRANT SELECT (id, seq, tenant_id, is_head, attempts, due_at) ON outbox TO sluiceway_worker;
-GRANT UPDATE (attempts, lease_until, lease_token) ON outbox TO sluiceway_worker;
+GRANT SELECT (id, seq, tenant_id, is_head, attempts, due_at) ON outbox TO lawang_worker;
+GRANT UPDATE (attempts, lease_until, lease_token) ON outbox TO lawang_worker;
 
 -- +goose Down
 DROP TABLE outbox;

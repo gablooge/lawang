@@ -5,7 +5,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/gablooge/sluiceway/internal/outbox"
+	"github.com/gablooge/lawang/internal/outbox"
 )
 
 func TestCauseText(t *testing.T) {

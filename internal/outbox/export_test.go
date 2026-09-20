@@ -1,6 +1,6 @@
 package outbox
 
-import "github.com/gablooge/sluiceway/internal/tenancy"
+import "github.com/gablooge/lawang/internal/tenancy"
 
 // AcceptIn is Accept inside a caller's tenant-bound transaction, so that a test can hold an
 // accepting transaction open.

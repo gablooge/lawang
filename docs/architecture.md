@@ -1,6 +1,6 @@
 # Architecture
 
-This is the target design for Sluiceway v0.1. It is a Go rewrite and generalization of a Python
+This is the target design for Lawang v0.1. It is a Go rewrite and generalization of a Python
 connector service that ran against real Slack, Microsoft Teams, Outlook, ClickUp and HubSpot
 tenants. The shape carries over because it held up; the places where it did not are called out in
 [section 10](#10-design-principles-learned-the-hard-way), and each one changed the design below.
@@ -29,7 +29,7 @@ Build order and open decisions live in [roadmap.md](roadmap.md).
 - Acting on providers (posting messages, creating tasks). The design leaves room for a tool-calling
   facade later; v0.1 is ingestion only.
 - Bulk analytics replication. That is a different problem with different tools.
-- Hosting OAuth consent screens. Sluiceway can delegate that to Nango.
+- Hosting OAuth consent screens. Lawang can delegate that to Nango.
 
 ---
 
@@ -39,8 +39,8 @@ One binary, two roles, one database.
 
 | Role | Command | What it does | Scaling |
 |---|---|---|---|
-| **serve** | `sluiceway serve` | Operator API under `/v1` and the webhook edge under `/ingress/{provider}` | Horizontal and stateless: verification and accept need only Postgres |
-| **worker** | `sluiceway worker` | Drains the outbox, renews subscriptions, reconciles, syncs access, sweeps retention | Horizontal: rows are claimed with `FOR UPDATE SKIP LOCKED`; cluster-wide sweeps elect a single runner with an advisory lock |
+| **serve** | `lawang serve` | Operator API under `/v1` and the webhook edge under `/ingress/{provider}` | Horizontal and stateless: verification and accept need only Postgres |
+| **worker** | `lawang worker` | Drains the outbox, renews subscriptions, reconciles, syncs access, sweeps retention | Horizontal: rows are claimed with `FOR UPDATE SKIP LOCKED`; cluster-wide sweeps elect a single runner with an advisory lock |
 
 Other subcommands: `migrate`, `connect <provider>`, `reconcile <tenant> <provider>`, `version`.
 
@@ -83,7 +83,7 @@ else including poison, because providers retry non-2xx responses and a retry sto
    in parallel.
 2. Commit the claim, then open a **second transaction** as the application role, bound to the
    row's own tenant, before touching anything that belongs to a tenant. The claim runs as
-   `sluiceway_worker`, and that transaction is cross-tenant for its whole life: Postgres ORs
+   `lawang_worker`, and that transaction is cross-tenant for its whole life: Postgres ORs
    permissive policies together, so binding a tenant inside it would take nothing away (see
    [section 4](#4-trust-model)).
 3. Parse the stored raw body into changes. One delivery can produce several records (a comment and
@@ -165,7 +165,7 @@ unfinished, and a condition that repeats it misleads the planner into reading ev
 (ADR 10). The second line of defense is the unique index: whatever a writer does, a key cannot
 have two heads, so it cannot have two rows in flight.
 
-The claim runs as `sluiceway_worker`, which is granted only what it reads (`id`, `seq`,
+The claim runs as `lawang_worker`, which is granted only what it reads (`id`, `seq`,
 `tenant_id`, `is_head`, `attempts`, `due_at`) and may update only the lease. It cannot read
 `raw_body`, a row's state, or which entity a row belongs to, it writes `lease_token` without
 being able to read one back, and it cannot write `is_head`, so it can lease a head but never make
@@ -193,7 +193,7 @@ transaction (see [section 10](#10-design-principles-learned-the-hard-way)).
 ### 3.4 Access sync
 
 Per provider, a member source lists each container (channel, list, mailbox, portal) and its members.
-Sluiceway maps members to person ids through an identity resolver, diffs against what it last sent,
+Lawang maps members to person ids through an identity resolver, diffs against what it last sent,
 and pushes grants and revocations to sinks that accept membership. A failed provider read aborts
 the pass rather than being treated as an empty member list, because an outage must never look like
 everybody leaving.
@@ -208,22 +208,22 @@ Three roots of trust, and nothing else can establish a tenant:
 |---|---|---|
 | `/v1` operator API | operator credential | the credential |
 | `/ingress/{provider}` | provider signature over the raw bytes | the owned subscription row that verified it |
-| sink delivery | per-tenant sink credential | Sluiceway, from the outbox row |
+| sink delivery | per-tenant sink credential | Lawang, from the outbox row |
 
 **Row-level security.** Every tenant-scoped table has RLS enabled and forced, with the policy keyed
 on a transaction-local setting. If the setting is missing, a query returns zero rows. Three roles:
 
 | Role | Purpose |
 |---|---|
-| `sluiceway` | the application role; `NOSUPERUSER NOBYPASSRLS`, so RLS actually applies |
-| `sluiceway_resolver` | reads only the delivery-resolution columns of subscriptions, because it has to derive the tenant and so cannot be filtered by it |
-| `sluiceway_worker` | claims outbox rows across tenants, in a transaction that does nothing else; the work on each row then runs in a second transaction, as `sluiceway`, bound to that row's tenant |
+| `lawang` | the application role; `NOSUPERUSER NOBYPASSRLS`, so RLS actually applies |
+| `lawang_resolver` | reads only the delivery-resolution columns of subscriptions, because it has to derive the tenant and so cannot be filtered by it |
+| `lawang_worker` | claims outbox rows across tenants, in a transaction that does nothing else; the work on each row then runs in a second transaction, as `lawang`, bound to that row's tenant |
 
 The resolver and worker roles are granted with `INHERIT FALSE` and entered explicitly with
 `SET LOCAL ROLE`, so the application role does not silently pick up their wider policies.
 
 **A helper-role transaction is cross-tenant until it ends.** Permissive policies are ORed together,
-so once a helper role's policy applies (`TO sluiceway_worker USING (true)`, for example), binding a
+so once a helper role's policy applies (`TO lawang_worker USING (true)`, for example), binding a
 tenant in the same transaction narrows nothing: every tenant's rows stay visible, and updatable
 where the role may update. A bind could only add rows, on tables where the role has no policy of
 its own. The rule is therefore two transactions: the cross-tenant step (resolve an owner, claim a
@@ -232,12 +232,12 @@ application role bound to that tenant. The code enforces it: the transaction `st
 out refuses `tenancy.Bind`, savepoints included.
 
 **Bootstrap and preflight.** The application role cannot create roles, so an administrator applies
-a one-time bootstrap script (`sluiceway migrate bootstrap` prints it) that creates the three roles
-and a `sluiceway` schema owned by the application role. The administrator is a superuser, or a
+a one-time bootstrap script (`lawang migrate bootstrap` prints it) that creates the three roles
+and a `lawang` schema owned by the application role. The administrator is a superuser, or a
 non-superuser with `CREATEROLE` and `CREATE` on the database, which is what managed Postgres
 offers. The script is a single statement, so it applies completely or not at all, and it is safe
 to run again, also as a different administrator. It leaves the administrator's own role
-memberships exactly as it found them, and it refuses a database where a `sluiceway` schema already
+memberships exactly as it found them, and it refuses a database where a `lawang` schema already
 exists under another owner. Migrations then run as the application role itself. Every connection sets `search_path` to that schema explicitly, because the default
 `"$user"` entry follows `SET ROLE`.
 
@@ -268,7 +268,7 @@ the server both quote the connection target when a connection fails (user, datab
 client address), so a failure to connect is reduced to its classification: the host name does not
 resolve, connection refused, timed out, authentication failed or no such database (with the
 SQLSTATE, and never the server's message), TLS failure, or other, always prefixed with
-`SLUICEWAY_DATABASE_URL`. The same holds for a connection that fails later, in the middle of a
+`LAWANG_DATABASE_URL`. The same holds for a connection that fails later, in the middle of a
 transaction or a migration, while an error from a statement that ran (a constraint violation, a
 failed migration) keeps the server's message. Preflight refusals say "the login role", not its
 name. One connection attempt is bounded at 10 seconds unless the URL sets `connect_timeout` to 1
@@ -427,7 +427,7 @@ channel's members. One rule, applied the same way for every provider, is far har
 than a per-container flag whose meaning a sink can interpret differently from the connector
 (see principle 9).
 
-Sluiceway **never** stamps anything as public. Content from a connector reaches exactly the people
+Lawang **never** stamps anything as public. Content from a connector reaches exactly the people
 who could see it in the source tool, and no further.
 
 A record carries its scope and **never the scope's members**. Members travel separately, through
@@ -521,7 +521,7 @@ Built-in implementations planned for v0.1:
 ## 8. Package layout
 
 ```text
-cmd/sluiceway/        main: serve | worker | migrate | connect | reconcile | version
+cmd/lawang/         main: serve | worker | migrate | connect | reconcile | version
 internal/
   appversion/         the release version set by the linker, or the VCS revision of a dev build
   config/             environment config, fail-closed defaults

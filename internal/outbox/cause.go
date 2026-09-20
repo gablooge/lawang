@@ -27,7 +27,7 @@ const (
 	ClassSinkUnauthorized
 	// ClassVaultUnavailable: a secret could not be read, so nothing may be delivered.
 	ClassVaultUnavailable
-	// ClassInternal: a failure of Sluiceway's own, such as its database.
+	// ClassInternal: a failure of Lawang's own, such as its database.
 	ClassInternal
 )
 
@@ -81,7 +81,7 @@ func (c Cause) WithStatus(status int) Cause {
 // WithCode adds the error code the remote system gave, such as "rate_limited" or "invalid_grant".
 // It is kept only if it is at most 64 bytes of ASCII letters, digits, '_', '-' and '.', which a
 // message, a URL, a header or a JSON fragment never is. Anything else is recorded as "withheld",
-// so that an operator can see there was a code and that Sluiceway chose not to store it.
+// so that an operator can see there was a code and that Lawang chose not to store it.
 //
 // This stops text that carries a secret by accident. It cannot stop a caller that passes a secret
 // as the code: a bare token looks like a code. Pass the field of the response that the remote
