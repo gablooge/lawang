@@ -3,7 +3,6 @@ package provider
 import (
 	"errors"
 	"fmt"
-	"slices"
 
 	"github.com/gablooge/lawang/internal/record"
 )
@@ -29,7 +28,6 @@ var ErrNilProvider = errors.New("provider: nil provider")
 // key, never the segment, because outbox.Delivery.Provider must be a constant of the program.
 type Registry struct {
 	byKey map[string]Entry
-	keys  []string
 }
 
 // Entry is one provider in a Registry, together with the key the registry validated and keeps.
@@ -44,7 +42,9 @@ type Entry struct {
 // even when the two hold the same bytes.
 func (e Entry) Key() string { return e.key }
 
-// Provider is the registered provider.
+// Provider is the registered provider. Backlog item B08 calls Hydrate and Normalize through it:
+// the drain path has the outbox row's provider key and needs the provider itself, while the
+// accept path only ever needs WebhookSource.
 func (e Entry) Provider() Provider { return e.p }
 
 // WebhookSource reports whether the provider receives webhooks, and returns that capability. It
@@ -82,9 +82,7 @@ func NewRegistry(providers ...Provider) (*Registry, error) {
 			return nil, fmt.Errorf("%w: %q", ErrDuplicateKey, key)
 		}
 		r.byKey[key] = Entry{key: key, p: p}
-		r.keys = append(r.keys, key)
 	}
-	slices.Sort(r.keys)
 	return r, nil
 }
 
@@ -95,7 +93,3 @@ func (r *Registry) Lookup(key string) (Entry, bool) {
 	e, ok := r.byKey[key]
 	return e, ok
 }
-
-// Keys lists the registered provider keys in order. The slice is a copy, so a caller cannot
-// change what the registry serves.
-func (r *Registry) Keys() []string { return slices.Clone(r.keys) }

@@ -15,7 +15,9 @@ delivered exactly once to your memory, search, or RAG system.
 > interfaces, the registry and `/ingress/{provider}` with raw-body capture, a size cap and the
 > handshake hook. What is still missing is the half that makes a delivery belong to somebody:
 > signature verification against owned subscriptions, and the outbox insert. So no webhook is
-> stored yet. The design
+> stored yet, **and `lawang serve` does not mount the route at all**: an edge with no hub would
+> answer a provider without storing anything, so B07 is the item that wires it and until then a
+> POST to `/ingress/{provider}` is a 404 from the mux. The design
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in
 > [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the

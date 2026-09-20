@@ -109,10 +109,33 @@ unstorable provider as a caller bug rather than as poison).
 go to the handshake hook, to verification, to the delivery id and into the outbox row. Nothing on
 this path parses or re-serializes them (principle 1).
 
+**The URL a signature covers comes from configuration.** A provider that signs the request URL
+(HubSpot v3 signs the method, the full request URI, the body and a timestamp) signed the **public**
+URL, and behind a Cloudflare Tunnel or a reverse proxy that is not what the Go server sees. The
+edge builds `provider.Request.URL` from `LAWANG_PUBLIC_BASE_URL` plus the request's own escaped
+path and raw query, and **never** from `Host`, `X-Forwarded-Host` or `X-Forwarded-Proto`: all three
+are written by whoever sent the request, and a sender that chooses part of its own signed input can
+make a signature verify over content it picked, which is not a check at all. With the variable
+unset the edge still serves and `provider.Request.URL` is the empty string; a scheme that needs it
+returns `false` rather than guess, because a signature verified against a URL Lawang invented
+proves nothing (see [section 4](#4-trust-model)). `config.NormalizePublicBaseURL` owns the spelling
+and `ingress.New` calls it rather than carrying a copy, since the two strings end up compared byte
+for byte inside an HMAC.
+
 **The handshake hook** (`WebhookSource.Handshake`) runs before any tenant exists to resolve,
 because a challenge arrives before any subscription does. Its reply is bytes and a content type,
 not JSON: Slack echoes a challenge inside a JSON object and Microsoft Graph echoes a
-`validationToken` as `text/plain`.
+`validationToken` as `text/plain`. What a provider may answer with is bounded, because a handshake
+echoes a stranger's text and a provider package must not be able to turn this origin into one that
+serves content: the body is capped at 8 KiB; the status must be a 2xx or a 4xx, never a 3xx (which
+would redirect whoever sent the challenge), never a 5xx (which asks for a retry of an answer that
+will not change), and **never 401 or 403**, because the table above reserves 401 for a signature
+failure and a handshake has nothing to verify (a challenge it cannot read is a 400); and the
+content type must be `text/plain` or `application/json`, with no parameter but `charset=utf-8`.
+`text/html` with an echoed `<script>` would be reflected script execution, and
+`X-Content-Type-Options: nosniff` does not help, because nosniff stops a browser guessing a type
+and not honouring the one that was sent. Anything outside those bounds is a bug in a provider
+package: it is logged at error and answered 500, with none of the reply written.
 
 **The accept is bounded** (`ingress.DefaultAcceptTimeout`, 2 seconds, an order of magnitude over
 the 200 ms target). Every accept holds one pool connection for its resolve and its insert, and the
@@ -255,8 +278,26 @@ Three roots of trust, and nothing else can establish a tenant:
 | Surface | Trust root | Tenant comes from |
 |---|---|---|
 | `/v1` operator API | operator credential | the credential |
-| `/ingress/{provider}` | provider signature over the raw bytes | the owned subscription row that verified it |
+| `/ingress/{provider}` | provider signature over the raw bytes, and over the public URL where the scheme covers it | the owned subscription row that verified it |
 | sink delivery | per-tenant sink credential | Lawang, from the outbox row |
+
+**Nothing a sender writes may reach a signature base string.** Some schemes sign more than the
+body: HubSpot v3 signs the request method, the full public request URI, the body and a timestamp
+header. The method, the body and the timestamp are the sender's and are supposed to be, because
+the signature is what proves they were not changed. The **URL is different**: it is the one piece
+of the base string the receiver has to supply, and the obvious sources for it (`Host`,
+`X-Forwarded-Host`, `X-Forwarded-Proto`, `Forwarded`) are all written by whoever sent the request
+and passed through unchanged by a tunnel. A receiver that built the signed URL from them would let
+a sender choose part of what it is proving, and the check would pass over content the sender
+picked. So the public base URL is **configuration**: `LAWANG_PUBLIC_BASE_URL`, validated at start
+by `config.NormalizePublicBaseURL` (absolute, `http` or `https`, a host, no credentials, no query,
+no fragment, a clean path prefix, no trailing slash) and refused rather than guessed at.
+
+**Unset is a refusal, not a default.** With no public base URL configured the edge still serves,
+because most schemes never look at the URL, but `provider.Request.URL` is empty and a scheme that
+signs the URL must return `false`. That answers 401 for every delivery of that provider, which is
+loud and correct: the alternative is a signature checked against a URL Lawang made up, which
+passes or fails for reasons nobody can reason about. The operator's fix is one variable.
 
 **Row-level security.** Every tenant-scoped table has RLS enabled and forced, with the policy keyed
 on a transaction-local setting. If the setting is missing, a query returns zero rows. Three roles:
@@ -533,8 +574,19 @@ type Provider interface {
 type WebhookSource interface {
 	Handshake(r *http.Request, body []byte) (Reply, bool)          // challenge echoes
 	DeliveryKeys(body []byte, h http.Header) (DeliveryKeys, error) // what resolves the owner
-	Verify(body []byte, h http.Header, secret []byte) bool         // never errors, never panics
+	Verify(r Request, secret []byte) bool                          // never errors, never panics
 	Parse(body []byte) ([]Change, error)
+}
+
+// Request is one delivery as a signature scheme sees it: the union of what the schemes cover.
+// ClickUp signs the body, Slack v0 a timestamp header and the body, HubSpot v3 the method, the
+// full public URL, the body and a timestamp header. It is a struct so that the next scheme to
+// need one more field does not break every implementation written before it.
+type Request struct {
+	Method string      // as the sender spelled it
+	URL    string      // the PUBLIC URL, from configuration; empty when none is configured
+	Header http.Header // read-only
+	Body   []byte      // the exact request bytes, never re-serialized, never modified
 }
 type Registrar interface {
 	Register(ctx context.Context, t Tenant, cred Credential) ([]Subscription, error)
@@ -572,6 +624,23 @@ carrying a copy of the pattern: a registry that accepted `ms-graph` would regist
 whose every record fails in `Seal`. It calls `Key()` exactly once, at registration, and hands back
 its own copy of the string from then on, which is what makes `outbox.Delivery.Provider` a constant
 of the program rather than a decoded path segment.
+
+**Three things a provider author has to know, which the hub (B07) is where they bite.**
+
+- `Handshake` runs on **unauthenticated bytes, on every delivery**, not only on a challenge,
+  because a challenge arrives before any subscription exists and nothing else can tell the two
+  apart. It is the one place where a stranger's bytes drive real work before verification, so a
+  provider looks at a cheap discriminator first (a header, a query parameter, the first field) and
+  only then parses. Slack and Microsoft Graph both allow this.
+- `Verify` **never errors and never panics**, and nothing in the type system can enforce it. A
+  panic there is recovered per connection by `net/http` and the provider sees a dropped response
+  rather than a status. `Verify` runs once per candidate subscription, so B07's per-candidate loop
+  recovers around it: one provider's panic parks a delivery, it does not drop the connection.
+- The 503 the edge answers on a slow accept rests on `errors.Is(err, context.DeadlineExceeded)`.
+  Both error shapes pgx produces for a saturated pool match it today, but a statement cancelled
+  server side comes back as a `*pgconn.PgError` with SQLSTATE 57014 and no context error in its
+  chain, which would land on 500 where 503 with a `Retry-After` is the honest answer. B07 treats
+  `ctx.Err() != nil` after the call as the deadline case too.
 
 **What lands when.** `Provider` and `WebhookSource` are in `internal/provider` from B06, because
 the ingress edge is built on them. `Registrar`, `Reconciler` and `MemberSource` arrive with the

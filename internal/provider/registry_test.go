@@ -3,7 +3,6 @@ package provider_test
 import (
 	"context"
 	"errors"
-	"slices"
 	"strings"
 	"testing"
 	"unsafe"
@@ -134,23 +133,6 @@ func TestLookupReturnsTheRegistrysStringAndNotTheCallers(t *testing.T) {
 	}
 	if unsafe.StringData(entry.Key()) == unsafe.StringData(lookedUpWith) {
 		t.Fatal("Key() handed back the caller's own string, so request text could travel on")
-	}
-}
-
-func TestKeysAreSortedAndACopy(t *testing.T) {
-	t.Parallel()
-
-	reg, err := provider.NewRegistry(fake.New("slack"), fake.New("clickup"), fake.New("ms_graph"))
-	if err != nil {
-		t.Fatalf("NewRegistry: %v", err)
-	}
-	want := []string{"clickup", "ms_graph", "slack"}
-	if got := reg.Keys(); !slices.Equal(got, want) {
-		t.Fatalf("Keys() = %v, want %v", got, want)
-	}
-	reg.Keys()[0] = "tampered"
-	if got := reg.Keys(); !slices.Equal(got, want) {
-		t.Fatalf("Keys() is not a copy: %v", got)
 	}
 }
 

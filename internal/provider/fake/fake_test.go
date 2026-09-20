@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gablooge/lawang/internal/provider"
 	"github.com/gablooge/lawang/internal/provider/fake"
@@ -27,6 +28,18 @@ func delivery() string {
 	return `{"type":"event","workspace":"W1","subscription":"S1","events":[` + event + `]}`
 }
 
+// request is a delivery as the edge hands it to Verify. The method and the URL are filled in with
+// something a real request would carry, so that a Verify which started reading them would not
+// silently see zero values here.
+func request(body []byte, h http.Header) provider.Request {
+	return provider.Request{
+		Method: http.MethodPost,
+		URL:    "https://lawang.example.test/ingress/" + fake.DefaultKey,
+		Header: h,
+		Body:   body,
+	}
+}
+
 func signed(t *testing.T, body string) http.Header {
 	t.Helper()
 	h := http.Header{}
@@ -44,7 +57,7 @@ func TestVerifyRefusesEverythingARealProviderRefuses(t *testing.T) {
 	body := []byte(delivery())
 	good := fake.Sign([]byte(secret), body)
 
-	if !p.Verify(body, signed(t, string(body)), []byte(secret)) {
+	if !p.Verify(request(body, signed(t, string(body))), []byte(secret)) {
 		t.Fatal("a correctly signed delivery must verify")
 	}
 
@@ -75,7 +88,7 @@ func TestVerifyRefusesEverythingARealProviderRefuses(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if p.Verify(c.body, c.header, c.secret) {
+			if p.Verify(request(c.body, c.header), c.secret) {
 				t.Fatal("verified something it must refuse")
 			}
 		})
@@ -109,11 +122,33 @@ func TestVerifyIsOverTheExactBytes(t *testing.T) {
 	}
 
 	h := headerWith(fake.Sign([]byte(secret), raw))
-	if !p.Verify(raw, h, []byte(secret)) {
+	if !p.Verify(request(raw, h), []byte(secret)) {
 		t.Fatal("the raw bytes must verify")
 	}
-	if p.Verify(reserialized, h, []byte(secret)) {
+	if p.Verify(request(reserialized, h), []byte(secret)) {
 		t.Fatal("re-serialized JSON must not verify against a signature over the raw bytes")
+	}
+}
+
+// TestVerifyIgnoresWhatThisSchemeDoesNotSign holds the double to what it says it is. It signs the
+// body alone, like ClickUp, so a different method and an empty URL (which is what
+// provider.Request carries when no public base URL is configured) must change no answer. A double
+// that quietly started reading them would make the edge's fail-closed behaviour untestable.
+func TestVerifyIgnoresWhatThisSchemeDoesNotSign(t *testing.T) {
+	t.Parallel()
+
+	p := fake.New(fake.DefaultKey)
+	body := []byte(delivery())
+	h := headerWith(fake.Sign([]byte(secret), body))
+
+	for _, r := range []provider.Request{
+		{Method: http.MethodPost, URL: "", Header: h, Body: body},
+		{Method: "PUT", URL: "https://elsewhere.example.test/ingress/fake?x=1", Header: h, Body: body},
+		{Method: "", URL: "", Header: h, Body: body},
+	} {
+		if !p.Verify(r, []byte(secret)) {
+			t.Fatalf("a body-only scheme refused over method %q and URL %q", r.Method, r.URL)
+		}
 	}
 }
 
@@ -229,11 +264,63 @@ func TestADeliveryThisProviderWouldNotHaveSentIsAnError(t *testing.T) {
 			}
 		})
 	}
+}
 
-	// Bytes that are not UTF-8 would be rewritten to U+FFFD by encoding/json, which turns two
-	// different deliveries into one. They are refused before the decoder sees them.
-	if _, err := p.Parse([]byte{'{', 0xff, 0xfe, '}'}); err == nil {
-		t.Fatal("Parse accepted bytes that are not UTF-8")
+// TestBytesThatAreNotUTF8AreRefusedBeforeTheDecoder covers the one refusal in decodeStrict that
+// encoding/json does not make on its own, and that the first version of this test did not reach:
+// it sent {0xff,0xfe,'}'}, which is not JSON at all, so the decoder refused it whether or not
+// utf8.Valid was there, and the check survived its own mutation.
+//
+// Go's JSON scanner accepts any byte above 0x1f inside a string, and the decoder then rewrites
+// whatever is not valid UTF-8 to U+FFFD. Two deliveries that differ in one byte therefore become
+// one parsed value while their delivery ids (which hash the raw bytes) differ, which is exactly
+// the "two different deliveries become one" that this double exists to refuse.
+//
+// Every case below except the last is valid JSON, asserted here, so utf8.Valid is the only thing
+// in the package that can refuse it. The bad byte sits in title, the one field parseEvent does
+// not otherwise constrain: workspace, subscription, version and container are printable ASCII
+// only, so a bad byte in those is refused twice over and would prove nothing.
+func TestBytesThatAreNotUTF8AreRefusedBeforeTheDecoder(t *testing.T) {
+	t.Parallel()
+
+	p := fake.New(fake.DefaultKey)
+	withTitle := func(title string) []byte {
+		return []byte(`{"type":"event","workspace":"W1","subscription":"S1","events":[` +
+			`{"op":"upsert","external_id":"fake:task:1","container":"L1","version":"2",` +
+			`"title":"` + title + `","occurred_at":"2026-09-20T10:00:00Z"}]}`)
+	}
+	cases := map[string]struct {
+		body      []byte
+		validJSON bool
+	}{
+		"a lone 0xff in a string":           {withTitle("x\xff"), true},
+		"a lone 0xfe in a string":           {withTitle("x\xfe"), true},
+		"a truncated two byte sequence":     {withTitle("x\xc3("), true},
+		"a bare continuation byte":          {withTitle("x\x80"), true},
+		"a surrogate half encoded as UTF-8": {withTitle("x\xed\xa0\x80"), true},
+		"an overlong encoding of a slash":   {withTitle("x\xc0\xaf"), true},
+		"not JSON either":                   {[]byte{'{', 0xff, 0xfe, '}'}, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if json.Valid(tc.body) != tc.validJSON {
+				t.Fatalf("json.Valid = %v, want %v: this fixture no longer isolates the UTF-8 check",
+					json.Valid(tc.body), tc.validJSON)
+			}
+			if _, err := p.Parse(tc.body); err == nil {
+				t.Fatal("Parse accepted bytes that are not UTF-8")
+			}
+			if _, err := p.DeliveryKeys(tc.body, nil); err == nil {
+				t.Fatal("DeliveryKeys accepted bytes that are not UTF-8")
+			}
+		})
+	}
+
+	// The same delivery with a valid title is accepted, so the cases above are not passing
+	// against a Parse that refuses everything.
+	if _, err := p.Parse(withTitle("x?")); err != nil {
+		t.Fatalf("the same delivery with a valid title was refused: %v", err)
 	}
 }
 
@@ -253,6 +340,10 @@ func TestParseRefusesAnEventThisProviderWouldNotHaveSent(t *testing.T) {
 		"no container":           with(`{"external_id":"fake:task:1","op":"upsert","version":"2","occurred_at":"2026-09-20T10:00:00Z"}`),
 		"no occurred_at":         with(`{"external_id":"fake:task:1","op":"upsert","version":"2","container":"L1"}`),
 		"unknown event field":    with(`{"external_id":"fake:task:1","op":"upsert","version":"2","container":"L1","occurred_at":"2026-09-20T10:00:00Z","extra":1}`),
+		// The prefix is right and everything else is valid, so the length bound is the only thing
+		// that can refuse this. Without the case, dropping the bound changed nothing in the suite.
+		"external id too long": with(`{"external_id":"fake:` + strings.Repeat("x", 129) +
+			`","op":"upsert","version":"2","container":"L1","occurred_at":"2026-09-20T10:00:00Z"}`),
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -260,6 +351,39 @@ func TestParseRefusesAnEventThisProviderWouldNotHaveSent(t *testing.T) {
 				t.Fatal("Parse accepted it")
 			}
 		})
+	}
+}
+
+// TestAnOffsetTimeIsNormalizedToUTC pins the one line of parseEvent that changes a value rather
+// than refusing one. encoding/json keeps the offset a delivery was written with, and the record
+// format refuses any location but UTC, so without the conversion every delivery from a provider
+// that writes local time would fail far from here, in Seal. Every occurred_at fixture elsewhere in
+// this package is already spelled with a Z, so nothing else in the suite can see the difference.
+func TestAnOffsetTimeIsNormalizedToUTC(t *testing.T) {
+	t.Parallel()
+
+	p := fake.New(fake.DefaultKey)
+	const offset = `{"type":"event","workspace":"W1","events":[` +
+		`{"external_id":"fake:task:1","op":"upsert","version":"2","container":"L1",` +
+		`"title":"hello","occurred_at":"2026-09-20T17:00:00+07:00"}]}`
+
+	changes, err := p.Parse([]byte(offset))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	obj, err := p.Hydrate(t.Context(), "t_1", changes[0])
+	if err != nil {
+		t.Fatalf("Hydrate: %v", err)
+	}
+	recs, err := p.Normalize(obj, changes[0])
+	if err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if loc := recs[0].OccurredAt.Location(); loc != time.UTC {
+		t.Fatalf("OccurredAt location = %v, want UTC", loc)
+	}
+	if want := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC); !recs[0].OccurredAt.Equal(want) {
+		t.Fatalf("OccurredAt = %v, want %v", recs[0].OccurredAt, want)
 	}
 }
 

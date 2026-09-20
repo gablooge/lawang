@@ -34,6 +34,15 @@
 // nothing stored. And no provider can be storming, because a provider only ever posts to the URL
 // Lawang gave it, which names a registered provider. What reaches this branch is a scanner.
 //
+// # The URL a signature covers
+//
+// A provider that signs the request URL (HubSpot v3) signed the PUBLIC one, which behind a tunnel
+// or a reverse proxy is not what this process sees. The edge builds it from LAWANG_PUBLIC_BASE_URL
+// plus the request's own path and query, and never from Host, X-Forwarded-Host or
+// X-Forwarded-Proto: a sender that picks part of its own signed input is not being checked. With
+// no base URL configured the edge still serves and provider.Request.URL is empty, and a scheme
+// that needs it refuses (architecture 4).
+//
 // # What is never logged
 //
 // No body, no header value and no path segment reaches a log line or a response. The provider key
@@ -45,12 +54,17 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/gablooge/lawang/internal/config"
 	"github.com/gablooge/lawang/internal/provider"
 )
 
@@ -107,13 +121,15 @@ type Hub interface {
 	// Accept takes the delivery and returns what the provider should be told.
 	//
 	// p is the registry's entry, so p.Key() is this program's own constant and the string that
-	// belongs in outbox.Delivery.Provider. body is the exact bytes of the request, the ones a
-	// signature is over: an implementation must not re-serialize them, and must not modify the
-	// slice, which the edge does not copy. h is the request's headers, read-only.
+	// belongs in outbox.Delivery.Provider. req is the delivery as a signature scheme sees it, and
+	// it is what the hub hands to WebhookSource.Verify once per candidate subscription: the exact
+	// request bytes (an implementation must not re-serialize them, and must not modify the slice,
+	// which the edge does not copy), the headers, the method, and the public URL the provider
+	// posted to, which is built from configuration and never from a header.
 	//
 	// It returns an error only for a failure on our side. Everything a sender can cause is a
 	// Verdict: a forged signature, an unknown workspace, an ordering key that cannot be stored.
-	Accept(ctx context.Context, p provider.Entry, body []byte, h http.Header) (Verdict, error)
+	Accept(ctx context.Context, p provider.Entry, req provider.Request) (Verdict, error)
 }
 
 // Verdict is what the Hub decided, and the edge's only input for the status it answers. The zero
@@ -172,6 +188,12 @@ type Options struct {
 	AcceptTimeout time.Duration
 	// Logger is where the edge logs, and nil means slog.Default.
 	Logger *slog.Logger
+	// PublicBaseURL is LAWANG_PUBLIC_BASE_URL: the absolute URL a provider reaches this
+	// deployment at, which is what provider.Request.URL is built from. Empty means the
+	// deployment configured none, and provider.Request.URL is then empty too. New checks it with
+	// config.NormalizePublicBaseURL, the same function config.Load uses, and refuses what that
+	// refuses.
+	PublicBaseURL string
 }
 
 // Handler serves Pattern.
@@ -181,6 +203,7 @@ type Handler struct {
 	maxBody       int64
 	acceptTimeout time.Duration
 	log           *slog.Logger
+	publicBaseURL string
 }
 
 // New returns a Handler, or says what is missing. A nil registry or a nil hub is refused rather
@@ -195,12 +218,26 @@ func New(reg *provider.Registry, hub Hub, opts Options) (*Handler, error) {
 	if opts.MaxBody < 0 || opts.AcceptTimeout < 0 {
 		return nil, errors.New("ingress: MaxBody and AcceptTimeout cannot be negative")
 	}
+	// An unusable base URL is refused at start rather than carried into a signature base string,
+	// where it would show up as every delivery failing to verify with nothing to see. The check is
+	// config's own, called and not copied, because the two spellings end up compared byte for byte
+	// inside an HMAC.
+	base := ""
+	if opts.PublicBaseURL != "" {
+		normalized, err := config.NormalizePublicBaseURL(opts.PublicBaseURL)
+		if err != nil {
+			// The error never quotes the value, for the reason config gives.
+			return nil, fmt.Errorf("ingress: PublicBaseURL: %w", err)
+		}
+		base = normalized
+	}
 	h := &Handler{
 		reg:           reg,
 		hub:           hub,
 		maxBody:       opts.MaxBody,
 		acceptTimeout: opts.AcceptTimeout,
 		log:           opts.Logger,
+		publicBaseURL: base,
 	}
 	if h.maxBody == 0 {
 		h.maxBody = DefaultMaxBody
@@ -233,6 +270,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		// A provider that receives no webhooks has no endpoint here, and saying so would be a
 		// different answer for a registered provider than for an unregistered one.
+		//
+		// The answer stays byte-identical, but this branch is logged and the one above is not.
+		// What reaches the branch above is a scanner, and the segment is unloggable text from a
+		// stranger. What reaches this one is a key that IS in the registry, so it can only be a
+		// mistake in this program's own wiring (a method renamed in a refactor, a value receiver
+		// where a pointer receiver was meant, a provider registered that never implemented
+		// WebhookSource), and the consequence is that every real delivery is dropped with a 404
+		// and the loss is visible only on the provider's own dashboard. The key logged is the
+		// registry's own constant, never the path segment.
+		h.log.Warn("ingress: a registered provider is not a webhook source, so its deliveries are dropped",
+			"provider", entry.Key())
 		respond(w, http.StatusNotFound, "no such provider\n")
 		return
 	}
@@ -254,7 +302,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), h.acceptTimeout)
 	defer cancel()
-	verdict, err := h.hub.Accept(ctx, entry, body, r.Header)
+	verdict, err := h.hub.Accept(ctx, entry, provider.Request{
+		Method: r.Method,
+		URL:    h.publicURL(r),
+		Header: r.Header,
+		Body:   body,
+	})
 	switch {
 	case err != nil && r.Context().Err() != nil:
 		// The sender hung up. Nothing can be written to a closed connection, and this is not a
@@ -281,6 +334,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Debug("ingress: accepted", "provider", entry.Key(), "verdict", verdict.String())
 		respond(w, status, verdict.String()+"\n")
 	}
+}
+
+// publicURL is the absolute URL the provider posted to, as the provider itself would have written
+// it, and the empty string when the deployment configured no public base URL.
+//
+// Not one byte of it comes from the request's headers. Host, X-Forwarded-Host and
+// X-Forwarded-Proto are all written by whoever sent the request (the Cloudflare Tunnel in front of
+// a development machine passes Host straight through), so a signature base string built from them
+// would let the sender choose part of what it is proving, which makes the signature check theatre.
+// The scheme, the host and any stripped prefix therefore come from configuration, and only the
+// path and the query come from the request, which the sender signed as well.
+//
+// When the base is empty this returns empty rather than a relative URL, because a scheme that
+// signs the URL must refuse rather than verify against something invented (fail closed, see
+// provider.Request.URL). The edge still serves: every other scheme is unaffected, and a handshake
+// never needs it.
+func (h *Handler) publicURL(r *http.Request) string {
+	if h.publicBaseURL == "" {
+		return ""
+	}
+	// RequestURI is the escaped path plus "?" and the raw query when there is one, which is the
+	// form every signing scheme that covers a URL uses. The mux has already refused anything that
+	// needed cleaning, so this is the path as it arrived.
+	return h.publicBaseURL + r.URL.RequestURI()
 }
 
 // readBody captures the request body under the cap, and reports whether the caller may go on. It
@@ -340,8 +417,8 @@ func (h *Handler) writeReply(w http.ResponseWriter, key string, reply provider.R
 			"provider", key, "status", status)
 	case len(reply.Body) > maxReplyBody:
 		h.log.Error("ingress: handshake reply is too large", "provider", key, "bytes", len(reply.Body))
-	case !printableASCII(contentType):
-		h.log.Error("ingress: handshake reply has a content type that is not printable ASCII",
+	case !validHandshakeContentType(contentType):
+		h.log.Error("ingress: handshake reply has a content type a handshake may not use",
 			"provider", key)
 	default:
 		w.Header().Set("Content-Type", contentType)
@@ -353,11 +430,65 @@ func (h *Handler) writeReply(w http.ResponseWriter, key string, reply provider.R
 	respond(w, http.StatusInternalServerError, "error\n")
 }
 
-// handshakeStatus reports whether a provider's handshake may answer with this status: a 2xx or a
-// 4xx. A 3xx would let a provider redirect whoever sent the challenge, and a 5xx would ask for a
-// retry of a handshake that is not going to change its mind.
+// handshakeStatus reports whether a provider's handshake may answer with this status: a 2xx, or a
+// 4xx that is not 401 or 403.
+//
+// A 3xx would let a provider redirect whoever sent the challenge, and a 5xx would ask for a retry
+// of a handshake that is not going to change its mind. 401 is refused because the response-code
+// contract at the top of this file makes it mean exactly one thing, a signature that did not
+// verify, and a handshake runs before anything is verified and has no signature to fail: a
+// provider that answered a malformed challenge with 401, which is an easy and defensible-looking
+// choice, would make the one reserved status ambiguous for everyone reading the table afterwards.
+// 403 goes with it, because it is the same claim in a different number and nothing a handshake
+// does needs it. A challenge a provider cannot make sense of is a 400.
 func handshakeStatus(status int) bool {
-	return status >= 200 && status < 300 || status >= 400 && status < 500
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return false
+	case status >= 200 && status < 300:
+		return true
+	case status >= 400 && status < 500:
+		return true
+	default:
+		return false
+	}
+}
+
+// maxContentType bounds a handshake reply's content type before it is parsed. The longest thing
+// the allowlist below can spell is "application/json; charset=utf-8", so this is generous and
+// still not a header a provider can grow to a kilobyte.
+const maxContentType = 64
+
+// handshakeMediaTypes are the media types a handshake reply may use, and the list is closed on
+// purpose. A handshake echoes a challenge, which is a stranger's text, so a provider that could
+// choose the content type could turn this origin into one that serves what a browser executes:
+// text/html with an echoed <script> is reflected script execution, and X-Content-Type-Options:
+// nosniff does not help, because nosniff stops a browser guessing a type and not honouring the one
+// that was sent. These two are what the shapes in the wild need: Microsoft Graph echoes a
+// validationToken as text/plain, Slack echoes a challenge inside a JSON object.
+var handshakeMediaTypes = []string{"application/json", "text/plain"}
+
+// validHandshakeContentType reports whether a provider's handshake may answer with this
+// Content-Type: one of handshakeMediaTypes, with no parameter but charset, and charset only utf-8.
+// A parameter the edge does not understand is a provider bug, not something to pass on.
+//
+// mime.ParseMediaType also refuses a control character, a newline included, so this is the whole
+// guard against a second header smuggled through the content type as well.
+func validHandshakeContentType(s string) bool {
+	if len(s) > maxContentType {
+		return false
+	}
+	mediaType, params, err := mime.ParseMediaType(s)
+	if err != nil || !slices.Contains(handshakeMediaTypes, mediaType) {
+		return false
+	}
+	for name, value := range params {
+		// ParseMediaType lower-cases the media type and the parameter names, never the values.
+		if name != "charset" || !strings.EqualFold(value, "utf-8") {
+			return false
+		}
+	}
+	return true
 }
 
 // respond writes one of this package's own constant answers. Nothing a sender sent is ever in
@@ -370,18 +501,6 @@ func respond(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(msg)))
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, msg) //nolint:gosec // G705: msg is one of this file's own constants
-}
-
-// printableASCII reports whether s is visible ASCII and spaces only. It keeps a control character
-// out of a response header, where net/http would turn a newline into a space and leave something
-// nobody wrote.
-func printableASCII(s string) bool {
-	for i := range len(s) {
-		if s[i] < 0x20 || s[i] > 0x7E {
-			return false
-		}
-	}
-	return true
 }
 
 // compile-time check that the handler is one.

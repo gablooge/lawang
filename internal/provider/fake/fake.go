@@ -91,24 +91,32 @@ func Sign(secret, body []byte) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// Verify reports whether body is signed with secret. It never errors and never panics: every
+// Verify reports whether r.Body is signed with secret. It never errors and never panics: every
 // refusal is a plain false (architecture principle 1).
-func (p *Provider) Verify(body []byte, h http.Header, secret []byte) bool {
+//
+// This double signs the body alone, the way ClickUp does, so it ignores r.Method and r.URL. A
+// double that signed the URL would have to refuse when r.URL is empty, which is what
+// provider.Request documents; there is a test of that shape at the edge instead, because the
+// point belongs to the edge and not to any one provider.
+func (p *Provider) Verify(r provider.Request, secret []byte) bool {
 	if len(secret) == 0 {
 		return false // fail closed: a missing secret verifies nothing
 	}
-	sigs := h.Values(SignatureHeader)
+	sigs := r.Header.Values(SignatureHeader)
 	if len(sigs) != 1 {
 		// Two signature headers are two claims, and picking one is how a smuggled second value
 		// gets its chance.
 		return false
 	}
+	// hmac.Equal already refuses a digest of the wrong length, so the length test here changes no
+	// answer: it is the shape of the refusal written down, and no test can tell it from its
+	// absence.
 	want, err := hex.DecodeString(sigs[0])
 	if err != nil || len(want) != sha256.Size {
 		return false
 	}
 	mac := hmac.New(sha256.New, secret)
-	_, _ = mac.Write(body)
+	_, _ = mac.Write(r.Body)
 	return hmac.Equal(mac.Sum(nil), want)
 }
 

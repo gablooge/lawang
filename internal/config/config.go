@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -36,6 +37,13 @@ type Config struct {
 	ListenAddr  string
 	LogLevel    slog.Level
 	LogFormat   string // "json" or "text"
+
+	// PublicBaseURL is the scheme, host and any stripped path prefix that a provider reaches
+	// /ingress/{provider} at from the public internet, with no trailing slash, or the empty
+	// string when the deployment did not configure one. It is what the webhook edge builds the
+	// URL a signature covers out of (ingress.Options.PublicBaseURL, architecture 4); backlog
+	// item B07 wires it, because the edge is not mounted until a hub exists.
+	PublicBaseURL string
 }
 
 // defaultListenAddr is where serve listens when LAWANG_LISTEN_ADDR is unset.
@@ -86,6 +94,18 @@ func Variables() []Variable {
 			Default: defaultListenAddr,
 		},
 		{
+			Name: "LAWANG_PUBLIC_BASE_URL",
+			Doc: "The absolute URL providers reach this deployment at, scheme and host and any " +
+				"path prefix a reverse proxy strips before forwarding (https://lawang.example.com). " +
+				"No query, no fragment, no credentials, no trailing slash. It is configuration and " +
+				"never a header on purpose: a signature scheme that covers the request URL " +
+				"(HubSpot v3) is checked against this, and Host, X-Forwarded-Host and " +
+				"X-Forwarded-Proto are all chosen by whoever sent the request, so building the " +
+				"signed URL from them would let a sender pick part of what it signed.",
+			Default: "none. The edge still serves, and a provider whose signature covers the URL " +
+				"refuses every delivery rather than verify against a URL Lawang guessed.",
+		},
+		{
 			Name:    "LAWANG_LOG_LEVEL",
 			Doc:     "The lowest level that is logged. Case does not matter.",
 			Values:  slices.Clone(logLevelValues),
@@ -116,13 +136,16 @@ func (c Config) LogValue() slog.Value {
 		slog.String("listen_addr", c.ListenAddr),
 		slog.String("log_level", c.LogLevel.String()),
 		slog.String("log_format", c.LogFormat),
+		// Not redacted: it is a public hostname, it is what a provider posts to, and an operator
+		// debugging a signature failure needs to see the spelling the process actually holds.
+		slog.String("public_base_url", c.PublicBaseURL),
 	)
 }
 
 // String covers %v, %+v and %s, so printing a Config cannot leak the database URL either.
 func (c Config) String() string {
-	return fmt.Sprintf("{Env:%s DatabaseURL:%s ListenAddr:%s LogLevel:%s LogFormat:%s}",
-		c.Env, redacted, c.ListenAddr, c.LogLevel, c.LogFormat)
+	return fmt.Sprintf("{Env:%s DatabaseURL:%s ListenAddr:%s LogLevel:%s LogFormat:%s PublicBaseURL:%s}",
+		c.Env, redacted, c.ListenAddr, c.LogLevel, c.LogFormat, c.PublicBaseURL)
 }
 
 // GoString covers %#v.
@@ -169,6 +192,15 @@ func Load(getenv func(string) string) (Config, error) {
 			errs = append(errs, fmt.Errorf("LAWANG_LISTEN_ADDR: %w", err))
 		} else {
 			cfg.ListenAddr = v
+		}
+	}
+
+	if v := getenv("LAWANG_PUBLIC_BASE_URL"); v != "" {
+		base, err := NormalizePublicBaseURL(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("LAWANG_PUBLIC_BASE_URL: %w", err))
+		} else {
+			cfg.PublicBaseURL = base
 		}
 	}
 
@@ -221,6 +253,47 @@ func checkListenAddr(raw string) error {
 		return errors.New("port must be a number from 0 to 65535 (service names are not accepted)")
 	}
 	return nil
+}
+
+// NormalizePublicBaseURL checks LAWANG_PUBLIC_BASE_URL and returns it in the one spelling the
+// webhook edge concatenates a request path onto: scheme, host, an optional path prefix, and no
+// trailing slash. The empty string is not passed here; an unset variable is handled by the caller.
+//
+// It is exported and not private because internal/ingress checks the same value again in
+// ingress.New, by calling this function rather than by carrying a copy of the rules. The string
+// ends up inside a signature base string, so the two must agree to the byte: a base URL that Load
+// accepted and the edge spelled differently would make every signature fail with nothing to see.
+//
+// No error echoes the value. Load cannot know which variable a secret was pasted into, and a
+// manifest with two entries swapped puts the database URL here.
+func NormalizePublicBaseURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Not wrapped: the url.Error quotes the whole input.
+		return "", errors.New("not a valid URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", errors.New("scheme must be http or https, and the URL must be absolute")
+	}
+	if u.Host == "" {
+		return "", errors.New("missing host")
+	}
+	if u.User != nil {
+		return "", errors.New("must not carry credentials")
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return "", errors.New("must not carry a query or a fragment")
+	}
+	// The edge appends the request's own escaped path, so a percent-escape in the prefix would
+	// make the result depend on which spelling the provider happened to register.
+	if u.RawPath != "" {
+		return "", errors.New("the path prefix must not be percent-encoded")
+	}
+	p := strings.TrimSuffix(u.Path, "/")
+	if p != "" && (!strings.HasPrefix(p, "/") || path.Clean(p) != p) {
+		return "", errors.New("the path prefix must be a clean absolute path, for example /lawang")
+	}
+	return u.Scheme + "://" + u.Host + p, nil
 }
 
 // checkDatabaseURL rejects anything that is not a Postgres URL. The error never echoes the value,

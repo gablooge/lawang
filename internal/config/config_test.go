@@ -111,6 +111,7 @@ func TestLoadErrorsNeverEchoAnyValue(t *testing.T) {
 		"LAWANG_LISTEN_ADDR",
 		"LAWANG_LOG_LEVEL",
 		"LAWANG_LOG_FORMAT",
+		"LAWANG_PUBLIC_BASE_URL",
 	}
 
 	for _, name := range validated {
@@ -262,8 +263,9 @@ func readBy(base map[string]string) map[string]bool {
 // validSamples are values Load accepts for the variables that are not enumerations. An enumerated
 // variable needs none: its states come from Variable.Values.
 var validSamples = map[string][]string{
-	"LAWANG_DATABASE_URL": {"postgres://app@db/lawang", "postgresql://app@db:5432/lawang"},
-	"LAWANG_LISTEN_ADDR":  {":9000", "127.0.0.1:9000"},
+	"LAWANG_DATABASE_URL":    {"postgres://app@db/lawang", "postgresql://app@db:5432/lawang"},
+	"LAWANG_LISTEN_ADDR":     {":9000", "127.0.0.1:9000"},
+	"LAWANG_PUBLIC_BASE_URL": {"https://lawang.example.test", "https://lawang.example.test/prefix"},
 }
 
 // recordingBases is the full cross product of the states of every documented variable: unset,
@@ -383,6 +385,16 @@ func TestVariablesStateTheDefaultsLoadApplies(t *testing.T) {
 	if got := doc["LAWANG_DATABASE_URL"]; !strings.Contains(got, "required in production") {
 		t.Errorf("LAWANG_DATABASE_URL: the documented default %q does not say production has none", got)
 	}
+	// The public base URL has no default on purpose, and the documented default says what an
+	// unset one costs rather than naming a value. Guessing one would put a URL Lawang invented
+	// into a signature base string, which is a check that proves nothing.
+	if prod.PublicBaseURL != "" || dev.PublicBaseURL != "" {
+		t.Errorf("LAWANG_PUBLIC_BASE_URL unset gave %q in production and %q in development, want empty in both",
+			prod.PublicBaseURL, dev.PublicBaseURL)
+	}
+	if got := doc["LAWANG_PUBLIC_BASE_URL"]; !strings.Contains(got, "none") || !strings.Contains(got, "refuses") {
+		t.Errorf("LAWANG_PUBLIC_BASE_URL: the documented default %q does not say there is none and what that costs", got)
+	}
 
 	// The development fallback is a URL with a password in it. It is described, never printed.
 	// The description names where the process will connect, which is not secret, and nothing else.
@@ -452,5 +464,111 @@ func TestVariablesStateTheValuesLoadAccepts(t *testing.T) {
 	defer func() { values[0] = original }()
 	if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": dbURL, "LAWANG_ENV": "edited"})); err == nil {
 		t.Error("editing the result of Variables changed what Load accepts")
+	}
+}
+
+// TestThePublicBaseURLIsNormalizedAndNeverGuessed covers the variable a signature base string is
+// built from. The edge concatenates a request path onto this string and a provider's HMAC is
+// taken over the result, so an accepted value must come back in exactly one spelling, and
+// anything the edge could not concatenate onto safely must be refused at start rather than turned
+// into a signature that never verifies.
+func TestThePublicBaseURLIsNormalizedAndNeverGuessed(t *testing.T) {
+	t.Parallel()
+
+	accepted := map[string]string{
+		"https://lawang.example.test":         "https://lawang.example.test",
+		"https://lawang.example.test/":        "https://lawang.example.test",
+		"https://lawang.example.test:8443":    "https://lawang.example.test:8443",
+		"http://localhost:8080":               "http://localhost:8080",
+		"https://lawang.example.test/lawang":  "https://lawang.example.test/lawang",
+		"https://lawang.example.test/lawang/": "https://lawang.example.test/lawang",
+		"https://lawang.example.test/a/b":     "https://lawang.example.test/a/b",
+		"HTTPS://lawang.example.test":         "https://lawang.example.test",
+	}
+	for raw, want := range accepted {
+		t.Run("accepts "+raw, func(t *testing.T) {
+			t.Parallel()
+			got, err := NormalizePublicBaseURL(raw)
+			if err != nil {
+				t.Fatalf("NormalizePublicBaseURL(%q): %v", raw, err)
+			}
+			if got != want {
+				t.Fatalf("NormalizePublicBaseURL(%q) = %q, want %q", raw, got, want)
+			}
+			// Normalizing again must not move it, or Load and ingress.New would disagree about
+			// the spelling depending on how many times a value had been through.
+			again, err := NormalizePublicBaseURL(got)
+			if err != nil || again != got {
+				t.Fatalf("not idempotent: %q then %q, err %v", got, again, err)
+			}
+		})
+	}
+
+	refused := map[string]string{
+		"no scheme":                "lawang.example.test",
+		"a scheme-relative URL":    "//lawang.example.test",
+		"a path only":              "/ingress",
+		"an unsupported scheme":    "ftp://lawang.example.test",
+		"a postgres URL":           "postgres://app:hunter2@db:5432/lawang",
+		"no host":                  "https://",
+		"credentials":              "https://user:pass@lawang.example.test",
+		"a query":                  "https://lawang.example.test?x=1",
+		"a bare question mark":     "https://lawang.example.test?",
+		"a fragment":               "https://lawang.example.test#f",
+		"a percent-encoded prefix": "https://lawang.example.test/a%2Fb",
+		"a relative segment":       "https://lawang.example.test/a/../b",
+		"a doubled slash":          "https://lawang.example.test/a//b",
+		"a control character":      "https://lawang.example.test/\x00",
+		"not a URL at all":         "://",
+		"just a word":              "x",
+	}
+	for name, raw := range refused {
+		t.Run("refuses "+name, func(t *testing.T) {
+			t.Parallel()
+			got, err := NormalizePublicBaseURL(raw)
+			if err == nil {
+				t.Fatalf("NormalizePublicBaseURL(%q) = %q, want a refusal", raw, got)
+			}
+			if got != "" {
+				t.Fatalf("a refusal returned %q as well", got)
+			}
+			// No refusal echoes the value: Load cannot know which variable a secret was pasted
+			// into, and the refusal is printed to a container log.
+			if strings.Contains(err.Error(), raw) {
+				t.Fatalf("the refusal quotes what it was given: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadCarriesThePublicBaseURLThrough holds Load to the same rules, since the edge is handed
+// Config.PublicBaseURL and not the raw variable.
+func TestLoadCarriesThePublicBaseURLThrough(t *testing.T) {
+	t.Parallel()
+
+	const dbURL = "postgres://app@db/lawang"
+	cfg, err := Load(env(map[string]string{
+		"LAWANG_DATABASE_URL":    dbURL,
+		"LAWANG_PUBLIC_BASE_URL": "https://lawang.example.test/",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PublicBaseURL != "https://lawang.example.test" {
+		t.Fatalf("PublicBaseURL = %q, want the normalized form", cfg.PublicBaseURL)
+	}
+
+	_, err = Load(env(map[string]string{
+		"LAWANG_DATABASE_URL":    dbURL,
+		"LAWANG_PUBLIC_BASE_URL": "postgres://app:hunter2@db:5432/lawang",
+	}))
+	if err == nil {
+		t.Fatal("Load accepted a public base URL that is not one")
+	}
+	if strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "db:5432") {
+		t.Fatalf("the refusal echoes the value, which may be a database URL pasted into the wrong variable: %v", err)
+	}
+	if !strings.Contains(err.Error(), "LAWANG_PUBLIC_BASE_URL") {
+		t.Fatalf("the refusal does not name the variable: %v", err)
 	}
 }

@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,24 +39,23 @@ const delivery = `{"type":"event","workspace":"W1","subscription":"S1","events":
 
 // hubCall is what the edge handed the hub.
 type hubCall struct {
-	key    string
-	body   []byte
-	header http.Header
+	key string
+	req provider.Request
 }
 
 // testHub records every call and answers with fn, or with Stored when fn is nil.
 type testHub struct {
 	mu    sync.Mutex
 	calls []hubCall
-	fn    func(ctx context.Context, p provider.Entry, body []byte, h http.Header) (ingress.Verdict, error)
+	fn    func(ctx context.Context, p provider.Entry, req provider.Request) (ingress.Verdict, error)
 }
 
-func (h *testHub) Accept(ctx context.Context, p provider.Entry, body []byte, hdr http.Header) (ingress.Verdict, error) {
+func (h *testHub) Accept(ctx context.Context, p provider.Entry, req provider.Request) (ingress.Verdict, error) {
 	h.mu.Lock()
-	h.calls = append(h.calls, hubCall{key: p.Key(), body: body, header: hdr})
+	h.calls = append(h.calls, hubCall{key: p.Key(), req: req})
 	h.mu.Unlock()
 	if h.fn != nil {
-		return h.fn(ctx, p, body, hdr)
+		return h.fn(ctx, p, req)
 	}
 	return ingress.Stored, nil
 }
@@ -115,7 +116,7 @@ func (scripted) DeliveryKeys([]byte, http.Header) (provider.DeliveryKeys, error)
 	return provider.DeliveryKeys{}, errors.New("not used")
 }
 
-func (scripted) Verify([]byte, http.Header, []byte) bool { return false }
+func (scripted) Verify(provider.Request, []byte) bool { return false }
 
 func (scripted) Parse([]byte) ([]provider.Change, error) { return nil, errors.New("not used") }
 
@@ -180,12 +181,12 @@ func TestTheVerifierGetsByteIdenticalInput(t *testing.T) {
 		t.Fatal("the fixture must re-serialize differently, or this test proves nothing")
 	}
 
-	hub := &testHub{fn: func(_ context.Context, p provider.Entry, body []byte, h http.Header) (ingress.Verdict, error) {
+	hub := &testHub{fn: func(_ context.Context, p provider.Entry, req provider.Request) (ingress.Verdict, error) {
 		source, ok := p.WebhookSource()
 		if !ok {
 			return 0, errors.New("no webhook source")
 		}
-		if !source.Verify(body, h, []byte(secret)) {
+		if !source.Verify(req, []byte(secret)) {
 			return ingress.Unverified, nil
 		}
 		return ingress.Stored, nil
@@ -202,8 +203,8 @@ func TestTheVerifierGetsByteIdenticalInput(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("hub called %d times", len(calls))
 	}
-	if !bytes.Equal(calls[0].body, []byte(raw)) {
-		t.Fatalf("the hub got different bytes:\n got %q\nwant %q", calls[0].body, raw)
+	if !bytes.Equal(calls[0].req.Body, []byte(raw)) {
+		t.Fatalf("the hub got different bytes:\n got %q\nwant %q", calls[0].req.Body, raw)
 	}
 	if calls[0].key != fake.DefaultKey {
 		t.Fatalf("the hub got the key %q", calls[0].key)
@@ -247,8 +248,8 @@ func TestABodyThatIsNotJSONReachesTheHubUnchanged(t *testing.T) {
 				t.Fatalf("status = %d, want 202", rec.Code)
 			}
 			calls := hub.recorded()
-			if len(calls) != 1 || !bytes.Equal(calls[0].body, body) {
-				t.Fatalf("the hub got %q, want %q", calls[0].body, body)
+			if len(calls) != 1 || !bytes.Equal(calls[0].req.Body, body) {
+				t.Fatalf("the hub got %q, want %q", calls[0].req.Body, body)
 			}
 		})
 	}
@@ -325,8 +326,8 @@ func TestAnOversizeBodyIsRefusedWithoutBeingReadIntoMemory(t *testing.T) {
 		if rec.Code != http.StatusAccepted {
 			t.Fatalf("a body of exactly the cap: status = %d, want 202", rec.Code)
 		}
-		if calls := hub.recorded(); len(calls) != 1 || len(calls[0].body) != cap64 {
-			t.Fatalf("the hub got %d bytes", len(calls[0].body))
+		if calls := hub.recorded(); len(calls) != 1 || len(calls[0].req.Body) != cap64 {
+			t.Fatalf("the hub got %d bytes", len(calls[0].req.Body))
 		}
 
 		overCap := bytes.Repeat([]byte("a"), cap64+1)
@@ -435,11 +436,11 @@ func TestAnAnnouncedLengthCannotDriveAnAllocation(t *testing.T) {
 		t.Fatalf("status = %d, want 202", rec.Code)
 	}
 	calls := hub.recorded()
-	if len(calls) != 1 || string(calls[0].body) != "ten bytes!" {
-		t.Fatalf("the hub got %q", calls[0].body)
+	if len(calls) != 1 || string(calls[0].req.Body) != "ten bytes!" {
+		t.Fatalf("the hub got %q", calls[0].req.Body)
 	}
 	// The capacity of the buffer the body came out of is the allocation that was made.
-	if got := cap(calls[0].body); got > 4<<20 {
+	if got := cap(calls[0].req.Body); got > 4<<20 {
 		t.Fatalf("a body of 10 bytes was read into a buffer of %d, announced %d", got, announced)
 	}
 }
@@ -453,18 +454,17 @@ func TestAnUnknownProviderIs404AndNothingElseHappens(t *testing.T) {
 
 	long := strings.Repeat("\x01\xff\x00qZ", 100) // 500 bytes, well past the 32 a key may have
 	segments := map[string]string{
-		"a NUL":                 "\x00",
-		"a NUL inside":          "fa\x00ke",
-		"500 bytes":             long,
-		"the empty segment":     "",
-		"a capital":             "Fake",
-		"a hyphen":              "ms-graph",
-		"a newline":             "fake\nx",
-		"a slash":               "fake/x",
-		"a space":               "fa ke",
-		"a leading digit":       "9lives",
-		"33 characters":         strings.Repeat("a", 33),
-		"registered but silent": "plain", // a provider with no webhook has no endpoint here
+		"a NUL":             "\x00",
+		"a NUL inside":      "fa\x00ke",
+		"500 bytes":         long,
+		"the empty segment": "",
+		"a capital":         "Fake",
+		"a hyphen":          "ms-graph",
+		"a newline":         "fake\nx",
+		"a slash":           "fake/x",
+		"a space":           "fa ke",
+		"a leading digit":   "9lives",
+		"33 characters":     strings.Repeat("a", 33),
 	}
 	for name, segment := range segments {
 		t.Run(name, func(t *testing.T) {
@@ -489,7 +489,62 @@ func TestAnUnknownProviderIs404AndNothingElseHappens(t *testing.T) {
 			if segment != "" && strings.Contains(logs.String(), segment) {
 				t.Fatal("the log quoted the path segment")
 			}
+			// What reaches this branch is a scanner, and nothing is wrong with this program, so
+			// there is nothing for an operator to act on and the branch stays silent.
+			if logs.String() != "" {
+				t.Fatalf("an unknown segment wrote a log line: %s", logs.String())
+			}
 		})
+	}
+}
+
+// TestARegisteredProviderThatIsNotAWebhookSourceIsLoggedAndStill404 is the other half of the
+// branch above, and the case that used to be one row of its table.
+//
+// The answer a sender sees must stay byte-identical, so a registered provider and an unregistered
+// one cannot be told apart from outside. But this branch can only be reached by a key that is in
+// the registry, so it can only be a mistake in this program's own wiring (a method renamed in a
+// refactor, a value receiver where a pointer receiver was meant), and its consequence is that
+// every real delivery is dropped with a 404 whose loss shows up nowhere but the provider's own
+// dashboard. So it is logged, at a level an operator sees, with the registry's own constant.
+func TestARegisteredProviderThatIsNotAWebhookSourceIsLoggedAndStill404(t *testing.T) {
+	t.Parallel()
+
+	hub := &testHub{}
+	logs := &safeBuffer{}
+	// Warn and above only: the point of the finding is that an operator running at the default
+	// level sees this, not that it is somewhere in a debug stream.
+	opts := ingress.Options{
+		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	mux, _ := edge(t, hub, opts)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ingress/plain", strings.NewReader(delivery)))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if hub.count() != 0 {
+		t.Fatal("a provider with no webhook reached the hub")
+	}
+	// Byte for byte the answer an unregistered segment gets, headers included.
+	unknown := httptest.NewRecorder()
+	unknownMux, _ := edge(t, &testHub{}, ingress.Options{})
+	unknownMux.ServeHTTP(unknown, httptest.NewRequest(http.MethodPost, "/ingress/nosuch", strings.NewReader(delivery)))
+	if rec.Body.String() != unknown.Body.String() {
+		t.Fatalf("the bodies differ: %q and %q", rec.Body.String(), unknown.Body.String())
+	}
+	if !maps.EqualFunc(rec.Header(), unknown.Header(), slices.Equal) {
+		t.Fatalf("the headers differ: %v and %v", rec.Header(), unknown.Header())
+	}
+
+	logged := logs.String()
+	if !strings.Contains(logged, "level=WARN") {
+		t.Fatalf("a dropped delivery must be logged at warn or above: %q", logged)
+	}
+	if !strings.Contains(logged, "provider=plain") {
+		t.Fatalf("the log line does not name the provider: %q", logged)
 	}
 }
 
@@ -618,6 +673,37 @@ func TestAHandshakeReplyAProviderMayNotAskForIsRefused(t *testing.T) {
 			ContentType: "text/plain\r\nX-Injected: 1",
 			Body:        []byte("leaked"),
 		},
+		// 401 is the one status the response-code contract reserves, for a signature that did not
+		// verify. A handshake runs before anything is verified, so a 401 from one would make the
+		// reserved status mean two things to whoever is reading a provider's retry log. 403 is
+		// the same claim spelled differently.
+		"a 401 from a handshake": {Status: http.StatusUnauthorized, Body: []byte("leaked")},
+		"a 403 from a handshake": {Status: http.StatusForbidden, Body: []byte("leaked")},
+		// The reviewer's case: a handshake echoes a challenge, which is a stranger's text, so a
+		// provider that could pick the content type could make this origin serve script.
+		// X-Content-Type-Options: nosniff does not help, because the declared type really is HTML.
+		"text/html with a script": {
+			ContentType: "text/html",
+			Body:        []byte(`<script>alert(1)</script>leaked`),
+		},
+		"text/html with a charset":  {ContentType: "text/html; charset=utf-8", Body: []byte("leaked")},
+		"an SVG, which scripts too": {ContentType: "image/svg+xml", Body: []byte("leaked")},
+		"anything at all":           {ContentType: "application/octet-stream", Body: []byte("leaked")},
+		"an unknown parameter":      {ContentType: "text/plain; boundary=x", Body: []byte("leaked")},
+		"a charset that is not utf-8": {
+			ContentType: "text/plain; charset=iso-8859-1",
+			Body:        []byte("leaked"),
+		},
+		"a content type that is not one": {ContentType: "text-plain", Body: []byte("leaked")},
+		"an empty-looking content type":  {ContentType: " ", Body: []byte("leaked")},
+		// Padded with whitespace, which mime.ParseMediaType accepts and which leaves the media
+		// type and the one parameter exactly as the allowlist wants them. Only the length cap can
+		// refuse this, which is the point: without it a provider could grow a response header to
+		// any size it liked.
+		"a content type over the length cap": {
+			ContentType: "text/plain;" + strings.Repeat(" ", 64) + "charset=utf-8",
+			Body:        []byte("leaked"),
+		},
 	}
 	for name, reply := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -644,18 +730,46 @@ func TestAHandshakeReplyAProviderMayNotAskForIsRefused(t *testing.T) {
 		})
 	}
 
-	t.Run("a well-formed reply is written", func(t *testing.T) {
-		t.Parallel()
-		s := scripted{handshake: func(*http.Request, []byte) (provider.Reply, bool) {
-			return provider.Reply{Status: http.StatusOK, ContentType: "application/json", Body: []byte(`{"ok":true}`)}, true
-		}}
-		mux, _ := edge(t, &testHub{}, ingress.Options{}, s)
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ingress/scripted", nil))
-		if rec.Code != http.StatusOK || rec.Body.String() != `{"ok":true}` {
-			t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
-		}
-	})
+	// The allowlist must not cost a handshake anything it legitimately needs: Microsoft Graph
+	// echoes a validationToken as text/plain, Slack echoes a challenge inside a JSON object, and a
+	// malformed challenge is answered with a 400 rather than with the reserved 401.
+	allowed := map[string]provider.Reply{
+		"the default content type":  {Status: http.StatusOK, Body: []byte("token")},
+		"text/plain":                {ContentType: "text/plain", Body: []byte("token")},
+		"text/plain with a charset": {ContentType: "text/plain; charset=utf-8", Body: []byte("token")},
+		"an upper-case charset":     {ContentType: "text/plain; charset=UTF-8", Body: []byte("token")},
+		"an upper-case media type":  {ContentType: "TEXT/PLAIN", Body: []byte("token")},
+		"application/json":          {ContentType: "application/json", Body: []byte(`{"challenge":"token"}`)},
+		"a 400 for a bad challenge": {Status: http.StatusBadRequest, Body: []byte("bad challenge\n")},
+		"a 404":                     {Status: http.StatusNotFound, Body: []byte("token")},
+		"a 202":                     {Status: http.StatusAccepted, Body: []byte("token")},
+		"a body at the reply cap":   {Body: bytes.Repeat([]byte("l"), 8<<10)},
+	}
+	for name, reply := range allowed {
+		t.Run("allowed: "+name, func(t *testing.T) {
+			t.Parallel()
+			s := scripted{handshake: func(*http.Request, []byte) (provider.Reply, bool) {
+				return reply, true
+			}}
+			mux, _ := edge(t, &testHub{}, ingress.Options{}, s)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ingress/scripted", nil))
+
+			want := reply.Status
+			if want == 0 {
+				want = http.StatusOK
+			}
+			if rec.Code != want {
+				t.Fatalf("status = %d, want %d", rec.Code, want)
+			}
+			if rec.Body.String() != string(reply.Body) {
+				t.Fatalf("body = %q, want %q", rec.Body.String(), reply.Body)
+			}
+			if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Fatalf("nosniff = %q", got)
+			}
+		})
+	}
 }
 
 // TestTheVerdictDecidesTheStatus is the response-code contract of architecture 3.1. A provider
@@ -676,7 +790,7 @@ func TestTheVerdictDecidesTheStatus(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.verdict.String(), func(t *testing.T) {
 			t.Parallel()
-			hub := &testHub{fn: func(context.Context, provider.Entry, []byte, http.Header) (ingress.Verdict, error) {
+			hub := &testHub{fn: func(context.Context, provider.Entry, provider.Request) (ingress.Verdict, error) {
 				return c.verdict, nil
 			}}
 			mux, _ := edge(t, hub, ingress.Options{})
@@ -693,7 +807,7 @@ func TestTheVerdictDecidesTheStatus(t *testing.T) {
 func TestAHubThatReturnsNoVerdictAndNoErrorIsABug(t *testing.T) {
 	t.Parallel()
 
-	hub := &testHub{fn: func(context.Context, provider.Entry, []byte, http.Header) (ingress.Verdict, error) {
+	hub := &testHub{fn: func(context.Context, provider.Entry, provider.Request) (ingress.Verdict, error) {
 		return 0, nil
 	}}
 	mux, logs := edge(t, hub, ingress.Options{})
@@ -714,7 +828,7 @@ func TestAHubThatReturnsNoVerdictAndNoErrorIsABug(t *testing.T) {
 func TestASaturatedAcceptPathAnswersFastWithARetryableStatus(t *testing.T) {
 	t.Parallel()
 
-	hub := &testHub{fn: func(ctx context.Context, _ provider.Entry, _ []byte, _ http.Header) (ingress.Verdict, error) {
+	hub := &testHub{fn: func(ctx context.Context, _ provider.Entry, _ provider.Request) (ingress.Verdict, error) {
 		// What pgxpool.Acquire does when every connection is busy: wait on the context.
 		select {
 		case <-ctx.Done():
@@ -751,7 +865,7 @@ func TestASaturatedAcceptPathAnswersFastWithARetryableStatus(t *testing.T) {
 func TestAHubFailureIs500AndSaysNothing(t *testing.T) {
 	t.Parallel()
 
-	hub := &testHub{fn: func(context.Context, provider.Entry, []byte, http.Header) (ingress.Verdict, error) {
+	hub := &testHub{fn: func(context.Context, provider.Entry, provider.Request) (ingress.Verdict, error) {
 		return 0, errors.New("connection refused to the-database-host:5432")
 	}}
 	mux, _ := edge(t, hub, ingress.Options{})
@@ -866,10 +980,10 @@ func TestConcurrentDeliveriesKeepTheirOwnBodies(t *testing.T) {
 	t.Parallel()
 
 	const senders = 32
-	hub := &testHub{fn: func(_ context.Context, p provider.Entry, body []byte, h http.Header) (ingress.Verdict, error) {
+	hub := &testHub{fn: func(_ context.Context, p provider.Entry, req provider.Request) (ingress.Verdict, error) {
 		source, _ := p.WebhookSource()
 		// Verifying inside the hub means a body that belonged to another request fails here.
-		if !source.Verify(body, h, []byte(secret)) {
+		if !source.Verify(req, []byte(secret)) {
 			return ingress.Unverified, nil
 		}
 		return ingress.Stored, nil
@@ -920,7 +1034,7 @@ func TestNothingASenderControlsReachesTheLogOrTheResponse(t *testing.T) {
 	t.Parallel()
 
 	const marker = "zzmarkerzz"
-	hub := &testHub{fn: func(context.Context, provider.Entry, []byte, http.Header) (ingress.Verdict, error) {
+	hub := &testHub{fn: func(context.Context, provider.Entry, provider.Request) (ingress.Verdict, error) {
 		return ingress.Parked, nil
 	}}
 	mux, logs := edge(t, hub, ingress.Options{})
@@ -1018,7 +1132,7 @@ func TestVerdictStringNamesEveryVerdict(t *testing.T) {
 func TestASenderThatHangsUpIsNotAnError(t *testing.T) {
 	t.Parallel()
 
-	hub := &testHub{fn: func(ctx context.Context, _ provider.Entry, _ []byte, _ http.Header) (ingress.Verdict, error) {
+	hub := &testHub{fn: func(ctx context.Context, _ provider.Entry, _ provider.Request) (ingress.Verdict, error) {
 		return 0, fmt.Errorf("writing the outbox row: %w", ctx.Err())
 	}}
 	mux, logs := edge(t, hub, ingress.Options{})
@@ -1059,5 +1173,161 @@ func TestNewFallsBackToTheDefaultLogger(t *testing.T) {
 	mux.ServeHTTP(rec, signedRequest(delivery))
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", rec.Code)
+	}
+}
+
+// TestTheSignedURLComesFromConfigurationAndNeverFromTheRequest is the security decision behind
+// provider.Request.URL. HubSpot v3 signs the method, the full public request URL, the body and a
+// timestamp, and the public URL is the tunnel's or the proxy's, not the one this process sees.
+//
+// The tempting source is Host, X-Forwarded-Host and X-Forwarded-Proto, and it is the wrong one:
+// all three are written by whoever sent the request, and a Cloudflare Tunnel passes Host straight
+// through. A sender that picks part of its own signed input can make a signature verify over
+// content of its choosing, which is not a check at all. So the scheme, the host and any stripped
+// prefix come from configuration and nothing else.
+func TestTheSignedURLComesFromConfigurationAndNeverFromTheRequest(t *testing.T) {
+	t.Parallel()
+
+	const base = "https://lawang.example.test"
+	cases := []struct {
+		name   string
+		base   string
+		target string
+		want   string
+	}{
+		{"the plain path", base, "/ingress/fake", base + "/ingress/fake"},
+		{"a query is part of what was signed", base, "/ingress/fake?a=1&b=two",
+			base + "/ingress/fake?a=1&b=two"},
+		{"an escaped query survives", base, "/ingress/fake?t=a%2Bb%20c",
+			base + "/ingress/fake?t=a%2Bb%20c"},
+		{"a configured prefix is kept", base + "/lawang", "/ingress/fake",
+			base + "/lawang/ingress/fake"},
+		{"a trailing slash on the base is not doubled", base + "/", "/ingress/fake",
+			base + "/ingress/fake"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			hub := &testHub{}
+			mux, _ := edge(t, hub, ingress.Options{PublicBaseURL: c.base})
+
+			r := httptest.NewRequest(http.MethodPost, c.target, strings.NewReader(delivery))
+			// Everything a sender could hope to steer the signed URL with, all at once.
+			r.Host = "attacker.example"
+			r.Header.Set("Host", "attacker.example")
+			r.Header.Set("X-Forwarded-Host", "attacker.example")
+			r.Header.Set("X-Forwarded-Proto", "http")
+			r.Header.Set("X-Forwarded-For", "203.0.113.1")
+			r.Header.Set("Forwarded", "host=attacker.example;proto=http")
+			r.Header.Set(fake.SignatureHeader, fake.Sign([]byte(secret), []byte(delivery)))
+			mux.ServeHTTP(httptest.NewRecorder(), r)
+
+			calls := hub.recorded()
+			if len(calls) != 1 {
+				t.Fatalf("hub called %d times", len(calls))
+			}
+			if got := calls[0].req.URL; got != c.want {
+				t.Fatalf("Request.URL = %q, want %q", got, c.want)
+			}
+			if strings.Contains(calls[0].req.URL, "attacker.example") {
+				t.Fatal("a header reached the URL a signature is checked over")
+			}
+			if calls[0].req.Method != http.MethodPost {
+				t.Fatalf("Request.Method = %q", calls[0].req.Method)
+			}
+			if calls[0].req.Header.Get(fake.SignatureHeader) != r.Header.Get(fake.SignatureHeader) {
+				t.Fatal("the headers did not travel")
+			}
+		})
+	}
+}
+
+// TestWithNoPublicBaseURLTheEdgeServesAndAURLSigningProviderRefuses is the fail-closed half of the
+// same decision. The edge cannot know what URL a provider posted to unless it is told, and a
+// signature verified against a URL Lawang invented proves nothing, so a deployment that
+// configured none gets an empty Request.URL and a provider that needs it refuses the delivery.
+// The edge still serves, because every scheme that does not sign the URL is unaffected.
+func TestWithNoPublicBaseURLTheEdgeServesAndAURLSigningProviderRefuses(t *testing.T) {
+	t.Parallel()
+
+	// This stands for a HubSpot-shaped scheme: it signs the URL, so an empty one is a refusal and
+	// never a pass.
+	signsTheURL := func(req provider.Request) bool { return req.URL != "" }
+
+	for _, c := range []struct {
+		name string
+		base string
+		want int
+	}{
+		{"configured", "https://lawang.example.test", http.StatusAccepted},
+		{"not configured", "", http.StatusUnauthorized},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			hub := &testHub{fn: func(_ context.Context, _ provider.Entry, req provider.Request) (ingress.Verdict, error) {
+				if !signsTheURL(req) {
+					return ingress.Unverified, nil
+				}
+				return ingress.Stored, nil
+			}}
+			mux, _ := edge(t, hub, ingress.Options{PublicBaseURL: c.base})
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, signedRequest(delivery))
+
+			if rec.Code != c.want {
+				t.Fatalf("status = %d, want %d", rec.Code, c.want)
+			}
+			calls := hub.recorded()
+			if len(calls) != 1 {
+				t.Fatalf("hub called %d times: the edge must still serve", len(calls))
+			}
+			if c.base == "" && calls[0].req.URL != "" {
+				t.Fatalf("Request.URL = %q, want empty when nothing is configured", calls[0].req.URL)
+			}
+		})
+	}
+}
+
+// TestNewRefusesAPublicBaseURLItCannotUse keeps a broken base URL from becoming a signature that
+// never verifies with nothing to see. The rules are config's own, called and not copied, so this
+// also pins that ingress.New really calls that function.
+func TestNewRefusesAPublicBaseURLItCannotUse(t *testing.T) {
+	t.Parallel()
+
+	reg, err := provider.NewRegistry(fake.New(fake.DefaultKey))
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	for name, base := range map[string]string{
+		"no scheme":      "lawang.example.test",
+		"a path only":    "/ingress",
+		"a query":        "https://lawang.example.test?x=1",
+		"credentials":    "https://user:pass@lawang.example.test",
+		"a postgres URL": "postgres://app:hunter2@db:5432/lawang",
+		"no host":        "https://",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			h, err := ingress.New(reg, &testHub{}, ingress.Options{PublicBaseURL: base})
+			if err == nil {
+				t.Fatalf("New accepted %q", base)
+			}
+			if h != nil {
+				t.Fatal("New returned a handler with its error")
+			}
+			if strings.Contains(err.Error(), base) {
+				t.Fatalf("the refusal quotes the value, which may be a secret pasted into the wrong variable: %v", err)
+			}
+			if !strings.Contains(err.Error(), "PublicBaseURL") {
+				t.Fatalf("the refusal does not name the option: %v", err)
+			}
+		})
+	}
+
+	// And it normalizes what it accepts, so New and config.Load hold the same spelling. The
+	// trailing slash is the case that would otherwise double in every signed URL.
+	h, err := ingress.New(reg, &testHub{}, ingress.Options{PublicBaseURL: "https://lawang.example.test/"})
+	if err != nil || h == nil {
+		t.Fatalf("New refused a good base URL: %v", err)
 	}
 }

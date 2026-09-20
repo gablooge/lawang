@@ -86,17 +86,58 @@ type WebhookSource interface {
 	// hub looks subscriptions up by. They are untrusted: they say which rows are candidates,
 	// never which tenant this is. The tenant comes from the candidate whose secret verifies the
 	// body (principle 2).
+	//
+	// It takes the body and the headers rather than a Request, because the identifiers are in the
+	// delivery's own content: no provider puts them somewhere only a Request would carry, and a
+	// lookup key read from configuration rather than from the delivery would select candidates
+	// for the wrong delivery.
 	DeliveryKeys(body []byte, h http.Header) (DeliveryKeys, error)
 
-	// Verify reports whether the delivery is signed with secret, over the exact bytes of body,
-	// compared in constant time. It never errors and never panics: a missing secret, a missing
-	// or malformed signature and a body that is not what the provider sends are all a plain
-	// false (principle 1). It is called once per candidate subscription, so it does no I/O.
-	Verify(body []byte, h http.Header, secret []byte) bool
+	// Verify reports whether the delivery is signed with secret, compared in constant time. It
+	// never errors and never panics: a missing secret, a missing or malformed signature, a
+	// missing r.URL that this scheme needs, and a body that is not what the provider sends are
+	// all a plain false (principle 1). It is called once per candidate subscription, so it does
+	// no I/O.
+	Verify(r Request, secret []byte) bool
 
 	// Parse turns a verified delivery into its changes. It runs in the worker, on the stored
 	// bytes, never on the accept path.
 	Parse(body []byte) ([]Change, error)
+}
+
+// Request is one delivery as a signature scheme sees it: the parts of the HTTP request a
+// provider's signing scheme can cover. It is a struct rather than a longer parameter list because
+// the schemes disagree about what a signature is over, and the next one to need a field it does
+// not have must not break every implementation that came before it. ClickUp signs the body alone,
+// Slack v0 signs a timestamp header and the body, and HubSpot v3 signs the method, the full
+// request URL, the body and a timestamp header, so the union is what is here.
+//
+// Everything in it arrived from the public internet except URL, which is configuration.
+type Request struct {
+	// Method is the request method, as the sender spelled it ("POST").
+	Method string
+
+	// URL is the absolute public URL the provider posted to: the deployment's configured public
+	// base URL, then this request's own escaped path, then its raw query if it has one.
+	//
+	// It is deliberately not built from Host, X-Forwarded-Host or X-Forwarded-Proto. Every one of
+	// those is chosen by whoever sent the request (a tunnel or a reverse proxy passes them
+	// through), and a sender that chooses part of its own signed input can make a signature
+	// verify over content it picked, which is not a signature check at all.
+	//
+	// It is the empty string when the deployment set no public base URL. A scheme that signs the
+	// URL must then return false rather than guess one, because a signature verified against a
+	// URL Lawang invented proves nothing (fail closed). A scheme that does not sign the URL, which
+	// is most of them, ignores this field and is unaffected.
+	URL string
+
+	// Header is the request's headers, read-only. A scheme's timestamp and its signature are
+	// here, and a header the sender did not send is the empty value, never an error.
+	Header http.Header
+
+	// Body is the exact bytes of the request, the ones a signature is over. An implementation
+	// must not re-serialize them, and must not modify the slice, which is not copied.
+	Body []byte
 }
 
 // Reply is a handshake answer. The zero Reply is an empty 200.
