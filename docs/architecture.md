@@ -15,8 +15,9 @@ Build order and open decisions live in [roadmap.md](roadmap.md).
 
 1. Ingest changes from SaaS tools with webhooks as the primary path and reconciliation as the
    safety net.
-2. Stamp every record with its visibility (a scope and the scope's members) from the provider's
-   own sharing signals.
+2. Stamp every record with its visibility (a scope) from the provider's own sharing signals, and
+   sync each scope's members separately, under the same scope id
+   ([section 3.4](#34-access-sync)).
 3. Deliver each change to a sink exactly once, surviving provider re-sends, worker crashes and
    backfill overlaps.
 4. Isolate tenants at the database level, failing closed.
@@ -298,7 +299,7 @@ Three deterministic keys, minted in exactly one package (`internal/ids`) so the 
 | Where | Key | Effect |
 |---|---|---|
 | accept | `delivery_id = blake3(provider, raw_body)`, unique per tenant | an identical re-send is an accept no-op |
-| record | `id = "rec_" + blake3(provider, external_id, version, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
+| record | `id = "rec_" + blake3(provider, external_id, version, scope, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
 | subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates |
 
 Parts are joined with a `0x1F` separator so `("ab","c")` never collides with `("a","bc")`. A part
@@ -315,42 +316,109 @@ The **tenant** is part of the record id on purpose: two tenants can legitimately
 provider workspace, and without the salt the second tenant's records would dedupe away as
 duplicates of the first. The tenant participates only in the hash.
 
+The **scope** (the record's `visibility.scope`, [section 6](#6-the-record-format)) is part of the
+record id as well ([ADR 4](adr/0004-record-format-v1.md)). An entity that moves to another scope,
+a task to another list, is decided on different members from then on, and the provider's own
+version does not have to change with the move. Without the scope in the hash the moved record
+would keep its id, the ledger would skip it as already delivered, and the sink would go on
+deciding access on the old scope, with no error anywhere. `record.Seal` is the only caller of the
+recipe, and it hashes the scope the record carries. Both halves are enforced: a test fails when
+anything outside `internal/record` refers to `ids.RecordID`, and a record whose id, external id,
+version, scope, op or kind was changed after `Seal` cannot be marshalled. The tenant is in no
+field, so `Seal` remembers it and the stage that delivers asks `Record.SealedFor(tenant)`.
+
+One case the id cannot settle: an entity moved from scope A to B **and back to A**, with a
+provider version that changed at neither move, produces the first record's id again. The ledger
+(step 5 of [section 3.2](#32-drain-path-inside-worker)) must not skip it silently. An incoming id
+that is already known, is not the head of its entity's supersede chain, and whose scope differs
+from the head's scope is dead-lettered and counted (ADR 4, decision 7, which also says what an
+operator does then). This was decided by default and is the maintainer's to overrule.
+
 A **new version is a new record.** Edits never overwrite; the new record carries `supersedes`, the
 id of the version it replaces. Supersede links only point forward, so a late-arriving old version
 can never claim to replace a newer one.
 
 ---
 
-## 6. The record format (proposed)
+## 6. The record format
 
-This is the envelope a sink receives. Naming is not final; see the roadmap's open decisions.
+This is the envelope a sink receives: format **v1**, settled in
+[ADR 4](adr/0004-record-format-v1.md), with the scope id inside it settled in
+[ADR 3](adr/0003-scope-id-format.md). It is a public contract from v0.1 on. The contract itself
+is the JSON Schema (draft 2020-12),
+[`internal/record/record.v1.schema.json`](../internal/record/record.v1.schema.json): that is the
+file a sink author takes, and the binary embeds the same bytes. The Go types are in
+`internal/record`.
 
-```jsonc
+```json
 {
-  "id": "rec_4be29c01d7f3a8e64f0d2b91c6e75a30",
-  "op": "upsert",                          // upsert | delete (delete reserved, ships later)
-  "source": "slack",                       // wire name, configurable per sink
-  "kind": "message",                       // task | message | ticket | document | page
+  "format": "lawang.record/v1",
+  "id": "rec_bb4dc9bd2347887adae051e72346bec6",
+  "op": "upsert",
+  "source": "slack",
+  "kind": "message",
   "external_id": "slack:C0GENERAL:1752064245.000200",
-  "version": "1752064245.000200",          // monotonic per external_id
-  "supersedes": null,                      // id of the replaced version, or null
-  "occurred_at": "2026-07-09T12:30:45Z",   // source event time, never ingest time
+  "version": "1752064245.000200",
+  "supersedes": null,
+  "occurred_at": "2026-07-09T12:30:45Z",
   "title": "",
-  "text": "Numbers are in, call me at [PHONE]",   // already PII-masked
+  "text": "Numbers are in, call me at [PHONE]",
   "author": { "id": "U0BEN", "display": "ben" },
   "container": { "kind": "channel", "id": "C0GENERAL" },
-  "visibility": {
-    "scope": "slack:channel:C0GENERAL",    // the ONE thing access is decided on
-    "audience": "group"                    // direct | group; informational only
-  },
-  "origin": {
-    "automation": false,                   // bot or integration author
-    "untrusted": false                     // authored outside the tenant (inbound mail, guests)
-  },
-  "edges": { "reply_parent": null },       // relations from fields, never from NLP
-  "meta": { "raw_ref": "fs://raw/slack/4be29c01...", "delivery": "01JZXA8Q2K..." }
+  "visibility": { "scope": "slack:channel:C0GENERAL", "audience": "group" },
+  "origin": { "automation": false, "untrusted": false },
+  "edges": { "reply_parent": null },
+  "meta": { "delivery": "01JZXA8Q2K4M7N9P0R3S5T6V8W" }
 }
 ```
+
+A test keeps this example and the fixture the schema tests run on identical, so the example is
+always a record the schema accepts and the Go types produce.
+
+| Field | | What it is |
+|---|---|---|
+| `format` | required | `lawang.record/v1`, exactly. How a sink learns what it is reading, also from a file or a queue. |
+| `id` | required | The idempotency key, `rec_` and 32 hex characters ([section 5](#5-idempotency)). One id is one version of one entity in one scope, for one tenant. |
+| `op` | required | `upsert`, or `delete`: a tombstone with empty `title` and `text`. `delete` is part of v1 so that shipping deletions does not change the format; v0.1 never sends one. |
+| `source` | required | The name the sink knows the source by. Sink configuration (principle 4), so it is in no id and need not match the first segment of the scope. |
+| `kind` | required | `task`, `message`, `ticket`, `document` or `page`. A closed set. |
+| `external_id` | required | The entity's identity, the same for every version, **unique within one tenant across all its sources**: it begins with the internal provider key and a colon, and `Seal` refuses one that does not. A sink keys an entity by tenant and `external_id`, never by `source`. Opaque beyond the prefix. |
+| `version` | required | Names this version. Opaque to a sink: equal or not equal. The provider's normalizer promises it changes when the entity changes and never goes backwards for one `external_id`; the format cannot check that. |
+| `supersedes` | required, may be null | The `id` of the record this one replaces. Forward only. |
+| `occurred_at` | required | Source event time, never ingest time. RFC 3339, always UTC with `Z`, up to nine fractional digits. |
+| `title`, `text` | required, may be empty | Already PII-masked. At most 1,024 and 1,048,576 characters (Unicode code points). `title` is one line: no control characters, no line or paragraph separator. `text` holds anything but NUL. Untrusted content by nature, whatever `origin` says, and not safe to display as it stands: both may hold bidirectional formatting. |
+| `author` | required | `id` is the provider's own user id, as the provider spells it, and `display` a name to show. Either may be empty when the source does not say. Informational: **access is never decided on the author**, and `author.id` is not the person identifier that membership uses. `display` can neither break a line nor reorder the text around it (ADR 4, decision 9). |
+| `container` | required | `kind` and `id` of where the entity lives at the source (the channel of a message, the task of a comment). Often what the scope is made of, and not always. |
+| `visibility.scope` | required | **The one thing access is decided on.** A scope id (ADR 3), always built from the internal provider key. |
+| `visibility.audience` | required | `direct` (named participants: a DM, a mailbox) or `group` (a shared space). Informational only: it grants and denies nothing. |
+| `origin` | required | Signals, never clearances. `automation: true`: the source marks the author as a bot or an integration. `untrusted: true`: there is a positive signal that the author is outside the tenant. **`false` means no signal, never the opposite**, and never that the text is safe to follow. |
+| `edges.reply_parent` | required, may be null | The `external_id` of the entity this one replies to. Relations come from fields, never from NLP. |
+| `meta` | may be absent | Diagnostics (`delivery`: the accepted delivery the record was made from). Not part of the record's content. |
+
+**Reading rules for a sink.** Refuse a `format` you do not know. Be idempotent on `id`. Decide
+access on `visibility.scope` and nothing else, keyed by tenant and scope together, because the
+tenant is deliberately not in the envelope or in the scope id: it arrives beside the records,
+established by the per-tenant sink credential ([section 4](#4-trust-model)). Key an entity by
+tenant and `external_id` together, never by `source`, which is a name that may change. Compare `id`,
+`external_id`, `version` and `visibility.scope` for equality only, never parse them, and encode a
+scope id once more wherever it enters a URL (it holds percent signs, ADR 3). Ignore fields
+you do not know, **except inside `visibility`**, which is closed: an unknown field there could only
+be one that must not be ignored, so it is a reason to refuse the record. Field names are lowercase
+`a-z 0-9 _`, now and later, and a record with any other field name is refused (some decoders match
+names without regard to case, and would read `ID` beside `id` as the same field).
+
+Three rules of the format are beyond what a JSON Schema can state, so a sink that validates with
+the schema alone checks them itself (the Go decoder does): **a record document is UTF-8 and
+escapes no half of a surrogate pair** (checked on the bytes, before parsing, because parsers
+refuse such a document, or silently replace the bad part, or keep it, and then two consumers
+read two different records), no field name occurs twice in one object, and `supersedes` is never
+the record's own `id`.
+
+**What may change.** Within v1, every record Lawang produces validates against every earlier
+v1 schema. So only fields a reader may ignore are added, and nothing that exists moves, in either
+direction: a field removed, renamed or made optional, a changed meaning, a limit or a pattern
+changed (raised or lowered, widened or narrowed), a new `op`, `kind` or `audience`, and any change
+inside `visibility` make a new format with a new `format` value and a new schema `$id`.
 
 **The visibility rule is uniform: a person may see a record if they are a member of its scope.**
 There is deliberately no `private` flag. A DM is a scope whose members are its participants; a
@@ -362,10 +430,31 @@ than a per-container flag whose meaning a sink can interpret differently from th
 Lawang **never** stamps anything as public. Content from a connector reaches exactly the people
 who could see it in the source tool, and no further.
 
+A record carries its scope and **never the scope's members**. Members travel separately, through
+access sync ([section 3.4](#34-access-sync)), under the same scope id, which is the join key
+between the two. That is why somebody joining or leaving a channel never causes a record to be
+delivered again, and why no content hash can hide a permission change: permissions are not in the
+content to begin with. The membership message and the person identifier in it are decided with
+B23 and B24, not here (ADR 4).
+
+**A record that moves to another scope is a new record.** A task moved to another list, or a
+message moved to another channel, is decided on a different scope, so its `visibility.scope`
+changes, and the scope is part of the record id ([section 5](#5-idempotency)): the moved record
+gets a new `id` even when the provider's own version did not change with the move, the ledger
+does not skip it, and it names what it was in the old scope in `supersedes`, so the sink replaces
+it and the old scope's members lose it.
+
 `origin.untrusted` exists from day one because records authored by people outside the tenant, such
 as inbound email or external Slack guests, can carry text written to steer a downstream AI agent.
 Marking them at the connector boundary, the only place that knows, lets the sink treat them with
-suspicion.
+more suspicion. **What the field means is pinned now, because a meaning cannot change within v1:**
+`true` is a positive signal that the author is outside the tenant, and `false` is **no signal**,
+never "inside" and never "safe to follow". v0.1 sets it for no provider (the marking is on the
+roadmap after v0.1), so in v0.1 even mail from a stranger says `false`. A sink therefore treats
+every text as untrusted content, uses `true` to be stricter, and never uses `false` to be laxer.
+`origin.automation` is read the same way. The field stays two-valued: a third value, "known to
+be inside", could only be used to relax a guard, and an insider's message can quote an
+outsider's, so that is a statement Lawang can never make (ADR 4, decision 10).
 
 ---
 
@@ -437,6 +526,7 @@ internal/
   appversion/         the release version set by the linker, or the VCS revision of a dev build
   config/             environment config, fail-closed defaults
   ids/                ULIDs and the blake3 key recipes, golden-tested
+  record/             the record format: Go types, validation, the scope id, the embedded JSON Schema
   tenancy/            tenant context and RLS binding
   store/              pgx pool, preflight, transaction helpers, migrate
   testdb/             a real Postgres for integration tests, as the application role
@@ -552,5 +642,6 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Logging | standard library `log/slog` |
 | Crypto | standard library `crypto/hmac`, `crypto/aes`, `crypto/cipher` |
 | Metrics | `github.com/prometheus/client_golang` |
-| Tests | standard `testing`, `testcontainers-go` for Postgres, a JSON Schema validator for the record format |
+| Tests | standard `testing`, `testcontainers-go` for Postgres |
+| JSON Schema validation | `github.com/santhosh-tekuri/jsonschema/v6`, in tests only: pure Go, draft 2020-12, asserts formats on request, and the one module it builds with (`golang.org/x/text`) was already in the module graph. The `lawang` binary does not link it. Production code validates with `record.Validate`, which the tests hold equal to the schema. It becomes a runtime dependency only if the strict stub sink (B09) validates with the schema itself |
 | MCP (later) | `github.com/modelcontextprotocol/go-sdk` |

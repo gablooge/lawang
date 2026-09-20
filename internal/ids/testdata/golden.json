@@ -1,5 +1,5 @@
 {
-  "_comment": "Test vectors for the id recipes in internal/ids. delivery_id = hex(blake3(provider 0x1F body)). record_id = 'rec_' + hex(blake3(provider 0x1F external_id 0x1F version 0x1F tenant))[:32]. Regenerate with: go test ./internal/ids -run TestGolden -update. A changed value here is a breaking change to every record already delivered. The delivery_id vectors with a body of 1018 bytes or more exercise BLAKE3 beyond one 1024 byte chunk: body byte i is i mod 251 (the pattern the official BLAKE3 test vectors use), and the lengths are 1018 and 1019 (with the provider 'slack' and the separator the hash input is exactly 1024 and 1025 bytes), 1025, 8193 and 16385. Their expected values were computed with the Python blake3 package, not with this one, and every other vector was re-verified with it.",
+  "_comment": "Test vectors for the id recipes in internal/ids. delivery_id = hex(blake3(provider 0x1F body)). record_id = 'rec_' + hex(blake3(provider 0x1F external_id 0x1F version 0x1F scope 0x1F tenant))[:32], where scope is the record's visibility.scope. Regenerate with: go test ./internal/ids -run TestGolden -update. A changed value here is a breaking change to every record already delivered. The delivery_id vectors with a body of 1018 bytes or more exercise BLAKE3 beyond one 1024 byte chunk: body byte i is i mod 251 (the pattern the official BLAKE3 test vectors use), and the lengths are 1018 and 1019 (with the provider 'slack' and the separator the hash input is exactly 1024 and 1025 bytes), 1025, 8193 and 16385. Their expected values were computed with the Python blake3 package, not with this one, and every other vector was re-verified with it.",
   "delivery_id": [
     {
       "provider": "clickup",
@@ -67,50 +67,81 @@
       "provider": "slack",
       "external_id": "slack:C0GENERAL:1752064245.000200",
       "version": "1752064245.000200",
+      "scope": "slack:channel:C0GENERAL",
       "tenant": "tenant_a",
-      "want": "rec_3d5c0f99e671e1b1633cc02c82aa0133"
+      "want": "rec_bb4dc9bd2347887adae051e72346bec6"
     },
     {
       "provider": "slack",
       "external_id": "slack:C0GENERAL:1752064245.000200",
       "version": "1752064245.000200",
+      "scope": "slack:channel:C0GENERAL",
       "tenant": "tenant_b",
-      "want": "rec_5e3541c0a8d8918285e23a15f6d1aaf9"
+      "want": "rec_55bc8ef878ba62a04af52296ece8dce9"
     },
     {
       "provider": "slack",
       "external_id": "slack:C0GENERAL:1752064245.000200",
       "version": "1752064300.000100",
+      "scope": "slack:channel:C0GENERAL",
       "tenant": "tenant_a",
-      "want": "rec_e7e92b7560a65954fe9c3e504aa89b16"
+      "want": "rec_107965ded935b5f7fa886accc2de1492"
     },
     {
       "provider": "clickup",
       "external_id": "clickup:task:86a1xyz",
       "version": "1752064245000",
+      "scope": "clickup:list:901100",
       "tenant": "01JZXA8Q2KTENANT0000000000",
-      "want": "rec_2e511fbbd957e13f2d41b73ee397a8f1"
+      "want": "rec_819e706fcd7fca5bd4817de68daf4ea7"
+    },
+    {
+      "provider": "clickup",
+      "external_id": "clickup:task:86a1xyz",
+      "version": "1752064245000",
+      "scope": "clickup:list:901200",
+      "tenant": "01JZXA8Q2KTENANT0000000000",
+      "want": "rec_5447c5aa080e047617d308cf8e309b7f"
     },
     {
       "provider": "x",
       "external_id": "ab",
       "version": "c",
+      "scope": "s",
       "tenant": "t",
-      "want": "rec_5ba14dd2b7f1cd101be994685dd6583e"
+      "want": "rec_a7de48e3008a1494c607ea8ac27d5ca5"
     },
     {
       "provider": "x",
       "external_id": "a",
       "version": "bc",
+      "scope": "s",
       "tenant": "t",
-      "want": "rec_bfafe27719e25ad24099a9759d05e7f1"
+      "want": "rec_a9c6deefbc728426e59b38fd44bd1e62"
+    },
+    {
+      "provider": "x",
+      "external_id": "a",
+      "version": "b",
+      "scope": "cd",
+      "tenant": "t",
+      "want": "rec_d4a8b8640e0eaf040f4926c2ec8464cc"
+    },
+    {
+      "provider": "x",
+      "external_id": "a",
+      "version": "b",
+      "scope": "c",
+      "tenant": "dt",
+      "want": "rec_a16cfc3f576098bae5347a7949453fc5"
     },
     {
       "provider": "outlook",
       "external_id": "outlook:AAMkAGI2über",
       "version": "CQAAABYAAAB",
+      "scope": "outlook:mailbox:ben%40example.com",
       "tenant": "tenant_a",
-      "want": "rec_e648329fe7b48764c3f9b28f6e93f679"
+      "want": "rec_d4295b8f9da3b4a4f6ef7941b064f5b1"
     }
   ]
 }
