@@ -472,19 +472,81 @@ func TestVariablesStateTheValuesLoadAccepts(t *testing.T) {
 // taken over the result, so an accepted value must come back in exactly one spelling, and
 // anything the edge could not concatenate onto safely must be refused at start rather than turned
 // into a signature that never verifies.
+// acceptedBaseURLs is what NormalizePublicBaseURL takes, and the one spelling it returns.
+//
+// It is a package-level table because two tests read it: the one below, which checks each answer,
+// and TestNormalizingTheResultAgainChangesNothing, which checks the property that would have
+// caught the shapes nobody thought to put in a table.
+var acceptedBaseURLs = map[string]string{
+	"https://lawang.example.test":         "https://lawang.example.test",
+	"https://lawang.example.test/":        "https://lawang.example.test",
+	"https://lawang.example.test:8443":    "https://lawang.example.test:8443",
+	"http://localhost:8080":               "http://localhost:8080",
+	"https://lawang.example.test/lawang":  "https://lawang.example.test/lawang",
+	"https://lawang.example.test/lawang/": "https://lawang.example.test/lawang",
+	"https://lawang.example.test/a/b":     "https://lawang.example.test/a/b",
+	"HTTPS://lawang.example.test":         "https://lawang.example.test",
+	// A default port and the host's case are deliberately kept: this string has to match the URL
+	// the operator registered with the provider, which they copied from its dashboard.
+	"https://EXAMPLE.com:443": "https://EXAMPLE.com:443",
+	"https://[::1]:8443/":     "https://[::1]:8443",
+	// Trailing slashes, however many. TrimSuffix would leave "https://x//" as "https://x/", which
+	// keeps the trailing slash the function promises to remove, and the second pass then removes
+	// it: Load and ingress.New would hold two different strings for one variable and every
+	// signature over the URL would fail.
+	"https://lawang.example.test//":         "https://lawang.example.test",
+	"https://lawang.example.test///":        "https://lawang.example.test",
+	"https://lawang.example.test/lawang//":  "https://lawang.example.test/lawang",
+	"https://lawang.example.test:8443//":    "https://lawang.example.test:8443",
+	"HTTPS://lawang.example.test/lawang///": "https://lawang.example.test/lawang",
+	// A sub-delimiter url.Parse leaves alone in a path. Rebuilding the answer with
+	// url.URL.String escaped it to %21, which the next pass refused: the fuzzer found this in
+	// under a second, and testdata/fuzz keeps it as a seed.
+	"https://lawang.example.test/a!b": "https://lawang.example.test/a!b",
+}
+
+// refusedBaseURLs is what NormalizePublicBaseURL refuses, by the name of the shape.
+var refusedBaseURLs = map[string]string{
+	"no scheme":                "lawang.example.test",
+	"a scheme-relative URL":    "//lawang.example.test",
+	"a path only":              "/ingress",
+	"an unsupported scheme":    "ftp://lawang.example.test",
+	"a postgres URL":           "postgres://app:hunter2@db:5432/lawang",
+	"no host":                  "https://",
+	"credentials":              "https://user:pass@lawang.example.test",
+	"a query":                  "https://lawang.example.test?x=1",
+	"a bare question mark":     "https://lawang.example.test?",
+	"a fragment":               "https://lawang.example.test#f",
+	"a percent-encoded prefix": "https://lawang.example.test/a%2Fb",
+	"a relative segment":       "https://lawang.example.test/a/../b",
+	"a doubled slash":          "https://lawang.example.test/a//b",
+	"a leading doubled slash":  "https://lawang.example.test//a",
+	"a control character":      "https://lawang.example.test/\x00",
+	"not a URL at all":         "://",
+	"just a word":              "x",
+	// The escapes Go re-spells to themselves, which a RawPath check does not see. Each one used
+	// to be accepted and decoded, and the decoded value was then refused by the next pass: an
+	// escaped space came back with a literal space in it, an escaped hash became a fragment and
+	// an escaped question mark became a query.
+	"an escaped space":         "https://lawang.example.test/a%20b",
+	"an escaped hash":          "https://lawang.example.test/a%23b",
+	"an escaped question mark": "https://lawang.example.test/a%3Fb",
+	"an escaped dot":           "https://lawang.example.test/%2e",
+	"a literal space":          "https://lawang.example.test/a b",
+	"a prefix outside ASCII":   "https://lawang.example.test/café",
+	"a single dot segment":     "https://lawang.example.test/.",
+	"a parent segment":         "https://lawang.example.test/..",
+	// url.Parse decodes escapes in the host, so this one parses with a host of "%" and the
+	// answer was a string no second pass could read back. The fuzzer found it, and
+	// testdata/fuzz keeps it as a seed.
+	"a percent-escape in the host": "http://%25",
+	"an IPv6 zone id":              "http://[fe80::1%25eth0]:8080",
+}
+
 func TestThePublicBaseURLIsNormalizedAndNeverGuessed(t *testing.T) {
 	t.Parallel()
 
-	accepted := map[string]string{
-		"https://lawang.example.test":         "https://lawang.example.test",
-		"https://lawang.example.test/":        "https://lawang.example.test",
-		"https://lawang.example.test:8443":    "https://lawang.example.test:8443",
-		"http://localhost:8080":               "http://localhost:8080",
-		"https://lawang.example.test/lawang":  "https://lawang.example.test/lawang",
-		"https://lawang.example.test/lawang/": "https://lawang.example.test/lawang",
-		"https://lawang.example.test/a/b":     "https://lawang.example.test/a/b",
-		"HTTPS://lawang.example.test":         "https://lawang.example.test",
-	}
+	accepted := acceptedBaseURLs
 	for raw, want := range accepted {
 		t.Run("accepts "+raw, func(t *testing.T) {
 			t.Parallel()
@@ -495,33 +557,10 @@ func TestThePublicBaseURLIsNormalizedAndNeverGuessed(t *testing.T) {
 			if got != want {
 				t.Fatalf("NormalizePublicBaseURL(%q) = %q, want %q", raw, got, want)
 			}
-			// Normalizing again must not move it, or Load and ingress.New would disagree about
-			// the spelling depending on how many times a value had been through.
-			again, err := NormalizePublicBaseURL(got)
-			if err != nil || again != got {
-				t.Fatalf("not idempotent: %q then %q, err %v", got, again, err)
-			}
 		})
 	}
 
-	refused := map[string]string{
-		"no scheme":                "lawang.example.test",
-		"a scheme-relative URL":    "//lawang.example.test",
-		"a path only":              "/ingress",
-		"an unsupported scheme":    "ftp://lawang.example.test",
-		"a postgres URL":           "postgres://app:hunter2@db:5432/lawang",
-		"no host":                  "https://",
-		"credentials":              "https://user:pass@lawang.example.test",
-		"a query":                  "https://lawang.example.test?x=1",
-		"a bare question mark":     "https://lawang.example.test?",
-		"a fragment":               "https://lawang.example.test#f",
-		"a percent-encoded prefix": "https://lawang.example.test/a%2Fb",
-		"a relative segment":       "https://lawang.example.test/a/../b",
-		"a doubled slash":          "https://lawang.example.test/a//b",
-		"a control character":      "https://lawang.example.test/\x00",
-		"not a URL at all":         "://",
-		"just a word":              "x",
-	}
+	refused := refusedBaseURLs
 	for name, raw := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
 			t.Parallel()
@@ -539,6 +578,117 @@ func TestThePublicBaseURLIsNormalizedAndNeverGuessed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// baseURLCorpus is what the idempotence property is checked over: every input either table
+// already holds, plus every combination of a scheme, a host and a path shape that has ever been
+// interesting here. Two more tables would only cover what somebody thought of; this covers the
+// product, which is where "https://x//" was hiding.
+func baseURLCorpus() []string {
+	var corpus []string
+	for raw := range acceptedBaseURLs {
+		corpus = append(corpus, raw)
+	}
+	for _, raw := range refusedBaseURLs {
+		corpus = append(corpus, raw)
+	}
+	schemes := []string{"http://", "https://", "HTTPS://", "ftp://", ""}
+	hosts := []string{"x", "x:443", "x:8443", "EXAMPLE.com", "[::1]:8443", "localhost", ""}
+	paths := []string{
+		"", "/", "//", "///", "/a", "/a/", "/a//", "//a", "/a//b", "/a/b", "/a/b/",
+		"/a/../b", "/a/./b", "/.", "/..", "/a%20b", "/a%2Fb", "/a%2e", "/a b", "/café",
+		"/a%23b", "/a%3Fb", "/a\x00", "/a?b", "/a#b", "/A/B",
+	}
+	for _, s := range schemes {
+		for _, h := range hosts {
+			for _, p := range paths {
+				corpus = append(corpus, s+h+p)
+			}
+		}
+	}
+	return corpus
+}
+
+// TestNormalizingTheResultAgainChangesNothing is the property the tables cannot state. The same
+// value is normalized more than once in a running deployment (Load normalizes the variable,
+// ingress.New normalizes what Load stored, and a Registrar registers what Load stored), and the
+// spellings meet inside an HMAC base string. A rule that moves a value on the second pass makes
+// the edge sign one string while the provider signed another, which is a 401 on every delivery
+// and reads as a forgery.
+func TestNormalizingTheResultAgainChangesNothing(t *testing.T) {
+	t.Parallel()
+
+	accepted := 0
+	for _, raw := range baseURLCorpus() {
+		got, err := NormalizePublicBaseURL(raw)
+		if err != nil {
+			// A refusal is a fixed point of nothing: a refused value never becomes an output.
+			continue
+		}
+		accepted++
+		checkNormalizedFixedPoint(t, raw, got)
+	}
+	// A guard against the corpus quietly becoming all refusals, which would make this test pass
+	// while proving nothing.
+	if accepted < 50 {
+		t.Fatalf("only %d of the corpus was accepted: the property is not being exercised", accepted)
+	}
+}
+
+// checkNormalizedFixedPoint holds one accepted answer to everything the doc comment promises:
+// a second pass returns it unchanged, and the result really is the shape the edge concatenates
+// onto.
+func checkNormalizedFixedPoint(t *testing.T, raw, got string) {
+	t.Helper()
+
+	again, err := NormalizePublicBaseURL(got)
+	if err != nil {
+		t.Errorf("NormalizePublicBaseURL(%q) = %q, and that answer is then refused: %v", raw, got, err)
+		return
+	}
+	if again != got {
+		t.Errorf("not idempotent: %q normalizes to %q, which normalizes to %q", raw, got, again)
+		return
+	}
+	if strings.HasSuffix(got, "/") {
+		t.Errorf("NormalizePublicBaseURL(%q) = %q, which keeps a trailing slash", raw, got)
+	}
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Errorf("NormalizePublicBaseURL(%q) = %q, which is not a URL: %v", raw, got, err)
+		return
+	}
+	if u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		t.Errorf("NormalizePublicBaseURL(%q) = %q, which has no host or no usable scheme", raw, got)
+	}
+	if u.EscapedPath() != u.Path {
+		t.Errorf("NormalizePublicBaseURL(%q) = %q, whose path is not its own escaped form", raw, got)
+	}
+	// The premise of the function dropping its old "must be absolute" check on the path: with a
+	// host present, url.Parse never produces a relative path. If this ever fires, that check has
+	// to come back, because the edge concatenates a request path straight onto this string.
+	if u.Path != "" && !strings.HasPrefix(u.Path, "/") {
+		t.Errorf("NormalizePublicBaseURL(%q) = %q, whose path is relative", raw, got)
+	}
+}
+
+// FuzzNormalizePublicBaseURL keeps the property open-ended: go test runs the seeds, and go test
+// -fuzz runs whatever the fuzzer invents. Nothing here asserts what the answer should be, only
+// that an accepted answer is one this function would return again unchanged.
+func FuzzNormalizePublicBaseURL(f *testing.F) {
+	for _, raw := range baseURLCorpus() {
+		f.Add(raw)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		got, err := NormalizePublicBaseURL(raw)
+		if err != nil {
+			if got != "" {
+				t.Errorf("a refusal of %q returned %q as well", raw, got)
+			}
+			return
+		}
+		checkNormalizedFixedPoint(t, raw, got)
+	})
 }
 
 // TestLoadCarriesThePublicBaseURLThrough holds Load to the same rules, since the edge is handed

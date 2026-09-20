@@ -264,6 +264,29 @@ func checkListenAddr(raw string) error {
 // ends up inside a signature base string, so the two must agree to the byte: a base URL that Load
 // accepted and the edge spelled differently would make every signature fail with nothing to see.
 //
+// # Normalizing the result again must return it unchanged
+//
+// The same value goes through this function more than once in a running deployment: Load
+// normalizes the variable, ingress.New normalizes what Load stored, and a Registrar (B13, B18)
+// registers what Load stored with the provider. If a second pass moved the string, the URL the
+// provider signs and the URL the edge verifies against would be different strings and every
+// delivery would be a 401 with nothing to see. So every rule here is idempotent in itself: what
+// it rewrites, it rewrites to a fixed point (trailing slashes are removed, all of them, so the
+// result has none), and everything else it either leaves alone or refuses. A refusal is a fixed
+// point too, since a refused value never becomes anyone's output.
+// TestNormalizingTheResultAgainChangesNothing asserts that as a property over a corpus rather
+// than over the table rows somebody happened to write.
+//
+// # What it deliberately does not touch
+//
+// The host is passed through exactly as written: its case is kept, and so is a default port
+// (https://EXAMPLE.com:443 stays as it is). That looks like an omission and is not. This string
+// has to match, byte for byte, the URL the operator gave the provider, which they copied from or
+// pasted into the provider's own dashboard. Lowercasing a host or dropping :443 would create that
+// mismatch rather than remove it, and the mismatch is invisible until every delivery answers 401.
+// The scheme is the exception: url.Parse lowercases it before this function sees it, and no
+// dashboard spells it differently.
+//
 // No error echoes the value. Load cannot know which variable a secret was pasted into, and a
 // manifest with two entries swapped puts the database URL here.
 func NormalizePublicBaseURL(raw string) (string, error) {
@@ -278,21 +301,48 @@ func NormalizePublicBaseURL(raw string) (string, error) {
 	if u.Host == "" {
 		return "", errors.New("missing host")
 	}
+	// url.Parse decodes percent-escapes in the host, so "http://%25" parses with a host of "%",
+	// which is not a host any second pass can read back (FuzzNormalizePublicBaseURL found this
+	// one). The only escape a host legitimately carries is an IPv6 zone id, which a public base
+	// URL has no use for, so the whole shape is refused rather than re-encoded.
+	if strings.Contains(u.Host, "%") {
+		return "", errors.New("the host must be written plainly, with no percent-escape")
+	}
 	if u.User != nil {
 		return "", errors.New("must not carry credentials")
 	}
 	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return "", errors.New("must not carry a query or a fragment")
 	}
-	// The edge appends the request's own escaped path, so a percent-escape in the prefix would
-	// make the result depend on which spelling the provider happened to register.
-	if u.RawPath != "" {
-		return "", errors.New("the path prefix must not be percent-encoded")
+	// The path prefix must already be its own escaped form. The edge appends the request's own
+	// escaped path to this string, so a prefix that is not escaped the same way would make the
+	// signed URL depend on which spelling happened to be registered.
+	//
+	// Comparing EscapedPath with Path is what catches every escape, not only the ones Go
+	// re-spells: %2F and %2e differ once url.Parse has canonicalized them, but %20, %23 and %3F
+	// re-encode to themselves, so a RawPath check lets them through and the value comes back with
+	// a literal space, hash or question mark in it. Those are exactly the shapes a second pass
+	// then refuses. A prefix outside ASCII is refused here too, for the same reason: the edge
+	// would be concatenating an unescaped prefix onto an escaped path.
+	if u.EscapedPath() != u.Path {
+		return "", errors.New("the path prefix must be written plainly, with no percent-escape and no character that needs one")
 	}
-	p := strings.TrimSuffix(u.Path, "/")
-	if p != "" && (!strings.HasPrefix(p, "/") || path.Clean(p) != p) {
+	// Every trailing slash, not one: TrimSuffix would leave "//" as "/", which path.Clean calls
+	// clean and which is the trailing slash this function promises to remove. What is left must
+	// already be clean, so a doubled or relative segment inside the prefix is refused rather than
+	// quietly rewritten into a URL the operator never registered.
+	p := strings.TrimRight(u.Path, "/")
+	if p != "" && path.Clean(p) != p {
 		return "", errors.New("the path prefix must be a clean absolute path, for example /lawang")
 	}
+	// Written out rather than handed to url.URL.String, which escapes a path byte for byte by its
+	// own rules and not by the ones url.Parse accepted: String turns the "!" in "/!a", which
+	// parses and comes back unchanged here, into "%21", and the next pass then refuses the
+	// escape. (FuzzNormalizePublicBaseURL found that within a second.) Concatenating the three
+	// parts that were just checked keeps the operator's own spelling, which is the whole point,
+	// and url.Parse reads the result back as the same scheme, host and path: the host cannot hold
+	// a slash, a question mark or a hash, since url.Parse would have split the URL there, and a
+	// path that is not absolute and clean was refused above.
 	return u.Scheme + "://" + u.Host + p, nil
 }
 

@@ -59,6 +59,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -248,11 +249,76 @@ func New(reg *provider.Registry, hub Hub, opts Options) (*Handler, error) {
 	if h.log == nil {
 		h.log = slog.Default()
 	}
+	if h.publicBaseURL == "" {
+		// The one signal an operator gets for a variable whose absence is otherwise silent. With
+		// no public base URL the edge serves normally, and every delivery of a provider whose
+		// signature covers the URL answers 401: the same status the contract reserves for a
+		// forged signature, on a provider's own dashboard, with nothing in this process to say
+		// which of the two it is. Refusing to start instead would be wrong here, because the edge
+		// does not know which providers a deployment has registered or which of their schemes
+		// sign the URL. B07 does know, and issue #7 carries the ask to refuse there.
+		h.log.Warn("ingress: LAWANG_PUBLIC_BASE_URL is not set, so a provider whose signature covers the request URL (HubSpot v3) will answer 401 for every delivery")
+	}
 	return h, nil
 }
 
-// Mount adds the route to mux, so the pattern is written in one place.
-func (h *Handler) Mount(mux *http.ServeMux) { mux.Handle(Pattern, h) }
+// Mount adds the route to mux, so the pattern is written in one place, and returns the handler
+// the server must serve. **The returned handler, not mux, is what belongs in http.Server.Handler**:
+// it is mux with the path guard of canonicalPathOnly in front of it, and without that guard the
+// mux redirects a non-canonical path instead of refusing it, which turns into a 401 that reads as
+// a forgery (see canonicalPathOnly). Routes added to mux afterwards are behind the guard too,
+// since what is wrapped is the mux itself.
+func (h *Handler) Mount(mux *http.ServeMux) http.Handler {
+	mux.Handle(Pattern, h)
+	return canonicalPathOnly(mux)
+}
+
+// canonicalPathOnly answers 404 for a request whose path net/http.ServeMux would have cleaned,
+// and passes everything else through untouched.
+//
+// It exists because the mux does that cleaning before any handler runs, and answers 307 with a
+// Location header: over a real socket, //ingress/fake, /ingress//fake and /ingress/fake/../fake
+// all redirect to /ingress/fake. A 307 preserves the method and the body, so a well-behaved
+// provider re-POSTs the delivery to the cleaned path, the edge then builds provider.Request.URL
+// from the cleaned path, and the provider signed the path it was given. Every delivery verifies
+// against the wrong string and answers 401, which the contract at the top of this file reserves
+// for exactly one thing: a signature that did not verify. A misconfiguration would be
+// indistinguishable from a forgery.
+//
+// Refusing is safe because a provider only ever posts to the URL Lawang gave it, which has one
+// spelling, so nothing legitimate arrives here needing to be cleaned. The answer is the 404 an
+// unknown provider gets, since the guard sits in front of every route and not only this one, and
+// a request that is refused for its path shape must not say whether the provider behind it
+// exists. The Cloudflare Tunnel in front of a development machine already refuses these shapes
+// (CLAUDE.md), and this is the same rule for a deployment that has no tunnel in front of it.
+//
+// The guard cannot live in the handler: the mux redirects before dispatching, so the handler is
+// never called. It cannot live in the pattern either. In front of the mux is the only place it
+// works, which is why Mount returns a handler rather than leaving the caller to remember.
+func canonicalPathOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !canonicalPath(r.URL.Path) {
+			respond(w, http.StatusNotFound, "no such provider\n")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// canonicalPath reports whether p is what net/http.ServeMux would route without cleaning it
+// first. It is path.Clean with a trailing slash put back, which is what net/http's own
+// (unexported) cleanPath does, so this refuses exactly the paths the mux would have redirected
+// and nothing else: a pattern that ends in a slash keeps working.
+func canonicalPath(p string) bool {
+	if p == "" || p[0] != '/' {
+		return false
+	}
+	clean := path.Clean(p)
+	if p[len(p)-1] == '/' && clean != "/" {
+		clean += "/"
+	}
+	return clean == p
+}
 
 // ServeHTTP is the accept path. Its order is the security argument: the path segment is resolved
 // to a registered provider before a single byte of the body is read.
@@ -305,7 +371,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	verdict, err := h.hub.Accept(ctx, entry, provider.Request{
 		Method: r.Method,
 		URL:    h.publicURL(r),
-		Header: r.Header,
+		Header: provider.NewHeader(r.Header),
 		Body:   body,
 	})
 	switch {
@@ -355,8 +421,10 @@ func (h *Handler) publicURL(r *http.Request) string {
 		return ""
 	}
 	// RequestURI is the escaped path plus "?" and the raw query when there is one, which is the
-	// form every signing scheme that covers a URL uses. The mux has already refused anything that
-	// needed cleaning, so this is the path as it arrived.
+	// form every signing scheme that covers a URL uses. It is the path exactly as it arrived,
+	// never a cleaned one: canonicalPathOnly, in front of the mux, has already answered 404 for
+	// anything the mux would otherwise have cleaned and redirected, so nothing reaches here whose
+	// spelling the sender would not recognize.
 	return h.publicBaseURL + r.URL.RequestURI()
 }
 

@@ -84,7 +84,7 @@ The full table, which `internal/ingress` implements:
 | 202 | stored |
 | 200 | a re-send of something already stored, a delivery nobody owns, or poison that was parked |
 | 401 | **only** a signature that did not verify |
-| 404 | no such provider, answered before anything is read or stored |
+| 404 | no such provider, or a path that is not already canonical, answered before anything is read or stored |
 | 413 | the body is over the cap |
 | 400 | the body could not be read: a `Content-Length` that lies, a connection that stopped |
 | 503 | the accept path did not finish in time, for example a saturated connection pool |
@@ -104,6 +104,17 @@ a constant of the program: `outbox.Delivery.Provider` must never be text a sende
 ([section 5](#5-idempotency) hashes it into the delivery id, and `outbox.Accept` treats an
 unstorable provider as a caller bug rather than as poison).
 
+**A path that is not already canonical is refused, not redirected.** `net/http.ServeMux` cleans a
+request path and answers 307 with a `Location` before any handler runs, so `//ingress/slack`,
+`/ingress//slack` and `/ingress/slack/../slack` would each redirect to `/ingress/slack`. A 307
+preserves the method and the body, so the provider re-POSTs, the edge signs the cleaned path and
+the provider signed the original: every delivery would be a 401, which the table above reserves for
+a forged signature. So `ingress.Handler.Mount` returns the handler the server serves, which is the
+mux with a guard in front of it, and a path the mux would have cleaned gets the same 404 an unknown
+provider gets. Nothing legitimate is refused, because a provider only ever posts to the one URL
+Lawang gave it. The Cloudflare Tunnel in front of a development machine already refuses these
+shapes; this is the same rule for a deployment with no tunnel in front of it.
+
 **The body is captured once, under a cap** (`ingress.DefaultMaxBody`, 1 MiB), by an
 `http.MaxBytesReader` in front of everything that touches it, hashing included. Those exact bytes
 go to the handshake hook, to verification, to the delivery id and into the outbox row. Nothing on
@@ -118,9 +129,14 @@ are written by whoever sent the request, and a sender that chooses part of its o
 make a signature verify over content it picked, which is not a check at all. With the variable
 unset the edge still serves and `provider.Request.URL` is the empty string; a scheme that needs it
 returns `false` rather than guess, because a signature verified against a URL Lawang invented
-proves nothing (see [section 4](#4-trust-model)). `config.NormalizePublicBaseURL` owns the spelling
-and `ingress.New` calls it rather than carrying a copy, since the two strings end up compared byte
-for byte inside an HMAC.
+proves nothing (see [section 4](#4-trust-model)); `ingress.New` says so once at warn level, naming
+the variable, because otherwise the only sign of a missing variable is a 401 on a provider's own
+dashboard. `config.NormalizePublicBaseURL` owns the spelling and `ingress.New` calls it rather than
+carrying a copy, since the two strings end up compared byte for byte inside an HMAC. Normalizing
+its own output returns it unchanged, which is a property test and not a table row: the same value
+is normalized by `config.Load`, again by `ingress.New`, and registered with the provider by a
+`Registrar`, so a rule that moved a string on the second pass would have the edge verify against
+one spelling while the provider signed another.
 
 **The handshake hook** (`WebhookSource.Handshake`) runs before any tenant exists to resolve,
 because a challenge arrives before any subscription does. Its reply is bytes and a content type,
@@ -291,13 +307,19 @@ and passed through unchanged by a tunnel. A receiver that built the signed URL f
 a sender choose part of what it is proving, and the check would pass over content the sender
 picked. So the public base URL is **configuration**: `LAWANG_PUBLIC_BASE_URL`, validated at start
 by `config.NormalizePublicBaseURL` (absolute, `http` or `https`, a host, no credentials, no query,
-no fragment, a clean path prefix, no trailing slash) and refused rather than guessed at.
+no fragment, a clean path prefix written with no percent-escape, no trailing slash) and refused
+rather than guessed at. Host case and a default port are deliberately **kept**: the string has to
+match the URL the operator registered with the provider, which they copied from its dashboard, so
+lowercasing a host or dropping `:443` would create the mismatch rather than remove it.
 
 **Unset is a refusal, not a default.** With no public base URL configured the edge still serves,
 because most schemes never look at the URL, but `provider.Request.URL` is empty and a scheme that
 signs the URL must return `false`. That answers 401 for every delivery of that provider, which is
 loud and correct: the alternative is a signature checked against a URL Lawang made up, which
-passes or fails for reasons nobody can reason about. The operator's fix is one variable.
+passes or fails for reasons nobody can reason about. The operator's fix is one variable, and
+`ingress.New` names it in a warning at start so the fix is findable from the logs rather than only
+from the provider's dashboard. Refusing to start belongs to the hub (B07), which is the layer that
+knows which providers are registered and which of their schemes cover the URL.
 
 **Row-level security.** Every tenant-scoped table has RLS enabled and forced, with the policy keyed
 on a transaction-local setting. If the setting is missing, a query returns zero rows. Three roles:
@@ -573,7 +595,7 @@ type Provider interface {
 // Optional capabilities.
 type WebhookSource interface {
 	Handshake(r *http.Request, body []byte) (Reply, bool)          // challenge echoes
-	DeliveryKeys(body []byte, h http.Header) (DeliveryKeys, error) // what resolves the owner
+	DeliveryKeys(body []byte, h Header) (DeliveryKeys, error)      // what resolves the owner
 	Verify(r Request, secret []byte) bool                          // never errors, never panics
 	Parse(body []byte) ([]Change, error)
 }
@@ -583,11 +605,17 @@ type WebhookSource interface {
 // full public URL, the body and a timestamp header. It is a struct so that the next scheme to
 // need one more field does not break every implementation written before it.
 type Request struct {
-	Method string      // as the sender spelled it
-	URL    string      // the PUBLIC URL, from configuration; empty when none is configured
-	Header http.Header // read-only
-	Body   []byte      // the exact request bytes, never re-serialized, never modified
+	Method string // always "POST": the route fixes the method. HubSpot v3 signs it
+	URL    string // the PUBLIC URL, from configuration; empty when none is configured
+	Header Header // readable, with no way to change what another candidate reads
+	Body   []byte // the exact request bytes, never re-serialized, never modified
 }
+
+// Header is the delivery's header fields. It is not an http.Header because the hub hands one
+// Request to Verify once per candidate subscription, and a map would let one implementation's
+// Set or Del change what the candidates after it see: an intermittent signature failure on the
+// second candidate only. Get and Values read; Values returns a copy; nothing writes.
+type Header struct{ /* wraps the request's own map, copies nothing */ }
 type Registrar interface {
 	Register(ctx context.Context, t Tenant, cred Credential) ([]Subscription, error)
 	Renew(ctx context.Context, s Subscription) (Subscription, error)
@@ -636,6 +664,12 @@ of the program rather than a decoded path segment.
   panic there is recovered per connection by `net/http` and the provider sees a dropped response
   rather than a status. `Verify` runs once per candidate subscription, so B07's per-candidate loop
   recovers around it: one provider's panic parks a delivery, it does not drop the connection.
+- `Request` is handed to `Verify` **once per candidate**, and the same value each time. That is why
+  `Request.Header` is this package's `Header` and not an `http.Header`: a provider that normalized
+  a header in place would change what the candidates after it read, and the symptom would be a
+  signature that fails for the second candidate only, in a tenant that happens to have two
+  subscriptions on one workspace. Nothing is copied per candidate, because there is nothing an
+  implementation can write to.
 - The 503 the edge answers on a slow accept rests on `errors.Is(err, context.DeadlineExceeded)`.
   Both error shapes pgx produces for a saturated pool match it today, but a statement cancelled
   server side comes back as a `*pgconn.PgError` with SQLSTATE 57014 and no context error in its

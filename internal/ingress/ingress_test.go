@@ -86,6 +86,14 @@ func (b *safeBuffer) String() string {
 	return b.buf.String()
 }
 
+// reset drops what has been logged so far, so that a test asserting on what one request logged is
+// not reading what starting the edge logged.
+func (b *safeBuffer) reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+}
+
 // plain is a provider with no webhook capability, so it has no endpoint at the edge.
 type plain struct{}
 
@@ -112,7 +120,7 @@ func (s scripted) Handshake(r *http.Request, body []byte) (provider.Reply, bool)
 	return s.handshake(r, body)
 }
 
-func (scripted) DeliveryKeys([]byte, http.Header) (provider.DeliveryKeys, error) {
+func (scripted) DeliveryKeys([]byte, provider.Header) (provider.DeliveryKeys, error) {
 	return provider.DeliveryKeys{}, errors.New("not used")
 }
 
@@ -121,7 +129,7 @@ func (scripted) Verify(provider.Request, []byte) bool { return false }
 func (scripted) Parse([]byte) ([]provider.Change, error) { return nil, errors.New("not used") }
 
 // edge builds a mux with the ingress route on it, plus the log it wrote.
-func edge(t *testing.T, hub ingress.Hub, opts ingress.Options, extra ...provider.Provider) (*http.ServeMux, *safeBuffer) {
+func edge(t *testing.T, hub ingress.Hub, opts ingress.Options, extra ...provider.Provider) (http.Handler, *safeBuffer) {
 	t.Helper()
 	providers := append([]provider.Provider{fake.New(fake.DefaultKey), plain{}}, extra...)
 	reg, err := provider.NewRegistry(providers...)
@@ -137,8 +145,13 @@ func edge(t *testing.T, hub ingress.Hub, opts ingress.Options, extra ...provider
 		t.Fatalf("ingress.New: %v", err)
 	}
 	mux := http.NewServeMux()
-	h.Mount(mux)
-	return mux, logs
+	// The handler Mount returns, not the mux: it carries the guard that refuses a path the mux
+	// would otherwise clean and redirect, and it is what B07 will put in http.Server.Handler.
+	served := h.Mount(mux)
+	// New logs when no public base URL is configured, which most of these tests do not set. That
+	// line has its own test; here it would show up as "this request logged something".
+	logs.reset()
+	return served, logs
 }
 
 func signedRequest(body string) *http.Request {
@@ -929,8 +942,8 @@ func TestABodyThatStopsEarlyIs400(t *testing.T) {
 }
 
 // TestPathTraversalNeverReachesTheHandler. The Cloudflare Tunnel in front of a developer machine
-// answers these itself, but the edge is not allowed to lean on that: net/http's mux cleans a path
-// before it matches, so a traversal ends as a redirect or a 404 and never as a delivery.
+// answers these itself, but the edge is not allowed to lean on that: a traversal is a 404 here,
+// and since the guard in front of the mux it is never a redirect either (the test below).
 func TestPathTraversalNeverReachesTheHandler(t *testing.T) {
 	t.Parallel()
 
@@ -944,6 +957,12 @@ func TestPathTraversalNeverReachesTheHandler(t *testing.T) {
 			mux, _ := edge(t, hub, ingress.Options{})
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, target, strings.NewReader(delivery)))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", rec.Code)
+			}
+			if loc := rec.Header().Get("Location"); loc != "" {
+				t.Fatalf("a traversal was answered with a redirect to %q", loc)
+			}
 			if rec.Code >= 200 && rec.Code < 300 {
 				t.Fatalf("status = %d, a traversal must never be accepted", rec.Code)
 			}
@@ -951,6 +970,146 @@ func TestPathTraversalNeverReachesTheHandler(t *testing.T) {
 				t.Fatal("a traversal reached the hub")
 			}
 		})
+	}
+}
+
+// rawPOST sends one request over a real TCP connection with the request target written out
+// verbatim, which is the only way to test what the server does with a path that is not canonical:
+// an http.Client, and httptest.NewRequest, both hand net/http a parsed URL, and httptest's own
+// recorder never involves the mux's routing at all.
+func rawPOST(t *testing.T, addr, target, body string) answer {
+	t.Helper()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	// A deadline on both halves, so a server that never answers fails this test in seconds
+	// instead of hanging it.
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	req := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		target, len(body), body)
+	if _, err := io.WriteString(conn, req); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	answered, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the response body: %v", err)
+	}
+	return answer{status: resp.StatusCode, header: resp.Header, body: string(answered)}
+}
+
+// answer is what rawPOST read back, with the connection already closed, so that nothing in a test
+// holds a socket open waiting for a Cleanup.
+type answer struct {
+	status int
+	header http.Header
+	body   string
+}
+
+// TestAPathTheMuxWouldCleanIsRefusedAndNeverRedirected is the reason Mount returns a handler.
+//
+// net/http.ServeMux cleans a path and redirects before any handler runs: over a real socket,
+// //ingress/fake, /ingress//fake and /ingress/fake/../fake each used to answer 307 with
+// Location: /ingress/fake. A 307 preserves the method and the body, so a provider follows it by
+// re-POSTing the delivery to the cleaned path. The edge would then build provider.Request.URL
+// from the cleaned path while the provider signed the path it was given, and every delivery would
+// answer 401: the status this package's contract reserves for a signature that did not verify. A
+// misconfiguration would be indistinguishable from a forgery.
+//
+// So a path that is not already canonical is refused with the 404 an unknown provider gets.
+func TestAPathTheMuxWouldCleanIsRefusedAndNeverRedirected(t *testing.T) {
+	t.Parallel()
+
+	const base = "https://lawang.example.test"
+	hub := &testHub{}
+	reg, err := provider.NewRegistry(fake.New(fake.DefaultKey))
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	h, err := ingress.New(reg, hub, ingress.Options{
+		PublicBaseURL: base,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("ingress.New: %v", err)
+	}
+	mux := http.NewServeMux()
+	// Two routes of the kind the binary will have around the edge, to pin that the guard fronts
+	// whatever is on the mux (it is the mux that redirects, not this handler) and that a pattern
+	// which legitimately ends in a slash keeps working.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("POST /sub/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+	srv := httptest.NewServer(h.Mount(mux))
+	t.Cleanup(srv.Close)
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	refused := []string{
+		"//ingress/" + fake.DefaultKey,
+		"/ingress//" + fake.DefaultKey,
+		"/ingress/" + fake.DefaultKey + "/../" + fake.DefaultKey,
+		"/ingress/./" + fake.DefaultKey,
+		"/ingress/" + fake.DefaultKey + "/.",
+		"/ingress/../ingress/" + fake.DefaultKey,
+		"//healthz",
+		"/sub//",
+	}
+	// What an unknown provider is answered, to compare against: a request refused for the shape of
+	// its path must not be distinguishable from one refused for its provider, or the shape of the
+	// path becomes a way to ask which providers are registered.
+	unknown := rawPOST(t, addr, "/ingress/nosuch", delivery)
+	if unknown.status != http.StatusNotFound {
+		t.Fatalf("an unknown provider answered %d, want 404", unknown.status)
+	}
+
+	for _, target := range refused {
+		resp := rawPOST(t, addr, target, delivery)
+		if resp.status != http.StatusNotFound {
+			t.Errorf("POST %s: status = %d, want 404", target, resp.status)
+		}
+		if resp.body != unknown.body {
+			t.Errorf("POST %s: body = %q, want the unknown-provider answer %q", target, resp.body, unknown.body)
+		}
+		if loc := resp.header.Get("Location"); loc != "" {
+			t.Errorf("POST %s: answered with a redirect to %q, which a provider would follow by "+
+				"re-POSTing to a path it did not sign", target, loc)
+		}
+		if got, want := resp.header.Get("Content-Type"), "text/plain; charset=utf-8"; got != want {
+			t.Errorf("POST %s: Content-Type = %q, want %q", target, got, want)
+		}
+	}
+	if hub.count() != 0 {
+		t.Fatalf("a path that had to be cleaned reached the hub %d times", hub.count())
+	}
+
+	// The control: the canonical spelling of the same route still works, and what the hub is
+	// handed is that spelling and not a cleaned one.
+	resp := rawPOST(t, addr, "/ingress/"+fake.DefaultKey+"?a=1", delivery)
+	if resp.status != http.StatusAccepted {
+		t.Fatalf("the canonical path answered %d, want 202", resp.status)
+	}
+	calls := hub.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("hub called %d times, want once", len(calls))
+	}
+	if want := base + "/ingress/" + fake.DefaultKey + "?a=1"; calls[0].req.URL != want {
+		t.Fatalf("Request.URL = %q, want %q", calls[0].req.URL, want)
+	}
+	// And a route that ends in a slash is not collateral damage.
+	if resp := rawPOST(t, addr, "/sub/", ""); resp.status != http.StatusTeapot {
+		t.Fatalf("a pattern ending in a slash answered %d, want 418", resp.status)
 	}
 }
 
@@ -1285,6 +1444,50 @@ func TestWithNoPublicBaseURLTheEdgeServesAndAURLSigningProviderRefuses(t *testin
 				t.Fatalf("Request.URL = %q, want empty when nothing is configured", calls[0].req.URL)
 			}
 		})
+	}
+}
+
+// TestAnUnsetPublicBaseURLIsSaidOutLoudAtStart is the operator's only signal for the one variable
+// whose absence is otherwise completely silent.
+//
+// Unset, the edge serves, provider.Request.URL is empty, and a scheme that signs the URL refuses
+// every delivery: 401, the status the contract reserves for a forged signature, on the provider's
+// dashboard and nowhere else. Nothing else in the process mentions it, so New says it once, at a
+// level an operator's handler passes, and names the variable.
+func TestAnUnsetPublicBaseURLIsSaidOutLoudAtStart(t *testing.T) {
+	t.Parallel()
+
+	reg, err := provider.NewRegistry(fake.New(fake.DefaultKey))
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	newEdge := func(t *testing.T, base string) string {
+		t.Helper()
+		logs := &safeBuffer{}
+		// Warn level, so this asserts an operator at the default level sees it, not that it is
+		// somewhere in a debug stream.
+		opts := ingress.Options{
+			PublicBaseURL: base,
+			Logger:        slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		}
+		if _, err := ingress.New(reg, &testHub{}, opts); err != nil {
+			t.Fatalf("ingress.New: %v", err)
+		}
+		return logs.String()
+	}
+
+	said := newEdge(t, "")
+	if !strings.Contains(said, "LAWANG_PUBLIC_BASE_URL") {
+		t.Fatalf("New said nothing about the unset variable: %q", said)
+	}
+	if !strings.Contains(said, "401") {
+		t.Fatalf("the warning does not say what it costs: %q", said)
+	}
+
+	// Configured, there is nothing to warn about, and a line every start would train an operator
+	// to ignore the one that matters.
+	if quiet := newEdge(t, "https://lawang.example.test"); quiet != "" {
+		t.Fatalf("New warned about a base URL that is configured: %q", quiet)
 	}
 }
 

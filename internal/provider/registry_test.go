@@ -3,6 +3,7 @@ package provider_test
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"unsafe"
@@ -166,5 +167,48 @@ func TestTheZeroEntryNamesNoProvider(t *testing.T) {
 	}
 	if _, ok := e.WebhookSource(); ok {
 		t.Fatal("the zero Entry is not a WebhookSource")
+	}
+}
+
+// TestAHeaderCannotBeUsedToChangeWhatTheNextCandidateReads is why Request.Header is a type of this
+// package and not an http.Header.
+//
+// The hub hands one Request to Verify once per candidate subscription (B07), so anything an
+// implementation could write to would be read by every candidate after it. A tenant with two
+// subscriptions on one workspace would then see a signature fail for the second candidate only,
+// and only sometimes, which is about the worst failure shape available. There is no Set and no
+// Del to call here, and the one method that returns something a caller could write to returns a
+// copy.
+func TestAHeaderCannotBeUsedToChangeWhatTheNextCandidateReads(t *testing.T) {
+	t.Parallel()
+
+	live := http.Header{}
+	live.Set("X-Signature", "first")
+	live.Add("X-Signature", "second")
+	h := provider.NewHeader(live)
+
+	// What one candidate can reach: the slice Values returned, and nothing else.
+	got := h.Values("X-Signature")
+	if len(got) != 2 || got[0] != "first" || got[1] != "second" {
+		t.Fatalf("Values = %q, want both values in order", got)
+	}
+	got[0] = "tampered"
+
+	// What every candidate after it reads.
+	if again := h.Values("X-Signature"); len(again) != 2 || again[0] != "first" || again[1] != "second" {
+		t.Fatalf("a candidate changed what the next one reads: Values = %q", again)
+	}
+	if v := h.Get("x-signature"); v != "first" {
+		t.Fatalf("Get = %q, want the first value, matched without regard to case", v)
+	}
+	if live.Get("X-Signature") != "first" {
+		t.Fatalf("the request's own header was changed through the wrapper: %q", live)
+	}
+
+	// The zero value reads as a request that sent no header at all, rather than panicking on a
+	// nil map: a Request built by hand in a test, or by a later caller, must not be a trap.
+	var zero provider.Header
+	if zero.Get("X-Signature") != "" || zero.Values("X-Signature") != nil {
+		t.Fatal("the zero Header must read as empty")
 	}
 }

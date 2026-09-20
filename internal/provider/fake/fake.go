@@ -160,7 +160,7 @@ func badChallenge() provider.Reply {
 }
 
 // DeliveryKeys reads the workspace and subscription ids out of a delivery.
-func (p *Provider) DeliveryKeys(body []byte, _ http.Header) (provider.DeliveryKeys, error) {
+func (p *Provider) DeliveryKeys(body []byte, _ provider.Header) (provider.DeliveryKeys, error) {
 	env, err := parseEnvelope(body)
 	if err != nil {
 		return provider.DeliveryKeys{}, err

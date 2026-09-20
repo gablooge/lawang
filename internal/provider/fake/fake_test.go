@@ -35,7 +35,7 @@ func request(body []byte, h http.Header) provider.Request {
 	return provider.Request{
 		Method: http.MethodPost,
 		URL:    "https://lawang.example.test/ingress/" + fake.DefaultKey,
-		Header: h,
+		Header: provider.NewHeader(h),
 		Body:   body,
 	}
 }
@@ -142,9 +142,9 @@ func TestVerifyIgnoresWhatThisSchemeDoesNotSign(t *testing.T) {
 	h := headerWith(fake.Sign([]byte(secret), body))
 
 	for _, r := range []provider.Request{
-		{Method: http.MethodPost, URL: "", Header: h, Body: body},
-		{Method: "PUT", URL: "https://elsewhere.example.test/ingress/fake?x=1", Header: h, Body: body},
-		{Method: "", URL: "", Header: h, Body: body},
+		{Method: http.MethodPost, URL: "", Header: provider.NewHeader(h), Body: body},
+		{Method: "PUT", URL: "https://elsewhere.example.test/ingress/fake?x=1", Header: provider.NewHeader(h), Body: body},
+		{Method: "", URL: "", Header: provider.NewHeader(h), Body: body},
 	} {
 		if !p.Verify(r, []byte(secret)) {
 			t.Fatalf("a body-only scheme refused over method %q and URL %q", r.Method, r.URL)
@@ -256,7 +256,7 @@ func TestADeliveryThisProviderWouldNotHaveSentIsAnError(t *testing.T) {
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := p.DeliveryKeys([]byte(body), nil); err == nil {
+			if _, err := p.DeliveryKeys([]byte(body), provider.Header{}); err == nil {
 				t.Fatal("DeliveryKeys accepted it")
 			}
 			if _, err := p.Parse([]byte(body)); err == nil {
@@ -311,7 +311,7 @@ func TestBytesThatAreNotUTF8AreRefusedBeforeTheDecoder(t *testing.T) {
 			if _, err := p.Parse(tc.body); err == nil {
 				t.Fatal("Parse accepted bytes that are not UTF-8")
 			}
-			if _, err := p.DeliveryKeys(tc.body, nil); err == nil {
+			if _, err := p.DeliveryKeys(tc.body, provider.Header{}); err == nil {
 				t.Fatal("DeliveryKeys accepted bytes that are not UTF-8")
 			}
 		})
@@ -396,7 +396,7 @@ func TestThePipelineRoundTripProducesASealableRecord(t *testing.T) {
 	p := fake.New(fake.DefaultKey)
 	body := []byte(delivery())
 
-	keys, err := p.DeliveryKeys(body, nil)
+	keys, err := p.DeliveryKeys(body, provider.Header{})
 	if err != nil {
 		t.Fatalf("DeliveryKeys: %v", err)
 	}

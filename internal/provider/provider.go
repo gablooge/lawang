@@ -11,6 +11,7 @@ package provider
 import (
 	"context"
 	"net/http"
+	"slices"
 
 	"github.com/gablooge/lawang/internal/record"
 	"github.com/gablooge/lawang/internal/tenancy"
@@ -91,7 +92,7 @@ type WebhookSource interface {
 	// delivery's own content: no provider puts them somewhere only a Request would carry, and a
 	// lookup key read from configuration rather than from the delivery would select candidates
 	// for the wrong delivery.
-	DeliveryKeys(body []byte, h http.Header) (DeliveryKeys, error)
+	DeliveryKeys(body []byte, h Header) (DeliveryKeys, error)
 
 	// Verify reports whether the delivery is signed with secret, compared in constant time. It
 	// never errors and never panics: a missing secret, a missing or malformed signature, a
@@ -114,7 +115,11 @@ type WebhookSource interface {
 //
 // Everything in it arrived from the public internet except URL, which is configuration.
 type Request struct {
-	// Method is the request method, as the sender spelled it ("POST").
+	// Method is the request method, and it is always "POST": ingress.Pattern fixes the method, so
+	// the mux answers anything else itself and no other method reaches a provider. It is carried
+	// because HubSpot v3 puts the method in its base string, and an implementation that builds
+	// that string from this field rather than from a literal keeps saying the truth if the edge
+	// ever routes a second method. There is nothing here to branch on.
 	Method string
 
 	// URL is the absolute public URL the provider posted to: the deployment's configured public
@@ -131,14 +136,46 @@ type Request struct {
 	// is most of them, ignores this field and is unaffected.
 	URL string
 
-	// Header is the request's headers, read-only. A scheme's timestamp and its signature are
-	// here, and a header the sender did not send is the empty value, never an error.
-	Header http.Header
+	// Header is the request's header fields. A scheme's timestamp and its signature are here, and
+	// a header the sender did not send is the empty string, never an error.
+	Header Header
 
 	// Body is the exact bytes of the request, the ones a signature is over. An implementation
 	// must not re-serialize them, and must not modify the slice, which is not copied.
 	Body []byte
 }
+
+// Header is the header fields of one delivery, as a provider sees them: readable, and with no way
+// to change what anything else will read.
+//
+// It is not an http.Header, and that is the point. The hub hands one Request to Verify once per
+// candidate subscription (B07), so with a map an implementation that normalized a header in place
+// (a Set or a Del on the way to building a base string) would change what every later candidate
+// sees, and the symptom would be a signature that fails only for the second candidate and only
+// when a tenant has more than one. A comment asking implementations not to do that is not a
+// guard, and cloning the map per request does not help either, since every candidate is handed
+// the same Request. A type with no mutating method takes the mistake off the table and copies
+// nothing: the edge wraps the request's own map once, and reading through the wrapper costs a
+// method call that inlines away.
+type Header struct {
+	h http.Header
+}
+
+// NewHeader wraps h, which the caller must not write to afterwards. The edge passes the request's
+// own map, which net/http does not touch once the handler has been called.
+func NewHeader(h http.Header) Header { return Header{h: h} }
+
+// Get returns the first value of the named field, matching the name case-insensitively the way
+// http.Header.Get does, and the empty string when the sender sent no such field. The zero Header
+// has no fields, so Get on it is the empty string rather than a panic.
+func (h Header) Get(name string) string { return h.h.Get(name) }
+
+// Values returns every value of the named field, in the order the sender sent them, and nil when
+// there is none. A scheme that refuses a delivery carrying two signature headers, which is two
+// claims where the protocol allows one, needs the count and not just the first value.
+//
+// The slice is a copy, so writing to it changes nothing another candidate will read.
+func (h Header) Values(name string) []string { return slices.Clone(h.h.Values(name)) }
 
 // Reply is a handshake answer. The zero Reply is an empty 200.
 type Reply struct {
@@ -147,8 +184,10 @@ type Reply struct {
 	// malformed challenge is a legitimate answer, while a redirect (which would let a provider
 	// point a stranger somewhere) and a 5xx (which asks for a retry) are not.
 	Status int
-	// ContentType is the Content-Type header, and empty means text/plain; charset=utf-8. The
-	// edge refuses one that is not printable ASCII.
+	// ContentType is the Content-Type header, and empty means text/plain; charset=utf-8. The edge
+	// refuses anything outside a closed allowlist (text/plain and application/json, optionally
+	// with charset=utf-8), because a handshake echoes a stranger's text and a provider that could
+	// name the type could make this origin serve something a browser executes.
 	ContentType string
 	// Body is written as it stands. A provider that echoes a challenge is echoing text a
 	// stranger sent, so it checks that text before putting it here.
