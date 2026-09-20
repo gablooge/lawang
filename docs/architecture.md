@@ -121,10 +121,16 @@ this is the same rule for a deployment with no tunnel in front of it.
 307 from `/x` to `/x/` when `/x/` is a registered pattern and `/x` is not, and that one runs after
 any guard in front of the mux, because it depends on the routing table rather than on the request.
 So the routing table is `ingress`'s: every other route the server answers (`/healthz` now, the
-`/v1` operator API later) is given to `ingress.New` as a `Route`, and for every pattern that can
-match a path ending in a slash, `New` registers the slash-less path itself with the same 404. No
-bare mux exists for a caller to serve by mistake, which is what an earlier `Mount(mux)` shape
-allowed with nothing in `go build`, `go vet` or `golangci-lint` to say so.
+`/v1` operator API later) is given to `ingress.New` as a `Route`, and wherever the mux would
+redirect from a slash-less path, `New` registers that path itself with the same 404. Whether it
+would redirect is a property of the whole table and not of any one pattern, so `New` does not
+predict it from the pattern strings: it builds the table, builds a second mux carrying the same
+patterns and handlers that do nothing, and puts the question to that one. Predicting it was wrong
+in both directions, burying a route the mux already answered exactly and refusing a table
+`net/http` accepts. A `Route` under the webhook endpoint's own prefix (`/ingress/`) is refused at
+start, because such a route is more specific than the webhook pattern and would answer deliveries
+in the edge's place. No bare mux exists for a caller to serve by mistake, which is what an earlier
+`Mount(mux)` shape allowed with nothing in `go build`, `go vet` or `golangci-lint` to say so.
 
 **The body is captured once, under a cap** (`ingress.DefaultMaxBody`, 1 MiB), by an
 `http.MaxBytesReader` in front of everything that touches it, hashing included. Those exact bytes

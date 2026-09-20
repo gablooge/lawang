@@ -321,6 +321,11 @@ func NormalizePublicBaseURL(raw string) (string, error) {
 	// provider signed all carry "xn--caf-dma.example": the same 401 with nothing to see. The path
 	// prefix is refused outside ASCII a few lines below, for a related reason, and refusing both
 	// keeps one answer for one question.
+	//
+	// 0x80 is the definition of ASCII and not a boundary any test can pin: every byte of a
+	// non-ASCII character in valid UTF-8 starts a sequence with a lead byte of 0xC2 or more, so
+	// no input this function can be given tells 0x80 from 0xC0 or from 0xC2. Nothing here is
+	// weaker for it, and nobody should "tighten" it believing a test would notice.
 	for _, b := range []byte(u.Host) {
 		if b >= 0x80 {
 			return "", errors.New("the host must be written in ASCII, and an internationalized name in its punycode (xn--) form")

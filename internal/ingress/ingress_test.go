@@ -981,6 +981,14 @@ func TestPathTraversalNeverReachesTheHandler(t *testing.T) {
 func rawPOST(t *testing.T, addr, target, body string) answer {
 	t.Helper()
 
+	return raw(t, addr, http.MethodPost, target, body)
+}
+
+// raw is rawPOST for any method, which the redirect test needs because a routing table is not
+// always all POST and the mux's answer depends on the method.
+func raw(t *testing.T, addr, method, target, body string) answer {
+	t.Helper()
+
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -991,8 +999,8 @@ func rawPOST(t *testing.T, addr, target, body string) answer {
 	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatalf("SetDeadline: %v", err)
 	}
-	req := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-		target, len(body), body)
+	req := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		method, target, len(body), body)
 	if _, err := io.WriteString(conn, req); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -1158,9 +1166,11 @@ func TestAPathTheMuxWouldCleanIsRefusedAndNeverRedirected(t *testing.T) {
 // POST /ingress/{provider} does not end in a slash, but B07 and B08 add routes to this same
 // table, and an operator API mounted as a subtree would bring it back.
 //
-// So New registers the slash-less path itself, for every spelling of a pattern that can match a
-// path ending in a slash. All three spellings are here, and so is the case where the caller has
-// already registered that path, where New must not register a second one.
+// So New registers the slash-less path itself wherever the mux would otherwise redirect from it,
+// and it decides that by asking the mux and not by reading pattern strings. The tables below
+// include the shapes a string comparison got wrong: more than one route at one depth, where the
+// redirect never fires and a shadow route would bury a live route or conflict with it, and a last
+// segment written %2F, which net/http stores as the same segment as {$}.
 func TestNoRouteIsEverAnsweredWithARedirect(t *testing.T) {
 	t.Parallel()
 
@@ -1175,6 +1185,8 @@ func TestNoRouteIsEverAnsweredWithARedirect(t *testing.T) {
 		// want maps a request target to the status it must answer. No answer may ever carry a
 		// Location, whatever the status.
 		want map[string]int
+		// wantGET is the same for GET, for a table whose routes are not all POST.
+		wantGET map[string]int
 	}{
 		"a trailing slash": {
 			routes: []ingress.Route{{Method: http.MethodPost, Path: "/sub/", Handler: teapot}},
@@ -1253,6 +1265,76 @@ func TestNoRouteIsEverAnsweredWithARedirect(t *testing.T) {
 				"/a":     http.StatusNotFound,
 			},
 		},
+		// Two routes at one depth, the ordinary shape of a collection plus a subtree under it.
+		// The wildcard already answers /v1/tenants exactly, so the mux never redirects from it
+		// and there is nothing to take away. A route registered here anyway would be a literal,
+		// which beats the wildcard, and /v1/tenants would answer 404 instead of the caller's own
+		// handler: one path out of a family, with nothing logged.
+		"a wildcard at the same depth as a subtree": {
+			routes: []ingress.Route{
+				{Method: http.MethodPost, Path: "/v1/{resource}", Handler: teapot},
+				{Method: http.MethodPost, Path: "/v1/tenants/", Handler: ok},
+			},
+			want: map[string]int{
+				"/v1/tenants":   http.StatusTeapot,
+				"/v1/other":     http.StatusTeapot,
+				"/v1/tenants/":  http.StatusOK,
+				"/v1/tenants/x": http.StatusOK,
+			},
+		},
+		// Two wildcards at one depth. net/http registers both, and a route for the subtree's
+		// slash-less path would be GET /v1/{id}, which conflicts with GET /v1/{name} and would
+		// make New refuse a table net/http accepts, quoting a pattern the caller never wrote.
+		// The leaf answers /v1/a exactly, so again there is no redirect to take away.
+		"two wildcards at the same depth": {
+			routes: []ingress.Route{
+				{Method: http.MethodPost, Path: "/v1/{id}/", Handler: teapot},
+				{Method: http.MethodPost, Path: "/v1/{name}", Handler: ok},
+			},
+			want: map[string]int{
+				"/v1/a":  http.StatusOK,
+				"/v1/a/": http.StatusTeapot,
+			},
+		},
+		// The same two wildcards under different methods, where the redirect is real: nothing
+		// answers GET /v1/a, and GET /v1/a/ matches, so the mux would redirect. The route that
+		// stops it carries the method of the route that needs it, so it does not conflict with
+		// the caller's POST route and does not answer for POST.
+		"two wildcards at the same depth under different methods": {
+			routes: []ingress.Route{
+				{Method: http.MethodGet, Path: "/v1/{id}/", Handler: teapot},
+				{Method: http.MethodPost, Path: "/v1/{name}", Handler: ok},
+			},
+			want: map[string]int{
+				"/v1/a":  http.StatusOK,
+				"/v1/a/": http.StatusMethodNotAllowed,
+			},
+			wantGET: map[string]int{
+				"/v1/a":  http.StatusNotFound,
+				"/v1/a/": http.StatusTeapot,
+			},
+		},
+		// A last segment written %2F. net/http unescapes a literal segment when it parses a
+		// pattern, so this one is stored as the segment {$} is stored as, and the mux answers
+		// POST /a with 307 Location: /a/. The enumeration of "three spellings" this test used to
+		// assert said there was no path to redirect from here.
+		"a last segment that percent-decodes to a slash": {
+			routes: []ingress.Route{{Method: http.MethodPost, Path: "/a/%2F", Handler: teapot}},
+			want: map[string]int{
+				"/a":  http.StatusNotFound,
+				"/a/": http.StatusTeapot,
+			},
+		},
+		// A subtree whose slash-less path carries a percent-escape. The mux matches on the
+		// escaped path and unescapes a segment at a time, so the question put to it has to be
+		// asked in the spelling the sender would use, not in the decoded one.
+		"a subtree whose root carries a percent-escape": {
+			routes: []ingress.Route{{Method: http.MethodPost, Path: "/a%2Fb/", Handler: teapot}},
+			want: map[string]int{
+				"/a%2Fb":  http.StatusNotFound,
+				"/a%2Fb/": http.StatusTeapot,
+			},
+		},
 		// A rooted pattern has no slash-less path to redirect from: the mux cleans an empty path
 		// to "/" before it matches anything.
 		"a root subtree": {
@@ -1282,14 +1364,19 @@ func TestNoRouteIsEverAnsweredWithARedirect(t *testing.T) {
 			t.Cleanup(srv.Close)
 			addr := strings.TrimPrefix(srv.URL, "http://")
 
-			for target, want := range tc.want {
-				resp := rawPOST(t, addr, target, "")
-				if resp.status != want {
-					t.Errorf("POST %s: status = %d, want %d", target, resp.status, want)
-				}
-				if loc := resp.header.Get("Location"); loc != "" {
-					t.Errorf("POST %s: answered with a redirect to %q, which a provider would follow by "+
-						"re-POSTing to a path it did not sign", target, loc)
+			for method, want := range map[string]map[string]int{
+				http.MethodPost: tc.want,
+				http.MethodGet:  tc.wantGET,
+			} {
+				for target, status := range want {
+					resp := raw(t, addr, method, target, "")
+					if resp.status != status {
+						t.Errorf("%s %s: status = %d, want %d", method, target, resp.status, status)
+					}
+					if loc := resp.header.Get("Location"); loc != "" {
+						t.Errorf("%s %s: answered with a redirect to %q, which a provider would follow by "+
+							"re-sending to a path it did not sign", method, target, loc)
+					}
 				}
 			}
 			// The edge's own route is unaffected by whatever else is on the table.
@@ -1316,6 +1403,13 @@ func TestARouteNewCannotServeIsRefusedAtStart(t *testing.T) {
 		"a lower case method": {Method: "get", Path: "/healthz", Handler: nothing},
 		// net/http.ServeMux panics on this one, and New turns the panic into an error.
 		"a pattern net/http refuses": {Path: "/healthz/{", Handler: nothing},
+		// A route under the webhook prefix. A literal is the one that gets through the duplicate
+		// check, and it is more specific than POST /ingress/{provider}, so it would answer every
+		// delivery for that provider in the edge's place. The others already leave the edge
+		// answering, and are refused with it because nothing legitimate lives under the prefix.
+		"a literal under the webhook endpoint": {Method: http.MethodPost, Path: "/ingress/fake", Handler: nothing},
+		"a subtree under the webhook endpoint": {Path: "/ingress/{rest...}", Handler: nothing},
+		"the webhook pattern itself":           {Method: http.MethodPost, Path: "/ingress/{provider}", Handler: nothing},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1356,14 +1450,23 @@ func TestARouteNewCannotServeIsRefusedAtStart(t *testing.T) {
 		t.Fatalf("the refusal does not name the pattern: %v", err)
 	}
 
-	// A route that would take the webhook endpoint over is refused for the same reason, and the
-	// edge is the one that keeps it.
+	// A table net/http accepts but that cannot be served without a redirect: nothing answers
+	// POST /v1/tenants, /v1/tenants/ matches for every method, and the route that would stop the
+	// redirect conflicts with the caller's GET route. The refusal has to say that the pattern in
+	// net/http's message is this package's and not the caller's, because the caller never wrote
+	// it and would otherwise go looking for it.
 	_, err = ingress.New(reg, &testHub{}, ingress.Options{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Routes: []ingress.Route{{Method: http.MethodPost, Path: "/ingress/{provider}", Handler: nothing}},
+		Routes: []ingress.Route{
+			{Path: "/v1/tenants/", Handler: nothing},
+			{Method: http.MethodGet, Path: "/v1/{name}", Handler: nothing},
+		},
 	})
 	if err == nil {
-		t.Fatal("New let a caller take over the webhook route")
+		t.Fatal("New accepted a table it cannot serve without a redirect")
+	}
+	if !strings.Contains(err.Error(), "redirect") || !strings.Contains(err.Error(), `"/v1/tenants"`) {
+		t.Fatalf("the refusal does not say which route is this package's own: %v", err)
 	}
 }
 

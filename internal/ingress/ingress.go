@@ -59,6 +59,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"path"
 	"slices"
 	"strconv"
@@ -80,6 +81,12 @@ const (
 
 // pathValue is the wildcard name inside routePath.
 const pathValue = "provider"
+
+// edgePrefix is the path prefix the webhook route owns: every path the edge answers begins with
+// it. It is derived from routePath rather than written down a second time, so the two cannot
+// drift apart. Route.check refuses a caller's route under it, because such a route is more
+// specific than routePath and would answer deliveries in the edge's place.
+var edgePrefix = routePath[:strings.LastIndex(routePath, "/")+1]
 
 // notFoundBody is the only thing this package says to a request it refuses before the hub: an
 // unknown provider, a registered provider that is not a webhook source, a path the mux would have
@@ -203,7 +210,9 @@ type Route struct {
 	Method string
 	// Path is the pattern's path and must start with a slash: "/healthz", "/v1/tenants/{id}",
 	// or "/v1/" for a subtree. A host is not part of it, because everything here is served on
-	// whatever host reaches the listener.
+	// whatever host reaches the listener. A path under the webhook endpoint's own prefix
+	// ("/ingress/") is refused, whatever it is spelled as: such a route is more specific than
+	// the webhook pattern, so it would answer deliveries in the edge's place.
 	Path string
 	// Handler answers the route. It is served behind the path guard, like the edge itself.
 	Handler http.Handler
@@ -217,8 +226,9 @@ func (r Route) pattern() string {
 	return r.Method + " " + r.Path
 }
 
-// check refuses a route New could not register, or could register into something that can never
-// match. The messages never quote anything a sender wrote: a Route is this program's own wiring.
+// check refuses a route New could not register, one it could register into something that can
+// never match, and one that would answer in the edge's place. The messages never quote anything a
+// sender wrote: a Route is this program's own wiring.
 func (r Route) check() error {
 	if r.Handler == nil {
 		return errors.New("the handler is nil")
@@ -228,6 +238,14 @@ func (r Route) check() error {
 	}
 	if strings.ContainsAny(r.Path, " \t") {
 		return errors.New("the path must not contain a space")
+	}
+	// A literal under the webhook prefix is more specific than routePath, so net/http.ServeMux
+	// would hand it every delivery for that provider and the edge would never see one. The
+	// duplicate-pattern check in newMux catches routePath spelled exactly and nothing else, so
+	// POST /ingress/fake used to be accepted and to answer in the edge's place. Nothing
+	// legitimate lives under this prefix, so refusing the whole of it costs a caller nothing.
+	if strings.HasPrefix(r.Path, edgePrefix) {
+		return fmt.Errorf("the path is under %s, which is the webhook endpoint this package serves itself (%s)", edgePrefix, routePath)
 	}
 	for i := 0; i < len(r.Method); i++ {
 		if r.Method[i] < 'A' || r.Method[i] > 'Z' {
@@ -346,7 +364,16 @@ func New(reg *provider.Registry, hub Hub, opts Options) (http.Handler, error) {
 }
 
 // newMux builds the routing table: the webhook route, the caller's routes, and one route per
-// subtree pattern that exists only to take the trailing-slash redirect away from the mux.
+// path the mux would have answered with a trailing-slash redirect, which exists only to take that
+// redirect away from it.
+//
+// Whether the mux redirects is a property of the whole routing table and not of any one pattern,
+// so it is not predicted here: the table is built first, and then the mux itself is asked (see
+// redirects). An earlier shape compared path strings, and it was wrong in both directions. It
+// buried a caller's route, because POST /v1/{resource} already answers /v1/tenants exactly and
+// the redirect it added a route for was never going to fire, so its 404 shadowed the wildcard for
+// that one path. And it refused a table net/http accepts, because GET /v1/{id}/ plus
+// GET /v1/{name} made it register GET /v1/{id}, which conflicts with a pattern the caller wrote.
 //
 // It never panics. net/http.ServeMux panics on a pattern it cannot parse and on one that
 // conflicts with another, and a constructor that took the process down at start for a wiring
@@ -361,7 +388,11 @@ func newMux(h *edge, routes []Route) (_ *http.ServeMux, err error) {
 	all = append(all, Route{Method: routeMethod, Path: routePath, Handler: http.HandlerFunc(h.serveHTTP)})
 	all = append(all, routes...)
 
-	registered := make(map[string]bool, 2*len(all))
+	// This changes no answer, only the message. net/http.ServeMux panics on the second
+	// registration of a pattern and the recover below turns that into an error naming the same
+	// pattern, so no input can tell this branch from its absence; it is here because "two routes
+	// for X" is what the caller needs to read, and deleting it would cost that and nothing else.
+	registered := make(map[string]bool, len(all))
 	for _, rt := range all {
 		if registered[rt.pattern()] {
 			return nil, fmt.Errorf("ingress: two routes for %q", rt.pattern())
@@ -370,76 +401,112 @@ func newMux(h *edge, routes []Route) (_ *http.ServeMux, err error) {
 	}
 
 	mux := http.NewServeMux()
+	// probe carries the same patterns as mux, and a handler that does nothing. Asking a routing
+	// table what it would answer means serving a request into it, and serving one into mux would
+	// run a caller's handler or the edge for a request nobody made. The two are registered
+	// together, shadow routes included, so they route identically for as long as probe lives,
+	// which is until this function returns.
+	probe := http.NewServeMux()
+	nothing := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	// guarding names the route this package is adding on its own account while it is being
+	// added, so that a conflict with a caller's route is reported as what it is rather than as
+	// net/http's message about a pattern the caller never wrote.
+	guarding := ""
 	defer func() {
 		if r := recover(); r != nil {
 			// The text is net/http's and quotes the pattern, which is this program's own wiring
 			// and never anything a sender wrote.
+			if guarding != "" {
+				err = fmt.Errorf("ingress: %q is needed so net/http.ServeMux cannot answer that path "+
+					"with a redirect, and net/http.ServeMux refused it: %v", guarding, r)
+				return
+			}
 			err = fmt.Errorf("ingress: net/http.ServeMux refused a route: %v", r)
 		}
 	}()
 	for _, rt := range all {
 		mux.Handle(rt.pattern(), rt.Handler)
+		probe.Handle(rt.pattern(), nothing)
 	}
 	for _, rt := range all {
-		root, ok := subtreeRoot(rt.Path)
-		if !ok || coveredBy(all, rt.Method, root) {
+		root, ok := redirectRoot(rt.Path)
+		if !ok || !redirects(probe, rt.Method, root) {
 			continue
 		}
-		shadow := Route{Method: rt.Method, Path: root}.pattern()
-		if registered[shadow] {
-			continue
-		}
-		registered[shadow] = true
-		mux.Handle(shadow, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		guarding = Route{Method: rt.Method, Path: root}.pattern()
+		mux.Handle(guarding, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			respond(w, http.StatusNotFound, notFoundBody)
 		}))
+		// probe learns it too, so a second route with the same root sees an exact match here and
+		// asks for no route of its own. That is the whole of the deduplication.
+		probe.Handle(guarding, nothing)
+		guarding = ""
 	}
 	return mux, nil
 }
 
-// subtreeRoot returns the path from which net/http.ServeMux would answer a 307 redirect to a
-// pattern whose path is p, and whether there is one.
+// redirectRoot returns the only path from which net/http.ServeMux could answer a 307 redirect to
+// a pattern whose path is p, and whether there is one.
 //
 // The redirect (matchOrRedirect, net/http/server.go:2731 in Go 1.26.7) fires for a path that does
-// not end in a slash when the same path plus a slash is an exact match for some pattern. Only the
-// last segment of a pattern can match the empty segment that a trailing slash leaves, and only in
-// three spellings: a trailing slash, which net/http reads as an anonymous {...}; an explicit
-// {name...}; and {$}. A literal or a {name} segment never matches it, which is why
-// POST /ingress/{provider} has no root here and /ingress answers 404 rather than a redirect. All
-// three were checked over a real socket, and so were the two that do not redirect.
+// not end in a slash when the same path plus a slash is an exact match for some pattern. That
+// path plus a slash has one segment more than the path, so the only candidate is p without its
+// last segment, whatever that segment is written as. How it is written does not matter here and
+// deliberately is not read: an earlier version enumerated the spellings that can match the empty
+// segment a trailing slash leaves (a trailing slash, {name...}, {$}) and missed a fourth, since
+// net/http stores a literal segment written %2F as the same segment as {$}, so POST /a answered
+// 307 to /a/ for a route the enumeration said had no root.
 //
-// The root of a pattern that is itself rooted ("/", "/{$}", "/{rest...}") is the empty path, and
-// there is no redirect from it: the mux cleans an empty path to "/" before it matches anything.
-func subtreeRoot(p string) (string, bool) {
-	var root string
-	switch {
-	case strings.HasSuffix(p, "/"):
-		root = p[:len(p)-1]
-	case strings.HasSuffix(p, "/{$}"):
-		root = strings.TrimSuffix(p, "/{$}")
-	case strings.HasSuffix(p, "...}"):
-		// LastIndex is -1 when those bytes are part of a literal segment ("/a...}") rather than
-		// of a wildcard, and 0 when the wildcard is the whole path ("/{rest...}"). Both mean
-		// there is no path to redirect from, which is what the empty root says below.
-		root = p[:max(strings.LastIndex(p, "/{"), 0)]
-	default:
+// Whether the redirect really fires is for redirects to answer, because that depends on every
+// other pattern in the table. A pattern with a single segment ("/healthz", "/", "/{$}",
+// "/{rest...}") has no candidate at all: the mux cleans an empty path to "/" before it matches
+// anything.
+func redirectRoot(p string) (string, bool) {
+	i := strings.LastIndex(p, "/")
+	if i <= 0 {
 		return "", false
 	}
-	if root == "" {
-		return "", false
-	}
-	return root, true
+	return p[:i], true
 }
 
-// coveredBy reports whether some route already answers path for method, which is what stops the
-// mux redirecting to a subtree in the first place. A route with no method covers every method.
-func coveredBy(routes []Route, method, path string) bool {
-	for _, rt := range routes {
-		if rt.Path == path && (rt.Method == "" || rt.Method == method) {
-			return true
-		}
+// redirects reports whether mux answers method and path with a redirect, by putting a request to
+// the mux rather than predicting the answer from the pattern strings. Every handler in the mux it
+// is given does nothing (see newMux), so asking cannot run a caller's handler, cannot reach the
+// edge, and cannot touch anything outside this call.
+func redirects(mux *http.ServeMux, method, path string) bool {
+	u := &url.URL{Path: path}
+	if decoded, err := url.PathUnescape(path); err == nil {
+		// The mux matches on EscapedPath, which returns RawPath only when RawPath is a valid
+		// encoding of Path, so a path carrying a percent-escape needs both fields set. When it
+		// cannot be decoded, Path alone is right: net/http's own pattern parser leaves an
+		// undecodable segment as it is written, and so does EscapedPath.
+		u.Path, u.RawPath = decoded, path
 	}
-	return false
+	var answered statusOnly
+	mux.ServeHTTP(&answered, &http.Request{Method: method, URL: u, Header: make(http.Header)})
+	return answered.code >= 300 && answered.code < 400
+}
+
+// statusOnly is the http.ResponseWriter a redirect probe answers into. It keeps the status and
+// throws the rest away, because nothing written to it is ever sent anywhere.
+type statusOnly struct {
+	head http.Header
+	code int
+}
+
+func (s *statusOnly) Header() http.Header {
+	if s.head == nil {
+		s.head = make(http.Header)
+	}
+	return s.head
+}
+
+func (s *statusOnly) Write(b []byte) (int, error) { return len(b), nil }
+
+func (s *statusOnly) WriteHeader(code int) {
+	if s.code == 0 {
+		s.code = code
+	}
 }
 
 // canonicalPathOnly answers 404 for a request whose path net/http.ServeMux would have cleaned,
