@@ -9,7 +9,7 @@ import (
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
 
-	"github.com/gablooge/sluiceway/migrations"
+	"github.com/gablooge/lawang/migrations"
 )
 
 // How a Migrate that finds the advisory lock taken waits for it: one attempt per second, 300
@@ -44,7 +44,7 @@ func (db *DB) provider(logger *slog.Logger) (*goose.Provider, func(), error) {
 // tables end up owned by the role that will use them.
 //
 // A session-level advisory lock serializes concurrent callers, so several replicas may run
-// "sluiceway migrate" at once. A caller that finds the lock taken asks again every second for up to
+// "lawang migrate" at once. A caller that finds the lock taken asks again every second for up to
 // five minutes. The goose default asks every five seconds, so the k-th of N replicas started
 // together slept about 5(k-1) seconds, usually for a lock that was released within milliseconds
 // because there was nothing left to apply. One second is the shortest period goose accepts.

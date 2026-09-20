@@ -13,10 +13,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/gablooge/sluiceway/internal/store"
-	"github.com/gablooge/sluiceway/internal/tenancy"
-	"github.com/gablooge/sluiceway/internal/testdb"
-	"github.com/gablooge/sluiceway/migrations"
+	"github.com/gablooge/lawang/internal/store"
+	"github.com/gablooge/lawang/internal/tenancy"
+	"github.com/gablooge/lawang/internal/testdb"
+	"github.com/gablooge/lawang/migrations"
 )
 
 const (
@@ -111,7 +111,7 @@ func TestMigrationsRunAndRerunAsTheNonSuperuserRole(t *testing.T) {
 			WHERE rolname = current_user`).Scan(&user, &super, &bypass); err != nil {
 			return err
 		}
-		if user != "sluiceway" || super || bypass {
+		if user != "lawang" || super || bypass {
 			t.Fatalf("connected as %q (super=%v bypassrls=%v), want the plain application role", user, super, bypass)
 		}
 		return nil
@@ -270,7 +270,7 @@ func TestTenantBindingDoesNotOutliveItsTransaction(t *testing.T) {
 	err := db.Tx(ctx, func(tx pgx.Tx) error {
 		// The setting now reads back as '', not NULL. No row may match that either.
 		var raw *string
-		if err := tx.QueryRow(ctx, "SELECT current_setting('sluiceway.tenant', true)").Scan(&raw); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT current_setting('lawang.tenant', true)").Scan(&raw); err != nil {
 			return err
 		}
 		if raw != nil && *raw != "" {
@@ -334,7 +334,7 @@ func TestHelperRolesAreEnteredExplicitlyAndLeftAtCommit(t *testing.T) {
 		}
 
 		err = db.Tx(ctx, func(tx pgx.Tx) error {
-			if got := currentUser(tx); got != "sluiceway" {
+			if got := currentUser(tx); got != "lawang" {
 				t.Errorf("after RoleTx(%s), same connection, current_user = %q", role, got)
 			}
 			// INHERIT FALSE: membership grants the right to SET ROLE, and nothing implicitly.
@@ -366,7 +366,7 @@ func TestHelperRolesAreEnteredExplicitlyAndLeftAtCommit(t *testing.T) {
 func TestEveryTransactionIsReadCommittedWhateverTheDefault(t *testing.T) {
 	for name, alter := range map[string]string{
 		"set on the database": "ALTER DATABASE %I SET default_transaction_isolation = %L",
-		"set on the role":     "ALTER ROLE sluiceway IN DATABASE %I SET default_transaction_isolation = %L",
+		"set on the role":     "ALTER ROLE lawang IN DATABASE %I SET default_transaction_isolation = %L",
 	} {
 		for _, level := range []string{"repeatable read", "serializable"} {
 			t.Run(name+", "+level, func(t *testing.T) {
@@ -451,7 +451,7 @@ func TestOpenRefusesABypassRLSRole(t *testing.T) {
 	testdb.Exec(t, tdb.AdminURL, "CREATE ROLE sneaky LOGIN BYPASSRLS PASSWORD 'sneaky'")
 	t.Cleanup(func() { testdb.Exec(t, tdb.AdminURL, "DROP ROLE sneaky") })
 
-	url := strings.Replace(tdb.URL, "sluiceway:sluiceway_test@", "sneaky:sneaky@", 1)
+	url := strings.Replace(tdb.URL, "lawang:lawang_test@", "sneaky:sneaky@", 1)
 	db, err := store.Open(testCtx(t), url)
 	if !errors.Is(err, store.ErrUnsafeRole) {
 		if db != nil {
@@ -475,13 +475,13 @@ func TestOpenRefusesADatabaseThatIsNotBootstrapped(t *testing.T) {
 	}
 }
 
-// A schema called "sluiceway" that someone else created is not the one the bootstrap makes. The
+// A schema called "lawang" that someone else created is not the one the bootstrap makes. The
 // script's CREATE SCHEMA IF NOT EXISTS used to accept it silently, Open passed, and the first sign
 // of trouble was Migrate failing with "no schema has been selected to create in".
 func TestASchemaOwnedByAnotherRoleIsRefused(t *testing.T) {
 	testdb.New(t) // the roles exist cluster-wide once any database is bootstrapped
 	raw := testdb.NewRaw(t)
-	testdb.Exec(t, raw.AdminURL, "CREATE SCHEMA sluiceway")
+	testdb.Exec(t, raw.AdminURL, "CREATE SCHEMA lawang")
 
 	db, err := store.Open(testCtx(t), raw.URL)
 	if db != nil {
@@ -500,7 +500,7 @@ func TestASchemaOwnedByAnotherRoleIsRefused(t *testing.T) {
 	}
 
 	// Handing the schema over is the way out, and then both are content.
-	testdb.Exec(t, raw.AdminURL, "ALTER SCHEMA sluiceway OWNER TO sluiceway")
+	testdb.Exec(t, raw.AdminURL, "ALTER SCHEMA lawang OWNER TO lawang")
 	testdb.Bootstrap(t, raw.AdminURL)
 	db, err = store.Open(testCtx(t), raw.URL)
 	if err != nil {
@@ -564,7 +564,7 @@ func TestTenantIDDomainRejectsMalformedIDs(t *testing.T) {
 	// thing that can refuse. The empty id is left out for the reason above.
 	for _, id := range bad[1:] {
 		err := db.Tx(ctx, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, "SELECT set_config('sluiceway.tenant', $1, true)", id); err != nil {
+			if _, err := tx.Exec(ctx, "SELECT set_config('lawang.tenant', $1, true)", id); err != nil {
 				return err
 			}
 			_, err := tx.Exec(ctx, "INSERT INTO tenants (id) VALUES ($1)", id)

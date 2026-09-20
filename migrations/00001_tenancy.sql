@@ -12,7 +12,7 @@ CREATE DOMAIN tenant_id AS text
 -- +goose StatementBegin
 CREATE FUNCTION current_tenant() RETURNS text
   LANGUAGE sql STABLE PARALLEL SAFE
-AS $$ SELECT NULLIF(current_setting('sluiceway.tenant', true), '') $$;
+AS $$ SELECT NULLIF(current_setting('lawang.tenant', true), '') $$;
 -- +goose StatementEnd
 
 CREATE TABLE tenants (
@@ -31,10 +31,10 @@ CREATE POLICY tenant_isolation ON tenants
   WITH CHECK (id = current_tenant());
 
 -- The helper roles can reach the schema, and nothing in it until a later migration grants it.
-GRANT USAGE ON SCHEMA sluiceway TO sluiceway_resolver, sluiceway_worker;
+GRANT USAGE ON SCHEMA lawang TO lawang_resolver, lawang_worker;
 
 -- +goose Down
-REVOKE USAGE ON SCHEMA sluiceway FROM sluiceway_resolver, sluiceway_worker;
+REVOKE USAGE ON SCHEMA lawang FROM lawang_resolver, lawang_worker;
 DROP TABLE tenants;
 DROP FUNCTION current_tenant();
 DROP DOMAIN tenant_id;

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gablooge/sluiceway/internal/outbox"
-	"github.com/gablooge/sluiceway/internal/tenancy"
+	"github.com/gablooge/lawang/internal/outbox"
+	"github.com/gablooge/lawang/internal/tenancy"
 )
 
 // TestStressOrderingUnderRandomLoad runs every writer of the outbox at once, on a few hot keys:
@@ -227,7 +227,7 @@ func TestStressOrderingUnderRandomLoad(t *testing.T) {
 	var unfinished, isDelivered int64
 	err := admin.QueryRow(e.ctx, `
 		SELECT count(*) FILTER (WHERE state <> 'delivered'), count(*) FILTER (WHERE state = 'delivered')
-		  FROM sluiceway.outbox`).Scan(&unfinished, &isDelivered)
+		  FROM lawang.outbox`).Scan(&unfinished, &isDelivered)
 	if err != nil {
 		t.Fatal(err)
 	}

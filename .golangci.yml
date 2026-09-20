@@ -33,4 +33,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/gablooge/sluiceway
+        - github.com/gablooge/lawang

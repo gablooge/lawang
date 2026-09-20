@@ -5,7 +5,7 @@ Status: accepted, 2026-09-19 (backlog item B03)
 ## Decision
 
 Migrations are plain SQL files in `migrations/`, embedded in the binary and applied by
-`sluiceway migrate` using [`goose`](https://github.com/pressly/goose) as a library. A session-level
+`lawang migrate` using [`goose`](https://github.com/pressly/goose) as a library. A session-level
 advisory lock serializes concurrent runs, so several replicas may migrate at once. A run that finds
 the lock taken asks again every second, for up to five minutes. The goose default is every five
 seconds, which made the k-th of N replicas started together wait about 5(k-1) seconds, usually for
@@ -20,14 +20,14 @@ Migrations run as the **non-superuser application role**, the same login `serve`
 else.
 
 What that role cannot do for itself is a separate, one-time **bootstrap script**
-(`migrations/bootstrap/roles.sql`, printed by `sluiceway migrate bootstrap`) that an administrator
+(`migrations/bootstrap/roles.sql`, printed by `lawang migrate bootstrap`) that an administrator
 applies once per database. It creates the three roles, grants the two helper roles `WITH INHERIT
-FALSE, SET TRUE`, and creates the `sluiceway` schema owned by the application role.
+FALSE, SET TRUE`, and creates the `lawang` schema owned by the application role.
 
 The administrator is a superuser, or a non-superuser role with `CREATEROLE` and `CREATE` on the
 database, which is all that most managed Postgres gives out. A `CREATEROLE` role holds the roles it
 creates `WITH ADMIN OPTION` only, and creating a schema for another role requires `SET` on it, so
-the script grants itself `SET` on `sluiceway` for that one step and gives it back. Creating the
+the script grants itself `SET` on `lawang` for that one step and gives it back. Creating the
 schema first and handing it over with `ALTER SCHEMA ... OWNER TO` needs the same `SET` (checked on
 Postgres 16 and 17), so there is no way around borrowing it. The script borrows only when the
 schema does not exist yet and the administrator lacks `SET`. Giving it back is not a plain
@@ -64,7 +64,7 @@ The preflight runs once per process. A grant changed by an administrator afterwa
 until the next start. That is accepted: it guards against misconfiguration, and an actor who can
 change memberships can already read the tables.
 
-Everything lives in the `sluiceway` schema, and every connection sets `search_path` to it
+Everything lives in the `lawang` schema, and every connection sets `search_path` to it
 explicitly. Postgres 16 is the minimum, for `GRANT ... WITH INHERIT FALSE`.
 
 ## Why
@@ -79,7 +79,7 @@ explicitly. Postgres 16 is the minimum, for `GRANT ... WITH INHERIT FALSE`.
 - The alternative, giving the application role `CREATEROLE` so migrations could create the helper
   roles, would hand a network-facing service the power to mint database roles.
 - The explicit `search_path`: the default `"$user", public` follows `SET ROLE`, so it would stop
-  resolving Sluiceway's tables the moment a transaction entered a helper role.
+  resolving Lawang's tables the moment a transaction entered a helper role.
 
 ## Cost
 

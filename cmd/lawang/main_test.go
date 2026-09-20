@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gablooge/sluiceway/internal/config"
+	"github.com/gablooge/lawang/internal/config"
 )
 
 func noEnv(string) string { return "" }
@@ -53,7 +53,7 @@ func TestRunNeverPrintsAnUnknownCommand(t *testing.T) {
 		if code := run(context.Background(), args, noEnv, &out, &errOut); code != 2 {
 			t.Errorf("exit = %d, want 2", code)
 		}
-		if !strings.HasPrefix(errOut.String(), "sluiceway: unknown command\n") || !strings.Contains(errOut.String(), "Usage:") {
+		if !strings.HasPrefix(errOut.String(), "lawang: unknown command\n") || !strings.Contains(errOut.String(), "Usage:") {
 			t.Errorf("stderr does not say the command is unknown and how to use the binary: %.60s", errOut.String())
 		}
 		if out.Len() != 0 {
@@ -76,9 +76,9 @@ func TestRunRefusesExtraArguments(t *testing.T) {
 	// with an ephemeral port and is stopped by the deadline, which shows up as exit 0.
 	getenv := func(k string) string {
 		switch k {
-		case "SLUICEWAY_ENV":
+		case "LAWANG_ENV":
 			return "development"
-		case "SLUICEWAY_LISTEN_ADDR":
+		case "LAWANG_LISTEN_ADDR":
 			return "127.0.0.1:0"
 		}
 		return ""
@@ -92,8 +92,8 @@ func TestRunRefusesExtraArguments(t *testing.T) {
 		{[]string{"serve", "--listen", ":9090"}, "serve takes no arguments"},
 		{[]string{"worker", extra}, "worker takes no arguments"},
 		// A command that grows a subcommand keeps its row and changes only what it says.
-		{[]string{"migrate", extra}, "usage: sluiceway migrate [bootstrap]"},
-		{[]string{"migrate", "bootstrap", extra}, "usage: sluiceway migrate [bootstrap]"},
+		{[]string{"migrate", extra}, "usage: lawang migrate [bootstrap]"},
+		{[]string{"migrate", "bootstrap", extra}, "usage: lawang migrate [bootstrap]"},
 		{[]string{"version", extra}, "version takes no arguments"},
 		{[]string{"help", extra}, "help takes no arguments"},
 		{[]string{"-h", extra}, "-h takes no arguments"},
@@ -157,7 +157,7 @@ func TestUsageDocumentsTheConfigurationAndTheExitCodes(t *testing.T) {
 	for _, envName := range []string{"", "development"} {
 		_, _ = config.Load(func(k string) string {
 			read[k] = true
-			if k == "SLUICEWAY_ENV" {
+			if k == "LAWANG_ENV" {
 				return envName
 			}
 			return ""
@@ -194,10 +194,10 @@ func TestUsageDocumentsTheConfigurationAndTheExitCodes(t *testing.T) {
 		}
 	}
 	// Still one screen, and still the commands first.
-	if !strings.HasPrefix(usage, "Usage: sluiceway <command>") {
+	if !strings.HasPrefix(usage, "Usage: lawang <command>") {
 		t.Errorf("the usage text does not start with the synopsis: %.40s", usage)
 	}
-	if strings.Contains(usage, "@") || strings.Contains(usage, "sluiceway:sluiceway") {
+	if strings.Contains(usage, "@") || strings.Contains(usage, "lawang:lawang") {
 		t.Error("the usage text prints a URL with credentials")
 	}
 }
@@ -229,11 +229,11 @@ func TestRunServeExitsZeroAfterACleanShutdown(t *testing.T) {
 	// and the cleanup cancels the role whatever happened.
 	getenv := func(k string) string {
 		switch k {
-		case "SLUICEWAY_ENV":
+		case "LAWANG_ENV":
 			return "development"
-		case "SLUICEWAY_LISTEN_ADDR":
+		case "LAWANG_LISTEN_ADDR":
 			return "127.0.0.1:0"
-		case "SLUICEWAY_LOG_FORMAT":
+		case "LAWANG_LOG_FORMAT":
 			return "json"
 		}
 		return ""
@@ -293,7 +293,7 @@ func TestRunServeExitsZeroAfterACleanShutdown(t *testing.T) {
 }
 
 func TestRunRefusesToStartWithoutConfiguration(t *testing.T) {
-	// An environment with no SLUICEWAY_ENV is production, and production has no database URL to
+	// An environment with no LAWANG_ENV is production, and production has no database URL to
 	// guess.
 	//
 	// The test has to fail, not hang, if the refusal ever regresses. A role that wrongly starts
@@ -302,7 +302,7 @@ func TestRunRefusesToStartWithoutConfiguration(t *testing.T) {
 	// short deadline: a serve that starts is stopped by it and exits 0, which the assertion below
 	// reports as the wrong exit code.
 	getenv := func(k string) string {
-		if k == "SLUICEWAY_LISTEN_ADDR" {
+		if k == "LAWANG_LISTEN_ADDR" {
 			return "127.0.0.1:0"
 		}
 		return ""
@@ -318,7 +318,7 @@ func TestRunRefusesToStartWithoutConfiguration(t *testing.T) {
 				t.Errorf("exit = %d, want 1", code)
 			}
 			if !strings.Contains(errOut.String(), "invalid configuration") ||
-				!strings.Contains(errOut.String(), "SLUICEWAY_DATABASE_URL") {
+				!strings.Contains(errOut.String(), "LAWANG_DATABASE_URL") {
 				t.Errorf("stderr is not a configuration refusal naming the missing variable: %s", errOut.String())
 			}
 			if ctx.Err() != nil {
@@ -334,9 +334,9 @@ func TestRunNeverPrintsAConfigurationValue(t *testing.T) {
 	const secret = "postgres://leakuser:hunter2@leakhost:5432/leakdb"
 	getenv := func(k string) string {
 		switch k {
-		case "SLUICEWAY_DATABASE_URL":
+		case "LAWANG_DATABASE_URL":
 			return "postgres://leakuser:hunter2%zz@leakhost:5432/leakdb"
-		case "SLUICEWAY_ENV", "SLUICEWAY_LISTEN_ADDR", "SLUICEWAY_LOG_LEVEL", "SLUICEWAY_LOG_FORMAT":
+		case "LAWANG_ENV", "LAWANG_LISTEN_ADDR", "LAWANG_LOG_LEVEL", "LAWANG_LOG_FORMAT":
 			return secret
 		}
 		return ""
@@ -374,16 +374,16 @@ func TestRunNeverPrintsTheListenAddress(t *testing.T) {
 		{"passwordless database URL", "postgres://leakuser@leakhost/leakdb", "invalid configuration", []string{"leakuser", "leakhost", "leakdb"}},
 		{"port out of range", "leakhost.invalid:99999", "invalid configuration", []string{"leakhost", "99999"}},
 		// Accepted by Load, refused by the listener.
-		{"host that does not resolve", "leakhost.invalid:8080", "SLUICEWAY_LISTEN_ADDR", []string{"leakhost"}},
-		{"address of no local interface", "192.0.2.77:8080", "SLUICEWAY_LISTEN_ADDR", []string{"192.0.2.77"}},
+		{"host that does not resolve", "leakhost.invalid:8080", "LAWANG_LISTEN_ADDR", []string{"leakhost"}},
+		{"address of no local interface", "192.0.2.77:8080", "LAWANG_LISTEN_ADDR", []string{"192.0.2.77"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			getenv := func(k string) string {
 				switch k {
-				case "SLUICEWAY_DATABASE_URL":
-					return "postgres://app@db:5432/sluiceway"
-				case "SLUICEWAY_LISTEN_ADDR":
+				case "LAWANG_DATABASE_URL":
+					return "postgres://app@db:5432/lawang"
+				case "LAWANG_LISTEN_ADDR":
 					return tc.addr
 				}
 				return ""
@@ -427,7 +427,7 @@ func TestServeSaysWhenTheAddressIsInUse(t *testing.T) {
 	if !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("serve on a taken port returned %v, want EADDRINUSE", err)
 	}
-	if !strings.Contains(err.Error(), "SLUICEWAY_LISTEN_ADDR") || !strings.Contains(err.Error(), "in use") {
+	if !strings.Contains(err.Error(), "LAWANG_LISTEN_ADDR") || !strings.Contains(err.Error(), "in use") {
 		t.Errorf("error does not name the variable and the cause: %v", err)
 	}
 	if strings.Contains(err.Error(), port) || strings.Contains(err.Error(), "127.0.0.1") {
@@ -469,7 +469,7 @@ func TestListenErrorKeepsOnlyTheClassification(t *testing.T) {
 				t.Fatalf("the input does not carry the marker, so the case proves nothing: %v", tc.err)
 			}
 			got := listenError(tc.ctx, tc.err).Error()
-			if !strings.Contains(got, "SLUICEWAY_LISTEN_ADDR") || !strings.Contains(got, tc.want) {
+			if !strings.Contains(got, "LAWANG_LISTEN_ADDR") || !strings.Contains(got, tc.want) {
 				t.Errorf("got %q, want it to name the variable and say %q", got, tc.want)
 			}
 			if strings.Contains(got, marker) {
@@ -481,7 +481,7 @@ func TestListenErrorKeepsOnlyTheClassification(t *testing.T) {
 
 func TestRunStubbedRolesExitNonZero(t *testing.T) {
 	dev := func(k string) string {
-		if k == "SLUICEWAY_ENV" {
+		if k == "LAWANG_ENV" {
 			return "development"
 		}
 		return ""
@@ -499,7 +499,7 @@ func TestMigrateBootstrapPrintsTheScriptWithoutConfiguration(t *testing.T) {
 	if code := run(context.Background(), []string{"migrate", "bootstrap"}, noEnv, &out, &errOut); code != 0 {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	for _, want := range []string{"CREATE ROLE sluiceway ", "NOBYPASSRLS", "WITH INHERIT FALSE", "CREATE SCHEMA sluiceway AUTHORIZATION sluiceway"} {
+	for _, want := range []string{"CREATE ROLE lawang ", "NOBYPASSRLS", "WITH INHERIT FALSE", "CREATE SCHEMA lawang AUTHORIZATION lawang"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("bootstrap script does not contain %q", want)
 		}

@@ -5,7 +5,10 @@ Dates are deliberately absent, because a design document that carries dates star
 they slip. The design itself is in [architecture.md](architecture.md). The dated, item-by-item
 working plan is kept apart in [backlog.md](backlog.md), where slipping is cheap.
 
-The repository stays private until **M6**, so the first thing anyone sees is something that runs.
+The repository was private until 2026-09-20, on the reasoning that the first thing anyone sees
+should be something that runs. It is public earlier than that, from the record format onward,
+because the work itself is worth reading before it is worth running. The README says plainly what
+runs today, so nobody is misled.
 
 ---
 
@@ -17,7 +20,7 @@ Sizes are relative effort: **S** is a few days, **M** about a week, **L** more t
 
 The skeleton everything else hangs on.
 
-- `cmd/sluiceway` with the `serve`, `worker`, `migrate` and `version` subcommands
+- `cmd/lawang` with the `serve`, `worker`, `migrate` and `version` subcommands
 - environment config with fail-closed defaults (production unless development is explicit)
 - `internal/ids`: ULIDs and the three blake3 key recipes, with golden test vectors
 - Postgres via pgx, goose migrations embedded in the binary, the three roles
@@ -54,7 +57,7 @@ webhook for an unknown workspace is parked, never routed.
 
 - the `Vault` interface; `local` (AES-GCM, key from the environment, refuses to store plaintext);
   `nango` (self-hosted, HTTP only); `azureapp` (client credentials for Microsoft Graph)
-- `sluiceway connect <provider>`, reading secrets from the environment, never from arguments
+- `lawang connect <provider>`, reading secrets from the environment, never from arguments
 - `/v1` operator API: providers, the connection lifecycle, capabilities, health
 
 **Done when:** a connection can be created, completed and deleted through `/v1`; deleting it
@@ -109,7 +112,8 @@ locally with nothing but Docker installed.
 - setup guides per provider
 - a container image published to GHCR, a tagged release, a changelog
 - `CONTRIBUTING.md` and a provider-authoring guide
-- the repository flips to public
+- the community files a public repository needs: a code of conduct, issue and pull request
+  templates, and real first issues (the repository itself went public on 2026-09-20)
 
 **Done when:** someone who has never seen the project can follow the quickstart to a record at the
 stub sink.

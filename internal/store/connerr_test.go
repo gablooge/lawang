@@ -82,7 +82,7 @@ func TestConnErrorKeepsOnlyTheClassification(t *testing.T) {
 				t.Fatalf("the input does not carry the marker, so the case proves nothing: %v", tc.err)
 			}
 			got := connError(tc.ctx, tc.err).Error()
-			if !strings.HasPrefix(got, "SLUICEWAY_DATABASE_URL: ") || !strings.Contains(got, tc.want) {
+			if !strings.HasPrefix(got, "LAWANG_DATABASE_URL: ") || !strings.Contains(got, tc.want) {
 				t.Errorf("got %q, want it to name the variable and say %q", got, tc.want)
 			}
 			if strings.Contains(got, marker) {
@@ -146,14 +146,14 @@ func TestScrubReplacesOnlyWhatCarriesTheConnectionTarget(t *testing.T) {
 		"lookup": &net.DNSError{Err: "no such host", Name: marker, IsNotFound: true},
 	} {
 		got := scrub(ctx, err)
-		if got == nil || strings.Contains(got.Error(), marker) || !strings.HasPrefix(got.Error(), "SLUICEWAY_DATABASE_URL: ") {
+		if got == nil || strings.Contains(got.Error(), marker) || !strings.HasPrefix(got.Error(), "LAWANG_DATABASE_URL: ") {
 			t.Errorf("%s: scrub returned %v, want a classified error without %q", name, got, marker)
 		}
 	}
 }
 
 func TestPoolConfigSetsAConnectTimeout(t *testing.T) {
-	cfg, err := poolConfig("postgres://app@db.example:5432/sluiceway")
+	cfg, err := poolConfig("postgres://app@db.example:5432/lawang")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestPoolConfigSetsAConnectTimeout(t *testing.T) {
 		t.Errorf("search_path = %q, want %q", got, Schema)
 	}
 
-	cfg, err = poolConfig("postgres://app@db.example:5432/sluiceway?connect_timeout=3")
+	cfg, err = poolConfig("postgres://app@db.example:5432/lawang?connect_timeout=3")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestPoolConfigSetsAConnectTimeout(t *testing.T) {
 	// Deliberate: 0 is "wait forever" in libpq, and here it is the default. pgx parses it to the
 	// same zero as a missing parameter, and an unbounded start is what the default exists to
 	// prevent. If pgx ever starts telling the two apart, this row is where that gets noticed.
-	cfg, err = poolConfig("postgres://app@db.example:5432/sluiceway?connect_timeout=0")
+	cfg, err = poolConfig("postgres://app@db.example:5432/lawang?connect_timeout=0")
 	if err != nil {
 		t.Fatal(err)
 	}

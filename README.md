@@ -1,8 +1,11 @@
-# Sluiceway
+# Lawang
 
 **Permission-aware SaaS connectors for AI memory.**
 
-Sluiceway connects a workspace's SaaS tools (Slack, Microsoft Teams, Outlook, ClickUp, HubSpot),
+*Lawang* is Javanese for door or gate: the thing every change passes through, and where it is
+decided who may see it.
+
+Lawang connects a workspace's SaaS tools (Slack, Microsoft Teams, Outlook, ClickUp, HubSpot),
 receives their webhooks directly, and turns every change into a clean, permission-stamped record
 delivered exactly once to your memory, search, or RAG system.
 
@@ -16,13 +19,13 @@ delivered exactly once to your memory, search, or RAG system.
 
 ## Why another connector project
 
-Most connector tools move data. Sluiceway controls **what gets through and who may see it**, which
+Most connector tools move data. Lawang controls **what gets through and who may see it**, which
 is the part that matters once the data lands in something an AI agent reads.
 
 - **Permission-stamped at the source.** Every record carries a scope (the channel, list, mailbox or
   portal it came from) and that scope's members, taken from the provider's own sharing signals.
   Your retrieval layer enforces one rule: a person may see a record if they are a member of its
-  scope. Sluiceway never guesses reach from content.
+  scope. Lawang never guesses reach from content.
 - **Exactly once, end to end.** Each change gets one deterministic id. A provider re-sending a
   webhook, a worker crashing mid-delivery, and a backfill overlapping the live feed all resolve to
   the same id, so all three are no-ops downstream.
@@ -30,7 +33,7 @@ is the part that matters once the data lands in something an AI agent reads.
   reconciliation fills the gaps webhooks leave, because they always leave gaps: endpoints get
   disabled, subscriptions expire, and some providers never redeliver.
 - **Tenant isolation by construction.** Postgres row-level security on every table, fail closed.
-  An incoming webhook's tenant comes from a subscription row Sluiceway owns, never from the
+  An incoming webhook's tenant comes from a subscription row Lawang owns, never from the
   payload, and a delivery that more than one tenant could claim is refused rather than routed.
 - **No broker.** One Postgres, an outbox table, and a worker. The hand-off between accepting a
   webhook and delivering a record is a database row, so there is nothing else to run or lose.
@@ -69,9 +72,9 @@ getting lost.
 Adding a provider means adding one Go package that implements a small set of interfaces. See
 [docs/architecture.md](docs/architecture.md#extension-points).
 
-## What Sluiceway is not
+## What Lawang is not
 
-- **Not a general ETL tool.** For bulk analytics pipelines use something like Airbyte. Sluiceway is
+- **Not a general ETL tool.** For bulk analytics pipelines use something like Airbyte. Lawang is
   built for change-by-change ingestion where permissions travel with the data.
 - **Not an auth product.** It can use Nango for OAuth and token refresh rather than reinventing it.
 - **Not a vector database.** It delivers records to whatever you index them in.

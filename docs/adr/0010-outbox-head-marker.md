@@ -39,7 +39,7 @@ sink someone else runs, and a worker polls once a second from several goroutines
 unbounded work on a per-poll path.
 
 Measured on Postgres 17.11 with default settings, the real roles and migrations, as
-`sluiceway_worker`, 5,000,000 delivered rows present (heap 1.3 GB), 120 byte bodies, analyzed,
+`lawang_worker`, 5,000,000 delivered rows present (heap 1.3 GB), 120 byte bodies, analyzed,
 second of two runs, each rolled back. Time is execution time, buffers are shared pages hit or read.
 
 | Unfinished rows | Batch | Before | After |
@@ -255,7 +255,7 @@ on 5,100,000 rows. It is for tests.) One statement is one snapshot and every wri
 invariant intact when it commits, so a key it reports is broken and not merely being written.
 
 It runs bound to a tenant, as the application role. It cannot run across tenants as
-`sluiceway_worker`: that role reads neither `state` nor `ordering_key`, on purpose (it never learns
+`lawang_worker`: that role reads neither `state` nor `ordering_key`, on purpose (it never learns
 which entity a row belongs to), and both are needed. A sweep over all tenants therefore either
 calls it per tenant, or gets a role of its own with `SELECT (tenant_id, ordering_key, state,
 is_head)` and a select policy. That choice, the sweep and a metric are B25. This record only makes
@@ -266,8 +266,8 @@ The repair, for one key, as an administrator (or bound to the tenant as the appl
 ```sql
 BEGIN ISOLATION LEVEL READ COMMITTED; -- a plain BEGIN inherits the session default
 SELECT pg_advisory_xact_lock(hashtextextended('<tenant>' || chr(31) || '<ordering key>', 0));
-UPDATE sluiceway.outbox SET is_head = true
- WHERE id = (SELECT id FROM sluiceway.outbox
+UPDATE lawang.outbox SET is_head = true
+ WHERE id = (SELECT id FROM lawang.outbox
               WHERE tenant_id = '<tenant>' AND ordering_key = '<ordering key>'
                 AND state IN ('pending', 'prepared')
               ORDER BY seq LIMIT 1);

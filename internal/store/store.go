@@ -11,13 +11,13 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/gablooge/sluiceway/internal/tenancy"
+	"github.com/gablooge/lawang/internal/tenancy"
 )
 
-// Schema is where every Sluiceway object lives. It is set as the search path on every connection
+// Schema is where every Lawang object lives. It is set as the search path on every connection
 // explicitly, because the default "$user" entry follows SET ROLE and would stop resolving the
 // moment a transaction enters a helper role.
-const Schema = "sluiceway"
+const Schema = "lawang"
 
 // minServerVersion is Postgres 16, the first with GRANT ... WITH INHERIT FALSE.
 const minServerVersion = 160000
@@ -27,8 +27,8 @@ type Role string
 
 // The helper roles. Their policies arrive with the tables they act on.
 const (
-	RoleResolver Role = "sluiceway_resolver"
-	RoleWorker   Role = "sluiceway_worker"
+	RoleResolver Role = "lawang_resolver"
+	RoleWorker   Role = "lawang_worker"
 )
 
 // ErrUnsafeRole reports a database login under which row-level security would not apply, or whose
@@ -36,13 +36,13 @@ const (
 var ErrUnsafeRole = errors.New("store: unsafe database role")
 
 // ErrNotBootstrapped reports a database where the one-time bootstrap script has not been run.
-var ErrNotBootstrapped = errors.New(`store: database is not bootstrapped, run "sluiceway migrate bootstrap" and apply its output as an administrator`)
+var ErrNotBootstrapped = errors.New(`store: database is not bootstrapped, run "lawang migrate bootstrap" and apply its output as an administrator`)
 
 // ErrSchemaNotOwned reports a schema of the right name that the login role does not own, so it is
 // not the one the bootstrap script creates. It is a sentinel of its own because neither of the
 // others tells the operator the truth: tenant isolation is not at stake, and applying the
 // bootstrap script again does not change who owns a schema that already exists.
-var ErrSchemaNotOwned = errors.New(`store: schema "sluiceway" is not owned by the login role`)
+var ErrSchemaNotOwned = errors.New(`store: schema "lawang" is not owned by the login role`)
 
 // DB is the connection pool.
 type DB struct {
@@ -84,15 +84,15 @@ func Open(ctx context.Context, databaseURL string) (*DB, error) {
 	return db, nil
 }
 
-// poolConfig parses the URL and applies what every Sluiceway connection needs.
+// poolConfig parses the URL and applies what every Lawang connection needs.
 func poolConfig(databaseURL string) (*pgxpool.Config, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		// Deliberately not wrapped: pgx's parse error repeats the URL with only the password masked.
-		return nil, errors.New("SLUICEWAY_DATABASE_URL: not a valid Postgres connection URL")
+		return nil, errors.New("LAWANG_DATABASE_URL: not a valid Postgres connection URL")
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = Schema
-	cfg.ConnConfig.RuntimeParams["application_name"] = "sluiceway"
+	cfg.ConnConfig.RuntimeParams["application_name"] = "lawang"
 	// Zero is "not set" and also an explicit connect_timeout=0: see defaultConnectTimeout.
 	if cfg.ConnConfig.ConnectTimeout == 0 {
 		cfg.ConnConfig.ConnectTimeout = defaultConnectTimeout
@@ -250,7 +250,7 @@ func (db *DB) Tx(ctx context.Context, fn func(pgx.Tx) error) error {
 // The replacement looks at the error and not at where it came from, ON PURPOSE. An error that fn
 // returns is replaced too when it wraps a *net.OpError, a *net.DNSError or a *pgconn.ConnectError,
 // and then nothing fn wrapped around it survives: errors.Is(err, aSentinelOfTheCaller) is false
-// and the text points at SLUICEWAY_DATABASE_URL. It has to work on what fn returns, because a
+// and the text points at LAWANG_DATABASE_URL. It has to work on what fn returns, because a
 // statement that fn runs on a connection that has just died fails with exactly such an error, and
 // fn is the one that returns it. Telling that error from a network error of the caller's own would
 // mean trusting a side channel (is the connection marked closed?) on every failure path of pgx,
@@ -295,8 +295,8 @@ func (db *DB) TenantTx(ctx context.Context, id tenancy.ID, fn func(pgx.Tx) error
 //
 // THE TRANSACTION IS CROSS-TENANT FOR ITS WHOLE LIFE. Binding a tenant inside it does not narrow
 // it: Postgres ORs permissive policies together, so a policy of the helper role (for example
-// "TO sluiceway_worker USING (true)") keeps admitting every tenant's rows whatever
-// sluiceway.tenant says. A bind could only ever add rows, on tables where the role has no policy
+// "TO lawang_worker USING (true)") keeps admitting every tenant's rows whatever
+// lawang.tenant says. A bind could only ever add rows, on tables where the role has no policy
 // of its own. So fn does the role's cross-tenant step and nothing else (resolve an owner, claim a
 // row), returns what it learned, and the work for that tenant happens in a SECOND transaction
 // under TenantTx, as the application role.
@@ -314,9 +314,9 @@ func (db *DB) RoleTx(ctx context.Context, role Role, fn func(pgx.Tx) error) erro
 	var stmt string
 	switch role {
 	case RoleResolver:
-		stmt = "SET LOCAL ROLE sluiceway_resolver"
+		stmt = "SET LOCAL ROLE lawang_resolver"
 	case RoleWorker:
-		stmt = "SET LOCAL ROLE sluiceway_worker"
+		stmt = "SET LOCAL ROLE lawang_worker"
 	default:
 		return fmt.Errorf("store: unknown role %q", role)
 	}

@@ -1,4 +1,4 @@
-module github.com/gablooge/sluiceway
+module github.com/gablooge/lawang
 
 go 1.26.0
 

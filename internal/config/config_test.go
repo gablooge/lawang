@@ -16,7 +16,7 @@ func env(m map[string]string) func(string) string {
 
 func TestLoadUnsetEnvironmentIsProduction(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
-		"SLUICEWAY_DATABASE_URL": "postgres://app@db:5432/sluiceway",
+		"LAWANG_DATABASE_URL": "postgres://app@db:5432/lawang",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -34,15 +34,15 @@ func TestLoadUnsetEnvironmentIsProduction(t *testing.T) {
 
 func TestLoadProductionRequiresDatabaseURL(t *testing.T) {
 	for _, e := range []string{"", "production"} {
-		_, err := Load(env(map[string]string{"SLUICEWAY_ENV": e}))
-		if err == nil || !strings.Contains(err.Error(), "SLUICEWAY_DATABASE_URL") {
-			t.Errorf("SLUICEWAY_ENV=%q: err = %v, want a SLUICEWAY_DATABASE_URL error", e, err)
+		_, err := Load(env(map[string]string{"LAWANG_ENV": e}))
+		if err == nil || !strings.Contains(err.Error(), "LAWANG_DATABASE_URL") {
+			t.Errorf("LAWANG_ENV=%q: err = %v, want a LAWANG_DATABASE_URL error", e, err)
 		}
 	}
 }
 
 func TestLoadDevelopmentDefaults(t *testing.T) {
-	cfg, err := Load(env(map[string]string{"SLUICEWAY_ENV": "development"}))
+	cfg, err := Load(env(map[string]string{"LAWANG_ENV": "development"}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -60,11 +60,11 @@ func TestLoadDevelopmentDefaults(t *testing.T) {
 func TestLoadUnknownEnvironmentIsAnError(t *testing.T) {
 	// "dev" is the likely typo. It must not be read as development, and must not pass silently.
 	_, err := Load(env(map[string]string{
-		"SLUICEWAY_ENV":          "dev",
-		"SLUICEWAY_DATABASE_URL": "postgres://app@db:5432/sluiceway",
+		"LAWANG_ENV":          "dev",
+		"LAWANG_DATABASE_URL": "postgres://app@db:5432/lawang",
 	}))
-	if err == nil || !strings.Contains(err.Error(), "SLUICEWAY_ENV") {
-		t.Fatalf("err = %v, want a SLUICEWAY_ENV error", err)
+	if err == nil || !strings.Contains(err.Error(), "LAWANG_ENV") {
+		t.Fatalf("err = %v, want a LAWANG_ENV error", err)
 	}
 }
 
@@ -90,11 +90,11 @@ func TestLoadDatabaseURLErrorsNeverEchoTheValue(t *testing.T) {
 		"missing host": "postgres://leakuser:hunter2@/leakdb",
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := Load(env(map[string]string{"SLUICEWAY_DATABASE_URL": raw}))
+			_, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": raw}))
 			if err == nil {
 				t.Fatal("Load accepted a bad database URL")
 			}
-			if !strings.Contains(err.Error(), "SLUICEWAY_DATABASE_URL") {
+			if !strings.Contains(err.Error(), "LAWANG_DATABASE_URL") {
 				t.Errorf("error does not name the variable: %v", err)
 			}
 			assertNoSecret(t, "error", err.Error())
@@ -107,17 +107,17 @@ func TestLoadErrorsNeverEchoAnyValue(t *testing.T) {
 	// cannot know which, so no variable's error may repeat what it received.
 	const secret = "postgres://leakuser:hunter2@leakhost:5432/leakdb"
 	validated := []string{
-		"SLUICEWAY_ENV",
-		"SLUICEWAY_LISTEN_ADDR",
-		"SLUICEWAY_LOG_LEVEL",
-		"SLUICEWAY_LOG_FORMAT",
+		"LAWANG_ENV",
+		"LAWANG_LISTEN_ADDR",
+		"LAWANG_LOG_LEVEL",
+		"LAWANG_LOG_FORMAT",
 	}
 
 	for _, name := range validated {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(env(map[string]string{
-				"SLUICEWAY_DATABASE_URL": "postgres://app@db:5432/sluiceway",
-				name:                     secret,
+				"LAWANG_DATABASE_URL": "postgres://app@db:5432/lawang",
+				name:                  secret,
 			}))
 			if err == nil {
 				t.Fatalf("Load accepted a database URL as %s", name)
@@ -130,7 +130,7 @@ func TestLoadErrorsNeverEchoAnyValue(t *testing.T) {
 	}
 
 	t.Run("all at once", func(t *testing.T) {
-		all := map[string]string{"SLUICEWAY_DATABASE_URL": "mysql://leakuser:hunter2@leakhost:3306/leakdb"}
+		all := map[string]string{"LAWANG_DATABASE_URL": "mysql://leakuser:hunter2@leakhost:3306/leakdb"}
 		for _, name := range validated {
 			all[name] = secret
 		}
@@ -156,17 +156,17 @@ func TestLoadRefusesABadListenAddress(t *testing.T) {
 		":-1", ":+80", ": 80", ":80 ", ":0x50", ":8_0",
 	} {
 		_, err := Load(env(map[string]string{
-			"SLUICEWAY_DATABASE_URL": "postgres://app@db:5432/sluiceway",
-			"SLUICEWAY_LISTEN_ADDR":  addr,
+			"LAWANG_DATABASE_URL": "postgres://app@db:5432/lawang",
+			"LAWANG_LISTEN_ADDR":  addr,
 		}))
-		if err == nil || !strings.Contains(err.Error(), "SLUICEWAY_LISTEN_ADDR") {
-			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: err = %v, want a SLUICEWAY_LISTEN_ADDR error", addr, err)
+		if err == nil || !strings.Contains(err.Error(), "LAWANG_LISTEN_ADDR") {
+			t.Errorf("LAWANG_LISTEN_ADDR=%q: err = %v, want a LAWANG_LISTEN_ADDR error", addr, err)
 			continue
 		}
 		assertNoSecret(t, "error", err.Error())
 		// The port half is just as likely to be the pasted secret as the host half.
 		if _, port, ok := strings.Cut(addr, ":"); ok && len(port) > 1 && strings.Contains(err.Error(), port) {
-			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: error repeats the port %q: %v", addr, port, err)
+			t.Errorf("LAWANG_LISTEN_ADDR=%q: error repeats the port %q: %v", addr, port, err)
 		}
 	}
 }
@@ -178,22 +178,22 @@ func TestLoadAcceptsEveryOrdinaryListenAddress(t *testing.T) {
 		"127.0.0.1:9000", "[::]:8080",
 	} {
 		cfg, err := Load(env(map[string]string{
-			"SLUICEWAY_DATABASE_URL": "postgres://app@db:5432/sluiceway",
-			"SLUICEWAY_LISTEN_ADDR":  addr,
+			"LAWANG_DATABASE_URL": "postgres://app@db:5432/lawang",
+			"LAWANG_LISTEN_ADDR":  addr,
 		}))
 		if err != nil {
-			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: %v", addr, err)
+			t.Errorf("LAWANG_LISTEN_ADDR=%q: %v", addr, err)
 			continue
 		}
 		if cfg.ListenAddr != addr {
-			t.Errorf("SLUICEWAY_LISTEN_ADDR=%q: ListenAddr = %q", addr, cfg.ListenAddr)
+			t.Errorf("LAWANG_LISTEN_ADDR=%q: ListenAddr = %q", addr, cfg.ListenAddr)
 		}
 	}
 }
 
 func TestConfigNeverPrintsTheDatabaseURL(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
-		"SLUICEWAY_DATABASE_URL": "postgres://leakuser:hunter2@leakhost:5432/leakdb",
+		"LAWANG_DATABASE_URL": "postgres://leakuser:hunter2@leakhost:5432/leakdb",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -215,13 +215,13 @@ func TestConfigNeverPrintsTheDatabaseURL(t *testing.T) {
 
 func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
 	_, err := Load(env(map[string]string{
-		"SLUICEWAY_LOG_LEVEL":  "loud",
-		"SLUICEWAY_LOG_FORMAT": "xml",
+		"LAWANG_LOG_LEVEL":  "loud",
+		"LAWANG_LOG_FORMAT": "xml",
 	}))
 	if err == nil {
 		t.Fatal("Load accepted an invalid environment")
 	}
-	for _, want := range []string{"SLUICEWAY_DATABASE_URL", "SLUICEWAY_LOG_LEVEL", "SLUICEWAY_LOG_FORMAT"} {
+	for _, want := range []string{"LAWANG_DATABASE_URL", "LAWANG_LOG_LEVEL", "LAWANG_LOG_FORMAT"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s: %v", want, err)
 		}
@@ -230,10 +230,10 @@ func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
 
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
-		"SLUICEWAY_DATABASE_URL": "postgresql://app@db/sluiceway",
-		"SLUICEWAY_LISTEN_ADDR":  "127.0.0.1:9000",
-		"SLUICEWAY_LOG_LEVEL":    "debug",
-		"SLUICEWAY_LOG_FORMAT":   "TEXT",
+		"LAWANG_DATABASE_URL": "postgresql://app@db/lawang",
+		"LAWANG_LISTEN_ADDR":  "127.0.0.1:9000",
+		"LAWANG_LOG_LEVEL":    "debug",
+		"LAWANG_LOG_FORMAT":   "TEXT",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -262,8 +262,8 @@ func readBy(base map[string]string) map[string]bool {
 // validSamples are values Load accepts for the variables that are not enumerations. An enumerated
 // variable needs none: its states come from Variable.Values.
 var validSamples = map[string][]string{
-	"SLUICEWAY_DATABASE_URL": {"postgres://app@db/sluiceway", "postgresql://app@db:5432/sluiceway"},
-	"SLUICEWAY_LISTEN_ADDR":  {":9000", "127.0.0.1:9000"},
+	"LAWANG_DATABASE_URL": {"postgres://app@db/lawang", "postgresql://app@db:5432/lawang"},
+	"LAWANG_LISTEN_ADDR":  {":9000", "127.0.0.1:9000"},
 }
 
 // recordingBases is the full cross product of the states of every documented variable: unset,
@@ -284,11 +284,11 @@ func recordingBases(t *testing.T) []map[string]string {
 		// A state only drives the path it is named for if Load really takes it that way. A sample
 		// that has rotted into a refused value would silently leave the accepted path undriven.
 		for _, state := range accepted {
-			if _, err := Load(env(map[string]string{"SLUICEWAY_DATABASE_URL": "postgres://app@db/sluiceway", v.Name: state})); err != nil {
+			if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": "postgres://app@db/lawang", v.Name: state})); err != nil {
 				t.Fatalf("%s: Load refuses the state %q that stands for an accepted value: %v", v.Name, state, err)
 			}
 		}
-		if _, err := Load(env(map[string]string{"SLUICEWAY_DATABASE_URL": "postgres://app@db/sluiceway", v.Name: "x"})); err == nil {
+		if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": "postgres://app@db/lawang", v.Name: "x"})); err == nil {
 			t.Fatalf("%s: Load accepts \"x\", which stands for a refused value", v.Name)
 		}
 		states := append([]string{"", "x"}, accepted...)
@@ -358,30 +358,30 @@ func TestVariablesStateTheDefaultsLoadApplies(t *testing.T) {
 		doc[v.Name] = v.Default
 	}
 
-	prod, err := Load(env(map[string]string{"SLUICEWAY_DATABASE_URL": "postgres://app@db/sluiceway"}))
+	prod, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": "postgres://app@db/lawang"}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	dev, err := Load(env(map[string]string{"SLUICEWAY_ENV": "development"}))
+	dev, err := Load(env(map[string]string{"LAWANG_ENV": "development"}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 
-	if got := doc["SLUICEWAY_ENV"]; got != string(prod.Env) {
-		t.Errorf("SLUICEWAY_ENV: documented default %q, Load applies %q", got, prod.Env)
+	if got := doc["LAWANG_ENV"]; got != string(prod.Env) {
+		t.Errorf("LAWANG_ENV: documented default %q, Load applies %q", got, prod.Env)
 	}
-	if got := doc["SLUICEWAY_LISTEN_ADDR"]; got != prod.ListenAddr {
-		t.Errorf("SLUICEWAY_LISTEN_ADDR: documented default %q, Load applies %q", got, prod.ListenAddr)
+	if got := doc["LAWANG_LISTEN_ADDR"]; got != prod.ListenAddr {
+		t.Errorf("LAWANG_LISTEN_ADDR: documented default %q, Load applies %q", got, prod.ListenAddr)
 	}
-	if got, want := doc["SLUICEWAY_LOG_LEVEL"], strings.ToLower(prod.LogLevel.String()); got != want {
-		t.Errorf("SLUICEWAY_LOG_LEVEL: documented default %q, Load applies %q", got, want)
+	if got, want := doc["LAWANG_LOG_LEVEL"], strings.ToLower(prod.LogLevel.String()); got != want {
+		t.Errorf("LAWANG_LOG_LEVEL: documented default %q, Load applies %q", got, want)
 	}
 	wantFormat := prod.LogFormat + " in production, " + dev.LogFormat + " in development"
-	if got := doc["SLUICEWAY_LOG_FORMAT"]; got != wantFormat {
-		t.Errorf("SLUICEWAY_LOG_FORMAT: documented default %q, Load applies %q", got, wantFormat)
+	if got := doc["LAWANG_LOG_FORMAT"]; got != wantFormat {
+		t.Errorf("LAWANG_LOG_FORMAT: documented default %q, Load applies %q", got, wantFormat)
 	}
-	if got := doc["SLUICEWAY_DATABASE_URL"]; !strings.Contains(got, "required in production") {
-		t.Errorf("SLUICEWAY_DATABASE_URL: the documented default %q does not say production has none", got)
+	if got := doc["LAWANG_DATABASE_URL"]; !strings.Contains(got, "required in production") {
+		t.Errorf("LAWANG_DATABASE_URL: the documented default %q does not say production has none", got)
 	}
 
 	// The development fallback is a URL with a password in it. It is described, never printed.
@@ -395,8 +395,8 @@ func TestVariablesStateTheDefaultsLoadApplies(t *testing.T) {
 		t.Fatal("the development database URL has no password, so the check below proves nothing")
 	}
 	where := u.Host + ", database " + strings.TrimPrefix(u.Path, "/")
-	if got := doc["SLUICEWAY_DATABASE_URL"]; !strings.Contains(got, where) {
-		t.Errorf("SLUICEWAY_DATABASE_URL: the documented default %q does not say development connects to %q", got, where)
+	if got := doc["LAWANG_DATABASE_URL"]; !strings.Contains(got, where) {
+		t.Errorf("LAWANG_DATABASE_URL: the documented default %q does not say development connects to %q", got, where)
 	}
 	for _, v := range Variables() {
 		if strings.Contains(v.Doc+v.Default, dev.DatabaseURL) || strings.Contains(v.Doc+v.Default, "@") ||
@@ -413,7 +413,7 @@ func TestVariablesStateTheValuesLoadAccepts(t *testing.T) {
 	// refused. The last part is a sample: no test can try every string, so a value that Load
 	// accepts by some route other than the slice, and that nobody thought to list below, would
 	// still get through.
-	const dbURL = "postgres://app@db/sluiceway"
+	const dbURL = "postgres://app@db/lawang"
 	unlisted := []string{"x", "dev", "staging", "test", "prod", "trace", "fatal", "info+2", "logfmt", "console", "pretty"}
 
 	enumerated := make(map[string]bool)
@@ -423,12 +423,12 @@ func TestVariablesStateTheValuesLoadAccepts(t *testing.T) {
 		}
 		enumerated[v.Name] = true
 		for _, value := range v.Values {
-			if _, err := Load(env(map[string]string{"SLUICEWAY_DATABASE_URL": dbURL, v.Name: value})); err != nil {
+			if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": dbURL, v.Name: value})); err != nil {
 				t.Errorf("%s=%s is documented as accepted, but Load refuses it: %v", v.Name, value, err)
 			}
 		}
 		for _, value := range unlisted {
-			_, err := Load(env(map[string]string{"SLUICEWAY_DATABASE_URL": dbURL, v.Name: value}))
+			_, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": dbURL, v.Name: value}))
 			if err == nil {
 				t.Errorf("%s=%s is not documented, but Load accepts it", v.Name, value)
 				continue
@@ -438,7 +438,7 @@ func TestVariablesStateTheValuesLoadAccepts(t *testing.T) {
 			}
 		}
 	}
-	for _, name := range []string{"SLUICEWAY_ENV", "SLUICEWAY_LOG_LEVEL", "SLUICEWAY_LOG_FORMAT"} {
+	for _, name := range []string{"LAWANG_ENV", "LAWANG_LOG_LEVEL", "LAWANG_LOG_FORMAT"} {
 		if !enumerated[name] {
 			t.Errorf("%s is an enumeration in Load, but Variables does not list its values", name)
 		}
@@ -450,7 +450,7 @@ func TestVariablesStateTheValuesLoadAccepts(t *testing.T) {
 	original := values[0]
 	values[0] = "edited"
 	defer func() { values[0] = original }()
-	if _, err := Load(env(map[string]string{"SLUICEWAY_DATABASE_URL": dbURL, "SLUICEWAY_ENV": "edited"})); err == nil {
+	if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": dbURL, "LAWANG_ENV": "edited"})); err == nil {
 		t.Error("editing the result of Variables changed what Load accepts")
 	}
 }

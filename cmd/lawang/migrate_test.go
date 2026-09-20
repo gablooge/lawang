@@ -8,18 +8,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gablooge/sluiceway/internal/testdb"
+	"github.com/gablooge/lawang/internal/testdb"
 )
 
-// runMigrate runs "sluiceway migrate" the way main does, against databaseURL, with text logs so the
+// runMigrate runs "lawang migrate" the way main does, against databaseURL, with text logs so the
 // count can be read back. The deadline bounds a command that wrongly waits.
 func runMigrate(t *testing.T, databaseURL string) (code int, printed string) {
 	t.Helper()
 	getenv := func(k string) string {
 		switch k {
-		case "SLUICEWAY_DATABASE_URL":
+		case "LAWANG_DATABASE_URL":
 			return databaseURL
-		case "SLUICEWAY_LOG_FORMAT":
+		case "LAWANG_LOG_FORMAT":
 			return "text"
 		}
 		return ""
@@ -95,7 +95,7 @@ func TestMigrateNeverLogsAPartOfTheDatabaseURL(t *testing.T) {
 			if code != 1 {
 				t.Errorf("exit = %d, want 1", code)
 			}
-			if !strings.Contains(printed, "SLUICEWAY_DATABASE_URL") {
+			if !strings.Contains(printed, "LAWANG_DATABASE_URL") {
 				t.Errorf("the log does not name the variable: %s", printed)
 			}
 			for _, frag := range []string{"leakuser", "hunter2", "leakhost", "leakdb", target.Port()} {

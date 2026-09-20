@@ -1,4 +1,4 @@
-// Command sluiceway is the single Sluiceway binary. Its roles are subcommands.
+// Command lawang is the single Lawang binary. Its roles are subcommands.
 package main
 
 import (
@@ -12,13 +12,13 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/gablooge/sluiceway/internal/appversion"
-	"github.com/gablooge/sluiceway/internal/config"
-	"github.com/gablooge/sluiceway/internal/store"
-	"github.com/gablooge/sluiceway/migrations"
+	"github.com/gablooge/lawang/internal/appversion"
+	"github.com/gablooge/lawang/internal/config"
+	"github.com/gablooge/lawang/internal/store"
+	"github.com/gablooge/lawang/migrations"
 )
 
-const usageHead = `Usage: sluiceway <command>
+const usageHead = `Usage: lawang <command>
 
 Commands:
   serve     run the operator API and the webhook edge
@@ -28,7 +28,7 @@ Commands:
   version   print the version
   help      print this text (also -h and --help)
 
-Configuration comes from SLUICEWAY_* environment variables only.
+Configuration comes from LAWANG_* environment variables only.
 `
 
 const usageExitCodes = `
@@ -38,7 +38,7 @@ Exit codes:
   2   usage error: no command, an unknown command, or an argument the command does not take
 `
 
-// usage is what "sluiceway help" prints, so that an operator never has to read Go source to
+// usage is what "lawang help" prints, so that an operator never has to read Go source to
 // configure the service. The variables come from config.Variables, in the package that reads
 // them. What is held to Load there: the names (by recording what Load reads), the defaults (by
 // comparing them with what Load applies) and the values of the enumerated variables (Load
@@ -77,7 +77,7 @@ func refuseArguments(stderr io.Writer, args []string) bool {
 	if len(args) == 1 {
 		return false
 	}
-	fmt.Fprintf(stderr, "sluiceway: %s takes no arguments\n\n%s", args[0], usage) //nolint:gosec // G705: a terminal, not a browser
+	fmt.Fprintf(stderr, "lawang: %s takes no arguments\n\n%s", args[0], usage) //nolint:gosec // G705: a terminal, not a browser
 	return true
 }
 
@@ -115,7 +115,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	case "migrate":
 		if len(args) > 1 {
 			if args[1] != "bootstrap" || len(args) > 2 {
-				fmt.Fprintf(stderr, "sluiceway: usage: sluiceway migrate [bootstrap]\n")
+				fmt.Fprintf(stderr, "lawang: usage: lawang migrate [bootstrap]\n")
 				return 2
 			}
 			fmt.Fprint(stdout, migrations.Bootstrap)
@@ -134,7 +134,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	default:
 		// The word is not repeated: it is whatever was typed first, which can be a pasted database
 		// URL as easily as a typo, and stderr is the container log. The usage lists the real ones.
-		fmt.Fprintf(stderr, "sluiceway: unknown command\n\n%s", usage)
+		fmt.Fprintf(stderr, "lawang: unknown command\n\n%s", usage)
 		return 2
 	}
 	if refuseArguments(stderr, args) {
@@ -143,7 +143,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 
 	cfg, err := config.Load(getenv)
 	if err != nil {
-		fmt.Fprintf(stderr, "sluiceway: invalid configuration:\n%v\n", err)
+		fmt.Fprintf(stderr, "lawang: invalid configuration:\n%v\n", err)
 		return 1
 	}
 

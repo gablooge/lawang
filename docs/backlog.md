@@ -10,8 +10,8 @@ stays true.
 ## How to work this file
 
 Every item is also a GitHub issue with the same number: **B03 is
-[#3](https://github.com/gablooge/sluiceway/issues/3)**, B17 is #17, and so on. Each milestone is a
-[GitHub milestone](https://github.com/gablooge/sluiceway/milestones) carrying the target date from
+[#3](https://github.com/gablooge/lawang/issues/3)**, B17 is #17, and so on. Each milestone is a
+[GitHub milestone](https://github.com/gablooge/lawang/milestones) carrying the target date from
 the table below. GitHub holds the status (open, closed, comments); this file holds the order, the
 dates and the log.
 
@@ -58,7 +58,7 @@ project's whole claim.
 
 ## M0 · Foundations
 
-- [x] **B01 Skeleton, config, CI.** `cmd/sluiceway` with `serve`, `worker`, `migrate`, `version`
+- [x] **B01 Skeleton, config, CI.** `cmd/lawang` with `serve`, `worker`, `migrate`, `version`
   (stubs where the role does not exist yet); `internal/config` from the environment with
   fail-closed defaults; `Makefile` with `check`; `.golangci.yml`; GitHub Actions running vet, lint
   and `go test -race`.
@@ -130,7 +130,7 @@ project's whole claim.
   **Done when:** a test scans every table after a store and finds no token material; tampered
   ciphertext fails to decrypt; a missing key in production is a startup error.
 - [ ] **B14 Operator API and `connect`.** `/v1` providers, connection lifecycle, capabilities,
-  health; operator credential auth; `sluiceway connect <provider>` reading secrets from the
+  health; operator credential auth; `lawang connect <provider>` reading secrets from the
   environment only; the ClickUp registrar (update in place).
   **Done when:** a connection can be created, completed and deleted through `/v1`; deleting it
   calls the provider-side deregister (asserted against the fake server); re-registering does not
@@ -166,7 +166,7 @@ project's whole claim.
 
 - [ ] **B21 Reconcile framework and ClickUp.** Cursors, chunked passes that commit per chunk and
   pace between chunks, replay through the accept path as a trusted synthesized delivery,
-  `sluiceway reconcile <tenant> <provider>`.
+  `lawang reconcile <tenant> <provider>`.
   **Done when:** a test asserts no pause ever happens inside an open transaction; a gap left by a
   stopped webhook is filled and the overlap dedupes on record id.
 - [ ] **B22 Slack and HubSpot reconcilers.**
@@ -202,7 +202,7 @@ project's whole claim.
   **Done when:** the quickstart has been followed on a clean machine or container, start to finish.
 - [ ] **B29 Release. (needs you)** Release workflow, image on GHCR, changelog, tag `v0.1.0`, flip
   the repository to public.
-  **Done when:** `docker run ghcr.io/gablooge/sluiceway:v0.1.0 version` prints the tag.
+  **Done when:** `docker run ghcr.io/gablooge/lawang:v0.1.0 version` prints the tag.
 
 ---
 
@@ -234,5 +234,5 @@ One line per finished item: date, item, anything worth remembering.
 |---|---|---|
 | 2026-09-19 | B01 | Code written 2026-09-18, first CI run green on PR #30 the next day. The build-info package is `internal/appversion`, because revive rejects package names that shadow the standard library (`version`, `buildinfo`). |
 | 2026-09-18 | B02 | All 14 golden vectors cross-checked against the Python `blake3` package, so the recipes are reproducible outside Go. `RecordID` and `DeliveryID` return an error for an empty part or a part containing `0x1F`; architecture section 5 updated to say so. |
-| 2026-09-19 | B03 | Roles and schema come from a one-time admin bootstrap script (`sluiceway migrate bootstrap`); migrations run as the application role, and `store.Open` refuses a superuser or BYPASSRLS login everywhere. Postgres 16 is the minimum. Found on the way: a transaction-local setting reads back as `''` on a pooled connection, so policies go through `current_tenant()`. Mutation-checked: dropping FORCE RLS fails six tests. ADRs 1 and 2 written; sqlc itself arrives with B04. |
+| 2026-09-19 | B03 | Roles and schema come from a one-time admin bootstrap script (`lawang migrate bootstrap`); migrations run as the application role, and `store.Open` refuses a superuser or BYPASSRLS login everywhere. Postgres 16 is the minimum. Found on the way: a transaction-local setting reads back as `''` on a pooled connection, so policies go through `current_tenant()`. Mutation-checked: dropping FORCE RLS fails six tests. ADRs 1 and 2 written; sqlc itself arrives with B04. |
 | 2026-09-19 | B04 | Completes M0. A claim is a lease with a token, not a held lock. `delivery_id` is unique per tenant, not globally (design change, architecture section 5). The worker role sees only scheduling columns and can never read a payload. sqlc runs from its pinned Docker image (`make sqlc`, `make sqlc-check` in CI). Mutation-checked: the first version of the concurrent FIFO test missed a claim query with no head-of-key rule, so it was rewritten with adjacent versions and now catches it. Review round 1 (2026-09-19): `seq` is assigned at INSERT, not at COMMIT, so Accept and Replay now take a per-key `pg_advisory_xact_lock` before assigning one, and a replayed dead letter takes a fresh `seq` and goes to the BACK of its entity's queue (it could otherwise be leased alongside a newer version in flight). `prepared_at` lets a replay restore `prepared`. Round 2: the claim's snapshot-to-row-lock window is tested deterministically by pausing the claim in a test-only RESTRICTIVE select policy whose function waits on an advisory lock when it is shown a gate row, run under five planner settings. (The first attempt, a BEFORE UPDATE trigger, only paused under the default plan: do not use it.) The lock-before-INSERT order in `Accept` is pinned by stopping an INSERT after it has its `seq`. Round 3: the claim cost O(backlog) per poll (4.1 s at a million waiting rows), so the head of a key is now a stored marker, `is_head`, kept under the key's lock by every writer, the finishing transitions included, and guarded by a unique index and a CHECK ([ADR 10](adr/0010-outbox-head-marker.md)): 0.3 ms at the same size. Worth remembering: a condition that repeats what a CHECK already says (`state` next to `is_head`) made the planner read every waiting row at a batch of 100, so the claim has none, and a guard test bounds the claim's buffers and checks its plan. Also round 3: `Fail` and `MarkDead` take an `outbox.Cause` and no text (an HTTP client's error quotes the URL, API key included), `Claimed` is read-only, ordering keys are at most 512 bytes (`ErrBadOrderingKey`), a claim leases at most `MaxBatch` rows. After the review of the redesign: the head marker made the isolation level load-bearing (under a `default_transaction_isolation` of REPEATABLE READ a writer that waited for the key's lock decides on a snapshot from before the wait and strands a row, silently), so `store` begins every transaction READ COMMITTED by name. An ordering key with a NUL or invalid UTF-8 is `ErrBadOrderingKey` too, not the database's 22021. `Outbox.StrandedKeys` finds a key with work and no head, and ADR 10 has the repair; the sweep and the metric are B25. |

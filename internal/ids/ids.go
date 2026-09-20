@@ -1,4 +1,4 @@
-// Package ids mints every identifier Sluiceway uses. The hashed key recipes live here and nowhere
+// Package ids mints every identifier Lawang uses. The hashed key recipes live here and nowhere
 // else, so they cannot drift between the accept path, the worker and reconciliation.
 //
 // The recipes are a compatibility contract: changing one re-keys every record already delivered.

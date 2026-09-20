@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := check
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null)
-LDFLAGS := -s -w -X github.com/gablooge/sluiceway/internal/appversion.Version=$(VERSION)
+LDFLAGS := -s -w -X github.com/gablooge/lawang/internal/appversion.Version=$(VERSION)
 
 # sqlc runs from its pinned image, so nobody installs it and CI generates with the same version.
 SQLC := docker run --rm -v "$(CURDIR)":/src -w /src sqlc/sqlc:1.31.1
@@ -12,7 +12,7 @@ SQLC := docker run --rm -v "$(CURDIR)":/src -w /src sqlc/sqlc:1.31.1
 check: tidy sqlc-check vet lint test
 
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/sluiceway ./cmd/sluiceway
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/lawang ./cmd/lawang
 
 test:
 	go test -race -count=1 ./...

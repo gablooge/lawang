@@ -1,6 +1,10 @@
-# Sluiceway
+# Lawang
 
-Go service: permission-aware SaaS connectors for AI memory. Pre-alpha, private until v0.1.0.
+Go service: permission-aware SaaS connectors for AI memory. Pre-alpha, nothing released yet.
+
+**Treat everything in this repository as public**, because it is: every file, commit message,
+issue, comment and review can be read by anyone. Nothing personal to the maintainer belongs in it,
+and nothing that points at a machine of theirs.
 
 ## Where things are
 
@@ -8,7 +12,7 @@ Go service: permission-aware SaaS connectors for AI memory. Pre-alpha, private u
   change the document in the same branch and say why.
 - `docs/roadmap.md`: milestones M0 to M6 and what "done" means. Sequence only, no dates.
 - `docs/backlog.md`: the milestones cut into items B01 to B29, with dates. **This is the work queue.**
-- GitHub (`gablooge/sluiceway`): item BNN is issue #NN, and M0 to M6 are milestones with due dates.
+- GitHub (`gablooge/lawang`): item BNN is issue #NN, and M0 to M6 are milestones with due dates.
   Status lives there; order, dates and the log live in the backlog file.
 - `growth/`: the `bizdev` agent's working notes and drafts (landscape, positioning, launch
   drafts). Nothing in it is published by being committed. The maintainer reviews it before the
@@ -83,7 +87,7 @@ when their agent is done.
 ## Credentials for live verification
 
 The maintainer keeps real provider credentials **outside the repository**, in
-`~/.config/sluiceway/` (owner-only files, one per provider). They are for the live checks that the
+`~/.config/lawang/` (owner-only files, one per provider). They are for the live checks that the
 backlog marks "(needs you)", where one real event must reach the sink.
 
 | File | Variables (names only) | For |
@@ -93,15 +97,17 @@ backlog marks "(needs you)", where one real event must reach the sink.
 | `azure.env` | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | B13, B16, B17, B20 |
 | `hubspot.env` | `HUBSPOT_PRIVATE_APP_TOKEN`, `HUBSPOT_PORTAL_ID`, `HUBSPOT_WEBHOOK_MODE` | B18, B20 |
 | `cloudflare-tunnel.env` | `TUNNEL_TOKEN` | the webhook tunnel, below |
-| `cloudflare.env` | `CLOUDFLARE_TOKEN_SAMSULHADI` (Tunnel and DNS edit on one zone), `CLOUDFLARE_TOKEN` (read only) | changing the tunnel itself; agents do not need it |
+| `cloudflare.env` | a Cloudflare API token with Tunnel and DNS edit on one zone | changing the tunnel itself; agents do not need it |
 
-**The webhook tunnel.** Providers reach a developer machine through a Cloudflare Tunnel named
-`sluiceway-dev`, at `https://sluiceway-dev.samsulhadi.com`. It is up only while `cloudflared`
-runs, and it is started on demand, never as a service:
+**The webhook tunnel.** Providers reach a developer machine through a Cloudflare Tunnel, at
+`https://<your-tunnel-hostname>`. The real tunnel name and hostname are deliberately not written
+down in this repository, because publishing them invites traffic to a developer machine.
+They live in the maintainer's own notes, next to the credentials. The tunnel is up only while
+`cloudflared` runs, and it is started on demand, never as a service:
 
 ```sh
-docker run --rm --name sluiceway-tunnel \
-  --env-file ~/.config/sluiceway/cloudflare-tunnel.env \
+docker run --rm --name lawang-tunnel \
+  --env-file ~/.config/lawang/cloudflare-tunnel.env \
   cloudflare/cloudflared:2026.9.1 tunnel --no-autoupdate run
 ```
 
@@ -125,13 +131,13 @@ These tokens can read real mail and messages and can post as a real bot. The rul
 - **Never on a command line** (arguments are visible to every process on the machine). Load the
   file into the environment of the one process that needs it.
 - **Live tests are opt-in and never part of `make check` or CI.** They sit behind a build tag
-  (`live`) and an explicit variable, read the directory from `SLUICEWAY_CREDENTIALS_DIR` (default
-  `~/.config/sluiceway`), and **skip with a clear message** when a file or a variable is absent.
+  (`live`) and an explicit variable, read the directory from `LAWANG_CREDENTIALS_DIR` (default
+  `~/.config/lawang`), and **skip with a clear message** when a file or a variable is absent.
   CI has none of these secrets, and must stay that way.
 - **Read-only against the provider unless the backlog item says otherwise**, and then only in a
   place made for testing (a test channel, a test list, a test mailbox). Never post to, or read
   from, anything that belongs to real people. Register webhooks only with a name that says it is a
-  Sluiceway test, and deregister what you registered.
+  Lawang test, and deregister what you registered.
 - **Recorded payloads are scrubbed before they are committed**: tokens, signing secrets, email
   addresses, names, message text, and workspace, channel and user ids are replaced with obvious
   placeholders. The reviewer treats an unscrubbed payload as blocking.
@@ -158,7 +164,7 @@ mapping old commit hashes to new ones, because review replies cite hashes that n
   its value.
 - Fail closed: a missing tenant, secret, key or identity is a refusal, never a default.
 - A test double must reject whatever the real system rejects.
-- Integration tests use testcontainers Postgres and connect as the non-superuser `sluiceway`
+- Integration tests use testcontainers Postgres and connect as the non-superuser `lawang`
   role, not as the superuser.
 - **No tool attribution, anywhere.** No "Generated with Claude Code" line, and no other "generated
   with" or tool credit, in a pull request description, an issue, a comment, a review, a document
