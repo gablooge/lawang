@@ -69,12 +69,23 @@ import (
 	"github.com/gablooge/lawang/internal/provider"
 )
 
-// Pattern is the route this handler serves. The method is part of it, so anything but POST is the
-// mux's 405 and never reaches the handler.
-const Pattern = "POST /ingress/{provider}"
+// routePath is the path of the route the edge serves, and routeMethod is its method, so anything
+// but POST is the mux's 405 and never reaches the edge. Neither is exported, and neither is the
+// type that serves them: the only servable thing this package hands out is what New returns, and
+// that has the path guard in front of it (see New).
+const (
+	routeMethod = http.MethodPost
+	routePath   = "/ingress/{provider}"
+)
 
-// pathValue is the wildcard name inside Pattern.
+// pathValue is the wildcard name inside routePath.
 const pathValue = "provider"
+
+// notFoundBody is the only thing this package says to a request it refuses before the hub: an
+// unknown provider, a registered provider that is not a webhook source, a path the mux would have
+// redirected, and a route that exists only to stop a redirect all answer these same bytes. A
+// refusal that differed between them would tell a stranger which providers are registered.
+const notFoundBody = "no such provider\n"
 
 // DefaultMaxBody is the cap on a request body, and the reason a 500 MB POST costs this process a
 // megabyte and not half a gigabyte. Webhook bodies are small: a few kilobytes from Slack and
@@ -181,7 +192,52 @@ func (v Verdict) status() int {
 	}
 }
 
-// Options tunes a Handler. The zero Options is the documented default of every field.
+// Route is one more route for the server to answer next to the webhook endpoint: GET /healthz
+// now, the operator API when it lands. Routes are given to New rather than registered by the
+// caller on a mux of its own, because both of the redirects net/http.ServeMux answers have to be
+// stopped where the routing table is built, and New is where it is built (see New).
+type Route struct {
+	// Method is the one method the route answers, spelled as net/http spells it ("GET"). Empty
+	// means every method. Method matching is case sensitive, so a lower case spelling would
+	// register a route nothing can ever reach, and New refuses one.
+	Method string
+	// Path is the pattern's path and must start with a slash: "/healthz", "/v1/tenants/{id}",
+	// or "/v1/" for a subtree. A host is not part of it, because everything here is served on
+	// whatever host reaches the listener.
+	Path string
+	// Handler answers the route. It is served behind the path guard, like the edge itself.
+	Handler http.Handler
+}
+
+// pattern is the net/http.ServeMux pattern for this route.
+func (r Route) pattern() string {
+	if r.Method == "" {
+		return r.Path
+	}
+	return r.Method + " " + r.Path
+}
+
+// check refuses a route New could not register, or could register into something that can never
+// match. The messages never quote anything a sender wrote: a Route is this program's own wiring.
+func (r Route) check() error {
+	if r.Handler == nil {
+		return errors.New("the handler is nil")
+	}
+	if !strings.HasPrefix(r.Path, "/") {
+		return errors.New(`the path must start with a slash, and must not carry a host or a method (write Path: "/healthz", Method: "GET")`)
+	}
+	if strings.ContainsAny(r.Path, " \t") {
+		return errors.New("the path must not contain a space")
+	}
+	for i := 0; i < len(r.Method); i++ {
+		if r.Method[i] < 'A' || r.Method[i] > 'Z' {
+			return errors.New("the method must be an upper case method name such as GET, or empty for every method")
+		}
+	}
+	return nil
+}
+
+// Options tunes the edge. The zero Options is the documented default of every field.
 type Options struct {
 	// MaxBody is the cap on a request body in bytes, and 0 means DefaultMaxBody.
 	MaxBody int64
@@ -195,10 +251,14 @@ type Options struct {
 	// config.NormalizePublicBaseURL, the same function config.Load uses, and refuses what that
 	// refuses.
 	PublicBaseURL string
+	// Routes are the other routes the server answers. They are served behind the same path
+	// guard as the webhook endpoint, which is the reason they are given here: see New.
+	Routes []Route
 }
 
-// Handler serves Pattern.
-type Handler struct {
+// edge serves the webhook route. It is unexported, and so is its ServeHTTP, so that nothing
+// outside this package can put it on a mux of its own and lose the guard New puts in front of it.
+type edge struct {
 	reg           *provider.Registry
 	hub           Hub
 	maxBody       int64
@@ -207,9 +267,28 @@ type Handler struct {
 	publicBaseURL string
 }
 
-// New returns a Handler, or says what is missing. A nil registry or a nil hub is refused rather
-// than defaulted: an edge with no hub would answer a provider without storing anything.
-func New(reg *provider.Registry, hub Hub, opts Options) (*Handler, error) {
+// New returns the handler the server serves, or says what is missing. A nil registry or a nil hub
+// is refused rather than defaulted: an edge with no hub would answer a provider without storing
+// anything.
+//
+// # Why this returns the whole handler and not a route to mount
+//
+// net/http.ServeMux answers two kinds of redirect before any handler runs, and both of them turn a
+// delivery into a 401 that is indistinguishable from a forgery (see canonicalPathOnly for why).
+// Neither can be stopped by the caller remembering something:
+//
+//  1. It cleans the path and answers 307 with a Location. A guard in front of the mux stops that,
+//     because it depends only on the request.
+//  2. It answers 307 from /x to /x/ when /x/ is a registered pattern and /x is not. That one
+//     depends on the routing table rather than on the request, so nothing in front of the mux can
+//     see it coming. It is stopped where the table is built, by registering /x as well.
+//
+// So this package builds the mux, registers every route on it, and never hands the bare mux out.
+// An earlier shape returned the wrapped handler from a Mount(mux) method, and it had the failure
+// mode that a caller who wrote mux.Handle(pattern, h) themselves, or who dropped the return value,
+// got the unguarded mux and all three redirects back, with nothing in go build, go vet or
+// golangci-lint to say so. Other routes go in Options.Routes, so they are behind the guard too.
+func New(reg *provider.Registry, hub Hub, opts Options) (http.Handler, error) {
 	if reg == nil {
 		return nil, errors.New("ingress: a provider registry is required")
 	}
@@ -232,7 +311,7 @@ func New(reg *provider.Registry, hub Hub, opts Options) (*Handler, error) {
 		}
 		base = normalized
 	}
-	h := &Handler{
+	h := &edge{
 		reg:           reg,
 		hub:           hub,
 		maxBody:       opts.MaxBody,
@@ -259,18 +338,108 @@ func New(reg *provider.Registry, hub Hub, opts Options) (*Handler, error) {
 		// sign the URL. B07 does know, and issue #7 carries the ask to refuse there.
 		h.log.Warn("ingress: LAWANG_PUBLIC_BASE_URL is not set, so a provider whose signature covers the request URL (HubSpot v3) will answer 401 for every delivery")
 	}
-	return h, nil
+	mux, err := newMux(h, opts.Routes)
+	if err != nil {
+		return nil, err
+	}
+	return canonicalPathOnly(mux), nil
 }
 
-// Mount adds the route to mux, so the pattern is written in one place, and returns the handler
-// the server must serve. **The returned handler, not mux, is what belongs in http.Server.Handler**:
-// it is mux with the path guard of canonicalPathOnly in front of it, and without that guard the
-// mux redirects a non-canonical path instead of refusing it, which turns into a 401 that reads as
-// a forgery (see canonicalPathOnly). Routes added to mux afterwards are behind the guard too,
-// since what is wrapped is the mux itself.
-func (h *Handler) Mount(mux *http.ServeMux) http.Handler {
-	mux.Handle(Pattern, h)
-	return canonicalPathOnly(mux)
+// newMux builds the routing table: the webhook route, the caller's routes, and one route per
+// subtree pattern that exists only to take the trailing-slash redirect away from the mux.
+//
+// It never panics. net/http.ServeMux panics on a pattern it cannot parse and on one that
+// conflicts with another, and a constructor that took the process down at start for a wiring
+// mistake would be a worse answer than an error that describes it.
+func newMux(h *edge, routes []Route) (_ *http.ServeMux, err error) {
+	for i, rt := range routes {
+		if err := rt.check(); err != nil {
+			return nil, fmt.Errorf("ingress: Options.Routes[%d]: %w", i, err)
+		}
+	}
+	all := make([]Route, 0, len(routes)+1)
+	all = append(all, Route{Method: routeMethod, Path: routePath, Handler: http.HandlerFunc(h.serveHTTP)})
+	all = append(all, routes...)
+
+	registered := make(map[string]bool, 2*len(all))
+	for _, rt := range all {
+		if registered[rt.pattern()] {
+			return nil, fmt.Errorf("ingress: two routes for %q", rt.pattern())
+		}
+		registered[rt.pattern()] = true
+	}
+
+	mux := http.NewServeMux()
+	defer func() {
+		if r := recover(); r != nil {
+			// The text is net/http's and quotes the pattern, which is this program's own wiring
+			// and never anything a sender wrote.
+			err = fmt.Errorf("ingress: net/http.ServeMux refused a route: %v", r)
+		}
+	}()
+	for _, rt := range all {
+		mux.Handle(rt.pattern(), rt.Handler)
+	}
+	for _, rt := range all {
+		root, ok := subtreeRoot(rt.Path)
+		if !ok || coveredBy(all, rt.Method, root) {
+			continue
+		}
+		shadow := Route{Method: rt.Method, Path: root}.pattern()
+		if registered[shadow] {
+			continue
+		}
+		registered[shadow] = true
+		mux.Handle(shadow, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			respond(w, http.StatusNotFound, notFoundBody)
+		}))
+	}
+	return mux, nil
+}
+
+// subtreeRoot returns the path from which net/http.ServeMux would answer a 307 redirect to a
+// pattern whose path is p, and whether there is one.
+//
+// The redirect (matchOrRedirect, net/http/server.go:2731 in Go 1.26.7) fires for a path that does
+// not end in a slash when the same path plus a slash is an exact match for some pattern. Only the
+// last segment of a pattern can match the empty segment that a trailing slash leaves, and only in
+// three spellings: a trailing slash, which net/http reads as an anonymous {...}; an explicit
+// {name...}; and {$}. A literal or a {name} segment never matches it, which is why
+// POST /ingress/{provider} has no root here and /ingress answers 404 rather than a redirect. All
+// three were checked over a real socket, and so were the two that do not redirect.
+//
+// The root of a pattern that is itself rooted ("/", "/{$}", "/{rest...}") is the empty path, and
+// there is no redirect from it: the mux cleans an empty path to "/" before it matches anything.
+func subtreeRoot(p string) (string, bool) {
+	var root string
+	switch {
+	case strings.HasSuffix(p, "/"):
+		root = p[:len(p)-1]
+	case strings.HasSuffix(p, "/{$}"):
+		root = strings.TrimSuffix(p, "/{$}")
+	case strings.HasSuffix(p, "...}"):
+		// LastIndex is -1 when those bytes are part of a literal segment ("/a...}") rather than
+		// of a wildcard, and 0 when the wildcard is the whole path ("/{rest...}"). Both mean
+		// there is no path to redirect from, which is what the empty root says below.
+		root = p[:max(strings.LastIndex(p, "/{"), 0)]
+	default:
+		return "", false
+	}
+	if root == "" {
+		return "", false
+	}
+	return root, true
+}
+
+// coveredBy reports whether some route already answers path for method, which is what stops the
+// mux redirecting to a subtree in the first place. A route with no method covers every method.
+func coveredBy(routes []Route, method, path string) bool {
+	for _, rt := range routes {
+		if rt.Path == path && (rt.Method == "" || rt.Method == method) {
+			return true
+		}
+	}
+	return false
 }
 
 // canonicalPathOnly answers 404 for a request whose path net/http.ServeMux would have cleaned,
@@ -293,43 +462,62 @@ func (h *Handler) Mount(mux *http.ServeMux) http.Handler {
 // (CLAUDE.md), and this is the same rule for a deployment that has no tunnel in front of it.
 //
 // The guard cannot live in the handler: the mux redirects before dispatching, so the handler is
-// never called. It cannot live in the pattern either. In front of the mux is the only place it
-// works, which is why Mount returns a handler rather than leaving the caller to remember.
+// never called. In front of the mux is the only place it works, which is why New returns the
+// wrapped handler and never the mux.
+//
+// This is the cleaning redirect only. The mux's other redirect, from /x to a registered /x/,
+// depends on the routing table rather than on the request, so this guard cannot see it coming;
+// newMux takes that one away from the mux instead.
 func canonicalPathOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !canonicalPath(r.URL.Path) {
-			respond(w, http.StatusNotFound, "no such provider\n")
+		if !canonicalPath(r.URL.EscapedPath()) {
+			respond(w, http.StatusNotFound, notFoundBody)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// canonicalPath reports whether p is what net/http.ServeMux would route without cleaning it
-// first. It is path.Clean with a trailing slash put back, which is what net/http's own
-// (unexported) cleanPath does, so this refuses exactly the paths the mux would have redirected
-// and nothing else: a pattern that ends in a slash keeps working.
-func canonicalPath(p string) bool {
-	if p == "" || p[0] != '/' {
+// canonicalPath reports whether escaped is what net/http.ServeMux would route without cleaning it
+// first. It is net/http's own (unexported) cleanPath compared against its input: path.Clean with
+// a trailing slash put back, an empty path becoming "/" and a path with no leading slash getting
+// one.
+//
+// What it must be given is r.URL.EscapedPath(), which is the string findHandler cleans
+// (net/http/server.go:2662 and 2680 in Go 1.26.7), and never the decoded r.URL.Path. The two
+// differ, and reading the decoded one refuses requests the mux would have delivered:
+// /ingress/fake%2f%2fx decodes to /ingress/fake//x, which is not canonical, while the escaped
+// form is, and the mux routes it to the handler with no redirect at all. It costs nothing today,
+// because that request is a 404 from the registry either way, and it would cost a route the day
+// one has a wildcard segment that may carry an encoded slash.
+//
+// One request shape is refused that the mux would not have cleaned: a CONNECT, which findHandler
+// exempts from cleaning. This edge answers POST and nothing else, and a CONNECT is not something
+// a provider sends, so it is refused with everything else rather than exempted.
+func canonicalPath(escaped string) bool {
+	// Reachable over a real socket, both of them: an absolute-form request line with no path
+	// ("POST http://host HTTP/1.1") arrives with an empty path, and the asterisk form
+	// ("POST * HTTP/1.1") arrives with "*". Through the mux the first is a 307 to "/".
+	if escaped == "" || escaped[0] != '/' {
 		return false
 	}
-	clean := path.Clean(p)
-	if p[len(p)-1] == '/' && clean != "/" {
+	clean := path.Clean(escaped)
+	if escaped[len(escaped)-1] == '/' && clean != "/" {
 		clean += "/"
 	}
-	return clean == p
+	return clean == escaped
 }
 
-// ServeHTTP is the accept path. Its order is the security argument: the path segment is resolved
+// serveHTTP is the accept path. Its order is the security argument: the path segment is resolved
 // to a registered provider before a single byte of the body is read.
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *edge) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// r.PathValue gives the segment percent-decoded, so it can hold any byte at all: a NUL from
 	// %00, a newline, a slash from %2F, 500 bytes of anything. It is only ever used as a map key
 	// here, and never reaches a log, a response, an error or the outbox.
 	entry, ok := h.reg.Lookup(r.PathValue(pathValue))
 	if !ok {
 		// Nothing read, nothing stored, nothing said about what is registered.
-		respond(w, http.StatusNotFound, "no such provider\n")
+		respond(w, http.StatusNotFound, notFoundBody)
 		return
 	}
 	source, ok := entry.WebhookSource()
@@ -347,7 +535,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// registry's own constant, never the path segment.
 		h.log.Warn("ingress: a registered provider is not a webhook source, so its deliveries are dropped",
 			"provider", entry.Key())
-		respond(w, http.StatusNotFound, "no such provider\n")
+		respond(w, http.StatusNotFound, notFoundBody)
 		return
 	}
 
@@ -416,7 +604,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // signs the URL must refuse rather than verify against something invented (fail closed, see
 // provider.Request.URL). The edge still serves: every other scheme is unaffected, and a handshake
 // never needs it.
-func (h *Handler) publicURL(r *http.Request) string {
+func (h *edge) publicURL(r *http.Request) string {
 	if h.publicBaseURL == "" {
 		return ""
 	}
@@ -435,7 +623,7 @@ func (h *Handler) publicURL(r *http.Request) string {
 // is never accumulated: a 500 MB POST costs this process the cap plus one byte and the connection
 // is then closed. The reader is in front of everything that touches the body, hashing included
 // (ids.DeliveryID hashes whatever it is given).
-func (h *Handler) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+func (h *edge) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	// An honest Content-Length over the cap is refused without reading anything at all. A lying
 	// one is caught below, by the reader, which is the check that actually holds.
 	if r.ContentLength > h.maxBody {
@@ -470,7 +658,7 @@ func (h *Handler) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool
 // writeReply answers a handshake, and refuses a reply a provider should not be able to ask for.
 // A provider is this program's own code, so a refusal here is a bug to fix, which is why it is
 // logged at error and answered with a 500.
-func (h *Handler) writeReply(w http.ResponseWriter, key string, reply provider.Reply) {
+func (h *edge) writeReply(w http.ResponseWriter, key string, reply provider.Reply) {
 	status := reply.Status
 	if status == 0 {
 		status = http.StatusOK
@@ -571,5 +759,7 @@ func respond(w http.ResponseWriter, status int, msg string) {
 	_, _ = io.WriteString(w, msg) //nolint:gosec // G705: msg is one of this file's own constants
 }
 
-// compile-time check that the handler is one.
-var _ http.Handler = (*Handler)(nil)
+// compile-time check that the edge can be served, which is all newMux needs of it. It is
+// deliberately not an http.Handler: an exported ServeHTTP would let a caller put the edge on a
+// mux of its own and lose both of the guards New puts around it.
+var _ = http.HandlerFunc((*edge)(nil).serveHTTP)

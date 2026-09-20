@@ -97,7 +97,9 @@ func Variables() []Variable {
 			Name: "LAWANG_PUBLIC_BASE_URL",
 			Doc: "The absolute URL providers reach this deployment at, scheme and host and any " +
 				"path prefix a reverse proxy strips before forwarding (https://lawang.example.com). " +
-				"No query, no fragment, no credentials, no trailing slash. It is configuration and " +
+				"No query, no fragment, no credentials, no trailing slash. The host is named in " +
+				"ASCII, an internationalized name in its punycode (xn--) form, which is the " +
+				"spelling a provider's dashboard holds. It is configuration and " +
 				"never a header on purpose: a signature scheme that covers the request URL " +
 				"(HubSpot v3) is checked against this, and Host, X-Forwarded-Host and " +
 				"X-Forwarded-Proto are all chosen by whoever sent the request, so building the " +
@@ -298,8 +300,31 @@ func NormalizePublicBaseURL(raw string) (string, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", errors.New("scheme must be http or https, and the URL must be absolute")
 	}
-	if u.Host == "" {
+	// u.Host carries the port, so an empty u.Host is not the only way to arrive naming no
+	// machine: "http://:8080" parses with a host of ":8080", which is not empty, and the edge
+	// would then sign "http://:8080/ingress/hubspot" while the provider signed the real public
+	// URL. That is the silent 401 this whole function exists to prevent, and it is an easy thing
+	// to write, because LAWANG_LISTEN_ADDR two entries above it in the usage text takes exactly
+	// that spelling. u.Hostname is the half that names a machine, and no rule here can see the
+	// problem otherwise: "http://:8080" parses, normalizes to itself, and is a fixed point.
+	if u.Hostname() == "" {
 		return "", errors.New("missing host")
+	}
+	// The same silent mismatch from the other side: "http://x:" keeps a colon no dashboard holds,
+	// and it too is a fixed point of every other rule here.
+	if strings.HasSuffix(u.Host, ":") {
+		return "", errors.New("the host must not end in a colon with no port")
+	}
+	// The host is ASCII, and an internationalized name belongs here in its punycode (xn--) form.
+	// Go does not convert one to the other, so "https://café.example" would go into a signature
+	// base string as those bytes, while DNS, the provider's dashboard and therefore the URL the
+	// provider signed all carry "xn--caf-dma.example": the same 401 with nothing to see. The path
+	// prefix is refused outside ASCII a few lines below, for a related reason, and refusing both
+	// keeps one answer for one question.
+	for _, b := range []byte(u.Host) {
+		if b >= 0x80 {
+			return "", errors.New("the host must be written in ASCII, and an internationalized name in its punycode (xn--) form")
+		}
 	}
 	// url.Parse decodes percent-escapes in the host, so "http://%25" parses with a host of "%",
 	// which is not a host any second pass can read back (FuzzNormalizePublicBaseURL found this

@@ -490,6 +490,11 @@ var acceptedBaseURLs = map[string]string{
 	// the operator registered with the provider, which they copied from its dashboard.
 	"https://EXAMPLE.com:443": "https://EXAMPLE.com:443",
 	"https://[::1]:8443/":     "https://[::1]:8443",
+	// An internationalized host, in the one spelling a provider's dashboard holds. The kanji
+	// spelling of the same name is refused, so that an operator hears about it at start rather
+	// than as a 401 per delivery.
+	"https://xn--80ak6aa92e.com":       "https://xn--80ak6aa92e.com",
+	"https://xn--caf-dma.example/a/b/": "https://xn--caf-dma.example/a/b",
 	// Trailing slashes, however many. TrimSuffix would leave "https://x//" as "https://x/", which
 	// keeps the trailing slash the function promises to remove, and the second pass then removes
 	// it: Load and ingress.New would hold two different strings for one variable and every
@@ -541,6 +546,16 @@ var refusedBaseURLs = map[string]string{
 	// testdata/fuzz keeps it as a seed.
 	"a percent-escape in the host": "http://%25",
 	"an IPv6 zone id":              "http://[fe80::1%25eth0]:8080",
+	// A URL that names a port and no machine. u.Host is ":8080", which is not empty, so the
+	// check that catches "https://" does not catch this one, and neither can the idempotence
+	// property: it parses, and it is its own normal form. LAWANG_LISTEN_ADDR takes exactly this
+	// spelling, which is how it gets written here.
+	"a port and no host":    "http://:8080",
+	"a colon and no host":   "http://:",
+	"an empty port":         "http://lawang.example.test:",
+	"a host outside ASCII":  "https://café.example",
+	"an IDN host in kanji":  "http://例え.jp",
+	"an IDN host with path": "https://café.example/lawang",
 }
 
 func TestThePublicBaseURLIsNormalizedAndNeverGuessed(t *testing.T) {

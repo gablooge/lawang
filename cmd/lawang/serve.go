@@ -16,8 +16,10 @@ import (
 
 const shutdownGrace = 15 * time.Second
 
-// serve runs the HTTP role until ctx is cancelled. For now it carries only /healthz; the webhook
-// edge and the operator API mount here as they land.
+// serve runs the HTTP role until ctx is cancelled. For now it carries only /healthz. When the
+// webhook edge lands (B07 wires it, because it needs a hub), this mux goes away: ingress.New
+// builds the routing table, takes /healthz as an ingress.Route and returns the handler to serve,
+// so that no route is behind a mux that answers redirects.
 func serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)

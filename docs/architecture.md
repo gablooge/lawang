@@ -109,11 +109,22 @@ request path and answers 307 with a `Location` before any handler runs, so `//in
 `/ingress//slack` and `/ingress/slack/../slack` would each redirect to `/ingress/slack`. A 307
 preserves the method and the body, so the provider re-POSTs, the edge signs the cleaned path and
 the provider signed the original: every delivery would be a 401, which the table above reserves for
-a forged signature. So `ingress.Handler.Mount` returns the handler the server serves, which is the
-mux with a guard in front of it, and a path the mux would have cleaned gets the same 404 an unknown
-provider gets. Nothing legitimate is refused, because a provider only ever posts to the one URL
-Lawang gave it. The Cloudflare Tunnel in front of a development machine already refuses these
-shapes; this is the same rule for a deployment with no tunnel in front of it.
+a forged signature. So `ingress.New` returns the handler the server serves, which is a mux this
+package builds itself with a guard in front of it, and a path the mux would have cleaned gets the
+same 404 an unknown provider gets. Nothing legitimate is refused, because a provider only ever
+posts to the one URL Lawang gave it. The guard reads the request's **escaped** path, which is the
+string the mux cleans, so a wildcard segment that carries an encoded slash still reaches its
+handler. The Cloudflare Tunnel in front of a development machine already refuses these shapes;
+this is the same rule for a deployment with no tunnel in front of it.
+
+**The mux's other redirect is taken away from it, not guarded against.** `ServeMux` also answers
+307 from `/x` to `/x/` when `/x/` is a registered pattern and `/x` is not, and that one runs after
+any guard in front of the mux, because it depends on the routing table rather than on the request.
+So the routing table is `ingress`'s: every other route the server answers (`/healthz` now, the
+`/v1` operator API later) is given to `ingress.New` as a `Route`, and for every pattern that can
+match a path ending in a slash, `New` registers the slash-less path itself with the same 404. No
+bare mux exists for a caller to serve by mistake, which is what an earlier `Mount(mux)` shape
+allowed with nothing in `go build`, `go vet` or `golangci-lint` to say so.
 
 **The body is captured once, under a cap** (`ingress.DefaultMaxBody`, 1 MiB), by an
 `http.MaxBytesReader` in front of everything that touches it, hashing included. Those exact bytes
@@ -306,11 +317,15 @@ of the base string the receiver has to supply, and the obvious sources for it (`
 and passed through unchanged by a tunnel. A receiver that built the signed URL from them would let
 a sender choose part of what it is proving, and the check would pass over content the sender
 picked. So the public base URL is **configuration**: `LAWANG_PUBLIC_BASE_URL`, validated at start
-by `config.NormalizePublicBaseURL` (absolute, `http` or `https`, a host, no credentials, no query,
-no fragment, a clean path prefix written with no percent-escape, no trailing slash) and refused
+by `config.NormalizePublicBaseURL` (absolute, `http` or `https`, a host that names a machine and
+is written in ASCII, no credentials, no query, no fragment, a clean path prefix written with no
+percent-escape, no trailing slash) and refused
 rather than guessed at. Host case and a default port are deliberately **kept**: the string has to
 match the URL the operator registered with the provider, which they copied from its dashboard, so
-lowercasing a host or dropping `:443` would create the mismatch rather than remove it.
+lowercasing a host or dropping `:443` would create the mismatch rather than remove it. An
+internationalized host is given in its punycode (`xn--`) form for the same reason, and the other
+spelling is refused at start rather than turned into a 401 per delivery: `http://:8080`, which
+names a port and no machine, is refused for that reason too.
 
 **Unset is a refusal, not a default.** With no public base URL configured the edge still serves,
 because most schemes never look at the URL, but `provider.Request.URL` is empty and a scheme that
@@ -668,8 +683,14 @@ of the program rather than a decoded path segment.
   `Request.Header` is this package's `Header` and not an `http.Header`: a provider that normalized
   a header in place would change what the candidates after it read, and the symptom would be a
   signature that fails for the second candidate only, in a tenant that happens to have two
-  subscriptions on one workspace. Nothing is copied per candidate, because there is nothing an
-  implementation can write to.
+  subscriptions on one workspace. The header is a guarantee, because the type has no mutating
+  method and nothing is copied to get it. **`Request.Body` is a rule and not a guarantee**: it is a
+  `[]byte` that aliases the edge's own buffer, an implementation that normalizes it in place
+  changes what every later candidate verifies and what B07 stores in the outbox, and only a review
+  of the provider package catches that. Making it a guarantee belongs in B07's per-candidate loop,
+  where a copy per candidate costs 0.9 us for an 8 KiB delivery and 57 us at the 1 MiB cap against
+  a 200 ms target, and it is on [#7](https://github.com/gablooge/lawang/issues/7) with those
+  numbers.
 - The 503 the edge answers on a slow accept rests on `errors.Is(err, context.DeadlineExceeded)`.
   Both error shapes pgx produces for a saturated pool match it today, but a statement cancelled
   server side comes back as a `*pgconn.PgError` with SQLSTATE 57014 and no context error in its

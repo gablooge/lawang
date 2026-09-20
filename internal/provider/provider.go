@@ -115,7 +115,7 @@ type WebhookSource interface {
 //
 // Everything in it arrived from the public internet except URL, which is configuration.
 type Request struct {
-	// Method is the request method, and it is always "POST": ingress.Pattern fixes the method, so
+	// Method is the request method, and it is always "POST": the ingress route fixes the method, so
 	// the mux answers anything else itself and no other method reaches a provider. It is carried
 	// because HubSpot v3 puts the method in its base string, and an implementation that builds
 	// that string from this field rather than from a literal keeps saying the truth if the edge
@@ -141,7 +141,20 @@ type Request struct {
 	Header Header
 
 	// Body is the exact bytes of the request, the ones a signature is over. An implementation
-	// must not re-serialize them, and must not modify the slice, which is not copied.
+	// must not re-serialize them, and must not modify the slice.
+	//
+	// This one is a rule and not a guarantee, which is the difference between it and Header. The
+	// slice is handed out by value and aliases the edge's own buffer, so an implementation that
+	// normalized the bytes in place (trimming a byte order mark, lower casing, blanking a field
+	// before hashing) would change what every later candidate verifies and what B07 then stores
+	// in the outbox. Nothing in the type system stops that, and a review of a provider package
+	// has to look for it.
+	//
+	// Making it a guarantee is cheap and belongs where the per-candidate loop is, which is the
+	// hub (#7): copying the slice per candidate costs 0.9 microseconds for an 8 KiB delivery and
+	// 57 microseconds at the 1 MiB cap on this machine, against an accept path that targets 200
+	// ms. It is not done here, because the edge builds one Request and has no candidate loop to
+	// copy in.
 	Body []byte
 }
 
