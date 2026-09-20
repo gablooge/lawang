@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -12,13 +13,74 @@ import (
 )
 
 const (
-	idsImportPath = "github.com/gablooge/lawang/internal/ids"
 	// recordPackage is the one package that may call RecordID: record.Seal hashes the scope the
 	// record carries, and no other.
 	recordPackage = "internal/record"
 	// idsPackage is this package, where RecordID may be said once: where it is declared.
 	idsPackage = "internal/ids"
 )
+
+// idsImportPath is the import path of this package, read from go.mod rather than written here.
+//
+// It used to be a literal, and that is how this whole scan went blind once: the rename of
+// 2026-09-20 changed the module path, the literal kept the old one, and every reference the scan
+// looked for resolved to nothing. The meta-test below builds its synthetic sources from the same
+// value, so it agreed with the mistake and stayed green while a real second caller existed. A
+// derived path cannot disagree with the module it belongs to.
+var idsImportPath = modulePath() + "/" + idsPackage
+
+// modulePath reads the module line of go.mod at the repository root.
+func modulePath() string {
+	b, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
+	if err != nil {
+		panic("callers_test: cannot read go.mod: " + err.Error())
+	}
+	for line := range strings.Lines(string(b)) {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "module "); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	panic("callers_test: go.mod has no module line")
+}
+
+// TestTheImportPathNamesAPackageSomethingImports is the other half of the lesson above. Deriving
+// the path stops it from going stale, and this stops it from being derived wrongly: if the value
+// names no package that this repository imports, the scan would find nothing and say so by
+// passing. One importer is enough, and record is always one, because record.Seal is the only
+// caller there is meant to be.
+func TestTheImportPathNamesAPackageSomethingImports(t *testing.T) {
+	var importers []string
+	err := filepath.WalkDir(filepath.Join("..", ".."), func(path string, d fs.DirEntry, err error) error {
+		switch {
+		case err != nil:
+			return err
+		case d.IsDir():
+			if name := d.Name(); name == ".git" || name == ".claude" {
+				return fs.SkipDir
+			}
+			return nil
+		case !strings.HasSuffix(path, ".go"):
+			return nil
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+		if err != nil {
+			return nil // a file the scan cannot parse is the other test's problem, not this one
+		}
+		for _, spec := range f.Imports {
+			if p, err := strconv.Unquote(spec.Path.Value); err == nil && p == idsImportPath {
+				importers = append(importers, path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking the repository: %v", err)
+	}
+	if len(importers) == 0 {
+		t.Fatalf("no file imports %q, so the caller scan is looking for a package that does not "+
+			"exist and would pass however many callers there were", idsImportPath)
+	}
+}
 
 // RecordID is exported because record.Seal is in another package, and it takes any string as the
 // scope. A second caller could mint an id for a scope the record does not carry, and the promise
@@ -92,7 +154,7 @@ import _ "unsafe"
 func part(name, value string) error`, true},
 		{"a linkname in this package, which can push the recipe out", "internal/ids/push.go", `package ids
 import _ "unsafe"
-//go:linkname New github.com/gablooge/lawang/internal/worker.mint`, true},
+//go:linkname New ` + modulePath() + `/internal/worker.mint`, true},
 		{"a linkname to something else", "internal/worker/i.go", `package worker
 import _ "unsafe"
 //go:linkname nanotime runtime.nanotime
