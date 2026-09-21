@@ -36,8 +36,8 @@ type CrossTenantTx interface {
 type ID string
 
 // Sentinel owns every delivery that cannot be attributed to a tenant: one whose workspace nobody
-// has registered, and one that more than one tenant's secret verified. Such a delivery is parked
-// under this id rather than routed to a guess (principle 2), where it can be audited,
+// has registered, and one that more than one subscription's secret verified. Such a delivery is
+// parked under this id rather than routed to a guess (principle 2), where it can be audited,
 // re-resolved once the missing subscription exists (B25) and deleted by retention.
 //
 // It is a tenant id and not a tenant. No tenants row may carry it: the tenants table refuses it

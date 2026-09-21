@@ -18,10 +18,12 @@
 //
 // The tenant comes from a row Lawang owns, never from the payload. Nothing a sender writes selects
 // a tenant: the delivery's keys only narrow which rows are asked, and a row's tenant counts only
-// once that row's secret has verified the exact bytes the sender sent. When more than one tenant's
-// secret verifies one delivery, it is parked and not routed, because routing to the first match is
-// how data crossed tenants in the Python predecessor. That is why nothing here short-circuits on
-// the first candidate that verifies.
+// once that row's secret has verified the exact bytes the sender sent. When more than one
+// subscription's secret verifies one delivery, it is parked and not routed, because routing to the
+// first match is how data crossed tenants in the Python predecessor. That is why nothing here
+// short-circuits on the first candidate that verifies. Two rows of ONE tenant are parked too: the
+// ordering key names the subscription, so which of them owns the delivery is a real question (ADR
+// 11, decision 5).
 //
 // # Where this package stops
 //
