@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gablooge.github.io/lawang/schema/record/v1.json",
+  "title": "Lawang record, format v1",
+  "description": "The envelope a Lawang sink receives. One record is one version of one entity (a message, a task, a document) in one scope. Reading rules for a sink: check that format is exactly 'lawang.record/v1' and refuse anything else; be idempotent on id; decide access on visibility.scope and on nothing else (a person may see a record if they are a member of its scope, for the tenant the record was delivered for); key an entity by tenant and external_id together, never by source; compare id, external_id, version and visibility.scope for equality only, never parse them; ignore fields you do not know, except inside visibility, where an unknown field is a reason to refuse the record. Three rules of the format are beyond what a JSON Schema can state, and a sink that validates with this schema alone checks them itself: a record document is UTF-8 and holds no escape for half of a surrogate pair (check the bytes before parsing: parsers refuse such a document, or silently replace the bad part, or keep it, and then two consumers read two different records); no field name occurs twice in one object; supersedes is never the record's own id. See docs/adr/0003-scope-id-format.md and docs/adr/0004-record-format-v1.md.",
+  "$comment": "Two things here are deliberate. (1) Every anchored pattern has a companion that does not depend on the anchor: either a fixed length or a 'not' with an unanchored character class. In some regular expression dialects (Python's, for one) '$' also matches before a trailing newline, so an anchored pattern alone would accept 'rec_...\\n' in a validator built on them. (2) 'format: date-time' is an annotation unless the validator is told to assert formats, so occurred_at carries a pattern as well. The pattern cannot know the length of a month: assert formats if your validator can.",
+  "type": "object",
+  "propertyNames": { "$ref": "#/$defs/fieldName" },
+  "required": [
+    "format",
+    "id",
+    "op",
+    "source",
+    "kind",
+    "external_id",
+    "version",
+    "supersedes",
+    "occurred_at",
+    "title",
+    "text",
+    "author",
+    "container",
+    "visibility",
+    "origin",
+    "edges"
+  ],
+  "properties": {
+    "format": {
+      "description": "The format version. The promise within v1: every record Lawang produces validates against every earlier v1 schema, so a sink that validates with the file it took keeps working. Fields a reader may ignore can therefore be added, and nothing that exists changes, in either direction: no limit raised or lowered, no pattern or character set widened or narrowed, no field removed, renamed or made optional, no new value of op, kind or visibility.audience, no change of meaning, nothing at all inside visibility. Any of those is a new format with a new value here.",
+      "const": "lawang.record/v1"
+    },
+    "id": {
+      "description": "The idempotency key: one id is one version of one entity in one scope, for one tenant. A sink that receives an id it already holds has received a repeat. Opaque.",
+      "$ref": "#/$defs/recordId"
+    },
+    "op": {
+      "description": "upsert: store this version, replacing the one named by supersedes if there is one. delete: a tombstone, the entity is gone and every stored version of external_id goes with it; title and text are empty. Lawang v0.1 never sends delete. A sink that cannot honour a delete refuses the record, it never ignores it.",
+      "enum": ["upsert", "delete"]
+    },
+    "source": {
+      "description": "The name the sink knows this source by. It is sink configuration and may change, so it is for display and filtering. It is not part of any id and need not equal the first segment of visibility.scope.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "not": { "pattern": "[^a-z0-9_-]" }
+    },
+    "kind": {
+      "description": "What the entity is. A closed set.",
+      "enum": ["task", "message", "ticket", "document", "page"]
+    },
+    "external_id": {
+      "description": "The entity's identity, the same for every version of it. It is unique within one tenant, across all of the tenant's sources: it begins with Lawang's internal key of the provider and a colon ('slack:', 'clickup:'), which is what keeps the entities of two providers apart. A sink keys an entity by tenant and external_id together, and never by source, which is a name that may change. A delete removes what is stored under that key, and edges.reply_parent refers to it. Opaque beyond that: compare for equality.",
+      "$ref": "#/$defs/externalId"
+    },
+    "version": {
+      "description": "Which version of the entity this is. Opaque: two records of one external_id are the same version exactly when their version strings are equal, and a sink learns their order from supersedes, never by comparing versions.",
+      "$ref": "#/$defs/identifier",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "supersedes": {
+      "description": "The id of the record this one replaces, or null. Links point forward only: a version that arrives late never names a newer one. A record that moved to another scope supersedes the record it was in the old scope.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/recordId" }]
+    },
+    "occurred_at": {
+      "description": "When it happened at the source, never when Lawang ingested it. RFC 3339, always UTC with the 'Z' suffix, second precision or up to nine fractional digits, years 1000 to 9999, never a leap second.",
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 30,
+      "pattern": "^[1-9][0-9]{3}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]{1,9})?Z$",
+      "not": { "pattern": "[^0-9TZ.:-]" }
+    },
+    "title": {
+      "description": "May be empty. PII-masked like text. One line of content in any language: see $defs/oneLine for what it cannot hold. Like text it is whatever somebody wrote at the source, and it may hold bidirectional formatting characters, so it is not safe to display without the care a sink gives any foreign text.",
+      "$ref": "#/$defs/oneLine",
+      "maxLength": 1024
+    },
+    "text": {
+      "description": "The content, already PII-masked. May be empty. Untrusted: it is whatever somebody wrote at the source, whatever origin says. Every character except NUL is allowed, including newlines, tabs, control characters and bidirectional formatting characters.",
+      "type": "string",
+      "maxLength": 1048576,
+      "not": { "pattern": "\\x00" }
+    },
+    "author": {
+      "description": "Who wrote it, in the source's own terms. Informational: access is never decided on it.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "required": ["id", "display"],
+      "properties": {
+        "id": {
+          "description": "The source's user id, or empty when unknown.",
+          "$ref": "#/$defs/identifier",
+          "maxLength": 256
+        },
+        "display": {
+          "description": "A name to show, or empty when unknown. Not an identifier.",
+          "$ref": "#/$defs/displayName",
+          "maxLength": 256
+        }
+      }
+    },
+    "container": {
+      "description": "Where the entity lives at the source (the channel of a message, the task of a comment). Informational: it is often the scope's container too, and need not be.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/containerKind" },
+        "id": {
+          "description": "The source's id of the container, exactly as the source spells it.",
+          "$ref": "#/$defs/identifier",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "visibility": {
+      "description": "Everything access is decided on. Closed: a field a sink does not know here could only be one it must not ignore.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "required": ["scope", "audience"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "description": "The ONE thing access is decided on: a person may see the record if they are a member of this scope. Membership arrives separately, through access sync, under the same scope id. The tenant is not in it: key memberships and records by tenant and scope together.",
+          "$ref": "#/$defs/scopeId"
+        },
+        "audience": {
+          "description": "direct: the scope is a conversation or a mailbox of named participants. group: the scope is a shared space. Informational only. It grants and denies nothing.",
+          "enum": ["direct", "group"]
+        }
+      }
+    },
+    "origin": {
+      "description": "What Lawang knows about where the content came from. Both fields are signals and never clearances: true means Lawang has a positive signal, false means it has NO SIGNAL, because the source did not say, the provider cannot tell, or this version of Lawang does not look. false never means the opposite of true. Every text is untrusted content whatever these say: use true to be stricter, never false to be laxer.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "required": ["automation", "untrusted"],
+      "properties": {
+        "automation": {
+          "description": "true: Lawang has a positive signal that a bot or an integration wrote it (the source marks the author as one). false: no signal. It is never a statement that a person wrote it.",
+          "type": "boolean"
+        },
+        "untrusted": {
+          "description": "true: Lawang has a positive signal that the author is outside the tenant (inbound mail from a stranger, an external guest). Such text may be written to steer an AI agent that reads it. false: no signal. It is never a statement that the author is inside the tenant or that the text is safe to follow. Lawang v0.1 sets it for no provider, so every v0.1 record says false, mail from a stranger included.",
+          "type": "boolean"
+        }
+      }
+    },
+    "edges": {
+      "description": "Relations to other entities, taken from fields of the source and never inferred from text.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "required": ["reply_parent"],
+      "properties": {
+        "reply_parent": {
+          "description": "The external_id of the entity this one replies to, or null.",
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/externalId" }]
+        }
+      }
+    },
+    "meta": {
+      "description": "Diagnostics. Not part of the record's content: the same id may arrive again with a different meta. May be absent.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "properties": {
+        "delivery": {
+          "description": "Lawang's id of the accepted delivery the record was made from, for support. Empty means the same as absent.",
+          "$ref": "#/$defs/identifier",
+          "maxLength": 128
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "A tombstone carries no content.",
+      "if": { "required": ["op"], "properties": { "op": { "const": "delete" } } },
+      "then": { "properties": { "title": { "const": "" }, "text": { "const": "" } } }
+    }
+  ],
+  "$defs": {
+    "fieldName": {
+      "description": "Every field name of the format, now and later, is lowercase a-z, 0-9 and underscore, and a record with any other field name is refused. Some JSON decoders match names without regard to case (Go's does, and it folds U+212A and U+017F to 'k' and 's' as well), so an 'ID' beside 'id' would be one field to them and two to this schema.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "not": { "pattern": "[^a-z0-9_]" }
+    },
+    "recordId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^rec_[0-9a-f]{32}$"
+    },
+    "identifier": {
+      "description": "A string a program compares and an operator reads in a log. It holds none of: the control characters U+0000 to U+001F and U+007F to U+009F; the soft hyphen U+00AD; the Arabic letter mark U+061C; the zero-width and directional marks U+200B to U+200F; the line and paragraph separators and the bidirectional embeddings and overrides, U+2028 to U+202E; the word joiner, the invisible operators, the bidirectional isolates and the deprecated format characters, U+2060 to U+206F; the byte order mark U+FEFF. So it cannot break a log line or reorder what is shown next to it. The list is fixed and is not every invisible character of Unicode: a sink that shows an identifier to a person still treats it as foreign text. The characters from U+0080 up are in the pattern as themselves, written with JSON escapes, because regular expression dialects do not agree on an escape for them.",
+      "type": "string",
+      "not": { "pattern": "[\\x00-\\x1f\\x7f\u0080-\u009f\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]" }
+    },
+    "displayName": {
+      "description": "A name to show. The same as identifier, except that the zero-width non-joiner U+200C and joiner U+200D are allowed: Persian and Indic names are spelled with them and emoji are built with them. It cannot break a line or reorder the text around it. It can still imitate another name with look-alike letters, which no list of characters prevents.",
+      "type": "string",
+      "not": { "pattern": "[\\x00-\\x1f\\x7f\u0080-\u009f\u00ad\u061c\u200b\u200e\u200f\u2028-\u202e\u2060-\u206f\ufeff]" }
+    },
+    "oneLine": {
+      "description": "Content on one line. It holds none of the control characters U+0000 to U+001F and U+007F to U+009F (so no tab, line feed, carriage return or next line) and neither the line separator U+2028 nor the paragraph separator U+2029. Everything else is content, the bidirectional formatting characters included, because right-to-left text uses them.",
+      "type": "string",
+      "not": { "pattern": "[\\x00-\\x1f\\x7f\u0080-\u009f\u2028\u2029]" }
+    },
+    "externalId": {
+      "description": "An identifier of 1 to 1,024 characters that begins with a provider key (a lowercase letter, then up to 31 of a-z 0-9 _), a colon, and at least one more character.",
+      "$ref": "#/$defs/identifier",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[a-z][a-z0-9_]{0,31}:."
+    },
+    "containerKind": {
+      "description": "The source's word for a kind of container: channel, list, mailbox, dm. An open set.",
+      "type": "string",
+      "maxLength": 32,
+      "pattern": "^[a-z][a-z0-9_]{0,31}$",
+      "not": { "pattern": "[^a-z0-9_]" }
+    },
+    "scopeId": {
+      "description": "{provider}:{container_kind}:{container_id}. Exactly two colons. The container id keeps A-Z a-z 0-9 . _ ~ - as they are and carries every other byte as %XX with uppercase hex; control bytes are never carried. An escape of a character that needs none is refused, so one scope has exactly one spelling. Case-sensitive, ASCII, at most 512 characters. Opaque to a sink: compare for equality. It is safe as it stands in a JSON string, a database text column and a log line. It is NOT safe as it stands in a URL path or query, because it holds percent signs and a server decodes them once: percent-encode it once more as one opaque value, like any other string, never splice it into a path, and compare after exactly one decoding. It is not safe as it stands either in a file path (it holds colons, and '..%2F' turns into '../' in anything that decodes) or where a percent sign has a meaning of its own (a batch file, a crontab line, a printf format string).",
+      "type": "string",
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_]{0,31}:[a-z][a-z0-9_]{0,31}:(?:[A-Za-z0-9._~-]|%(?:2[0-9A-CF]|3[A-F]|40|5[B-E]|60|7[B-D]|[89A-F][0-9A-F]))+$",
+      "not": { "pattern": "[^A-Za-z0-9._~%:-]" }
+    }
+  }
+}

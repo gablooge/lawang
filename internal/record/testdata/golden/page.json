@@ -1,0 +1,33 @@
+{
+  "format": "lawang.record/v1",
+  "id": "rec_787e8dfa8545a560d1ca802c05c099ca",
+  "op": "upsert",
+  "source": "teams",
+  "kind": "page",
+  "external_id": "teams:page:19:abc@thread.tacv2:7",
+  "version": "7",
+  "supersedes": null,
+  "occurred_at": "2026-07-09T12:30:45.999999999Z",
+  "title": "Runbook",
+  "text": "",
+  "author": {
+    "id": "0f5c3a9e-1b2d-4c6f-8a7b-9d0e1f2a3b4c",
+    "display": "Ben"
+  },
+  "container": {
+    "kind": "channel",
+    "id": "19:abc@thread.tacv2"
+  },
+  "visibility": {
+    "scope": "teams:channel:19%3Aabc%40thread.tacv2",
+    "audience": "group"
+  },
+  "origin": {
+    "automation": false,
+    "untrusted": false
+  },
+  "edges": {
+    "reply_parent": null
+  },
+  "meta": {}
+}

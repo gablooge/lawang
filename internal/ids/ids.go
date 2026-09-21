@@ -64,16 +64,29 @@ func DeliveryID(provider string, rawBody []byte) (string, error) {
 
 // RecordID is the end-to-end idempotency key:
 //
-//	"rec_" + hex(blake3(provider, external_id, version, tenant))[:32]
+//	"rec_" + hex(blake3(provider, external_id, version, scope, tenant))[:32]
 //
 // provider is the internal provider key, never a sink's wire name, so renaming a source for a sink
 // does not re-key its records. tenant is part of the hash on purpose: two tenants may connect the
 // same provider workspace, and without it the second tenant's records would dedupe away.
-func RecordID(provider, externalID, version, tenant string) (string, error) {
+//
+// scope is the record's visibility.scope, the one thing access is decided on (ADR 4). It is hashed
+// so that an entity which moves to another scope is a new record even when the provider's own
+// version did not change with the move. Otherwise the moved record would keep its id, the ledger
+// would skip it as already delivered, and the sink would go on deciding access on the old scope.
+//
+// record.Seal is the only caller, and it hashes the scope the record carries and no other. That
+// is enforced, not only said. The guard is in record: a Record whose id, external id, version or
+// scope is not what Seal left there cannot be marshalled, whatever minted the id. The tripwire
+// is TestRecordIDHasNoCallerOutsideRecord, which fails when a file outside internal/record
+// refers to this function, when this package names it anywhere but here (so do not wrap it),
+// and on a go:linkname directive that reaches this package.
+func RecordID(provider, externalID, version, scope, tenant string) (string, error) {
 	parts := [...]struct{ name, value string }{
 		{"provider", provider},
 		{"external_id", externalID},
 		{"version", version},
+		{"scope", scope},
 		{"tenant", tenant},
 	}
 	h := blake3.New()

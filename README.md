@@ -10,8 +10,16 @@ receives their webhooks directly, and turns every change into a clean, permissio
 delivered exactly once to your memory, search, or RAG system.
 
 > **Status: pre-alpha.** The foundations are built (M0: configuration, id recipes, Postgres with
-> row-level security, the outbox), but nothing ingests a webhook yet. The design is written down in
-> [docs/architecture.md](docs/architecture.md), the build order in [docs/roadmap.md](docs/roadmap.md),
+> row-level security, the outbox), the record format is settled
+> ([schema](internal/record/record.v1.schema.json)), and the webhook edge now exists: the provider
+> interfaces, the registry and `/ingress/{provider}` with raw-body capture, a size cap and the
+> handshake hook. What is still missing is the half that makes a delivery belong to somebody:
+> signature verification against owned subscriptions, and the outbox insert. So no webhook is
+> stored yet, **and `lawang serve` does not mount the route at all**: an edge with no hub would
+> answer a provider without storing anything, so B07 is the item that wires it and until then a
+> POST to `/ingress/{provider}` is a 404 from the mux. The design
+> is written down in [docs/architecture.md](docs/architecture.md), the build order in
+> [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the
 > point where it runs end to end against real providers.
 
@@ -23,9 +31,11 @@ Most connector tools move data. Lawang controls **what gets through and who may 
 is the part that matters once the data lands in something an AI agent reads.
 
 - **Permission-stamped at the source.** Every record carries a scope (the channel, list, mailbox or
-  portal it came from) and that scope's members, taken from the provider's own sharing signals.
-  Your retrieval layer enforces one rule: a person may see a record if they are a member of its
-  scope. Lawang never guesses reach from content.
+  portal it came from), taken from the provider's own sharing signals. The scope's members are
+  not in the record: they are synced separately, under the same scope id, so when somebody joins
+  or leaves a channel no record has to be delivered again. Your retrieval layer enforces one rule:
+  a person may see a record if they are a member of its scope. Lawang never guesses reach from
+  content.
 - **Exactly once, end to end.** Each change gets one deterministic id. A provider re-sending a
   webhook, a worker crashing mid-delivery, and a backfill overlapping the live feed all resolve to
   the same id, so all three are no-ops downstream.
