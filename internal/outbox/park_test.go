@@ -2,6 +2,7 @@ package outbox_test
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -201,5 +202,68 @@ func TestEveryParkReasonHasItsOwnText(t *testing.T) {
 	}
 	if outbox.ParkUnreasoned.String() == "" {
 		t.Error("the zero reason has no text at all, so a log line about it says nothing")
+	}
+}
+
+// TestAnUnreadableDeliveryIsParkedWithoutItsBody. Of the five reasons, this is the only one whose
+// bytes nothing will ever read: no subscription registered later makes a body the provider could
+// not read its own keys out of resolvable, so B25 cannot settle it. It is also the only park a
+// stranger produces at will, because the ingress path takes any body up to 1 MiB with no
+// credential at all and the delivery id is a hash of the body, so every distinct body is another
+// row. Storing the payload forever for a row nothing reads is how a public endpoint fills a disk.
+func TestAnUnreadableDeliveryIsParkedWithoutItsBody(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+
+	junk := strings.Repeat("junk from a stranger ", 512)
+	id, fresh := e.park(junk, outbox.ParkUnreadable)
+	if !fresh {
+		t.Fatal("the first park of a delivery reports it was already parked")
+	}
+	row, err := e.ob.Get(e.ctx, tenancy.Sentinel, id)
+	if err != nil {
+		t.Fatalf("Get as the sentinel tenant: %v", err)
+	}
+	body := string(row.RawBody)
+	switch {
+	case strings.Contains(body, "junk from a stranger"):
+		t.Errorf("the parked row stored the bytes a stranger sent: %.120q", body)
+	case len(row.RawBody) > 256:
+		t.Errorf("the parked row is %d bytes for a %d byte delivery, which is not a note", len(row.RawBody), len(junk))
+	case !strings.Contains(body, strconv.Itoa(len(junk))):
+		t.Errorf("the note does not say how long the delivery was: %.200q", body)
+	}
+	// The note is still a function of the body alone, so the two things a delivery id is for both
+	// survive: a re-send of the same bytes is one row, and other bytes are another row.
+	if _, fresh := e.park(junk, outbox.ParkUnreadable); fresh {
+		t.Error("re-sending an unreadable delivery stored a second row")
+	}
+	if _, fresh := e.park(junk+"!", outbox.ParkUnreadable); !fresh {
+		t.Error("a different unreadable delivery deduped onto the first one's row")
+	}
+	if got := e.countRows(); got != 2 {
+		t.Errorf("the outbox holds %d rows, want 2", got)
+	}
+}
+
+// TestAReasonASweepCanSettleKeepsEveryByte is the other half of the rule. B25 re-resolves a
+// delivery parked for no owner or an ambiguous one once the subscription that owns it exists, and
+// it can only do that from the bytes as they arrived.
+func TestAReasonASweepCanSettleKeepsEveryByte(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+
+	for _, reason := range []outbox.ParkReason{
+		outbox.ParkNoOwner, outbox.ParkAmbiguousOwner, outbox.ParkUnverifiable, outbox.ParkUnstorable,
+	} {
+		body := `{"the delivery":"` + reason.String() + `"}`
+		id, _ := e.park(body, reason)
+		row, err := e.ob.Get(e.ctx, tenancy.Sentinel, id)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if string(row.RawBody) != body {
+			t.Errorf("%v stored %q, want the delivery as it arrived, %q", reason, row.RawBody, body)
+		}
 	}
 }

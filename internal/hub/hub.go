@@ -36,6 +36,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
+	"slices"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -274,13 +277,34 @@ func (h *Hub) deliveryKeys(source provider.WebhookSource, req provider.Request) 
 }
 
 // candidates returns the subscriptions the delivery's keys could belong to, and at most one more
-// than the hub will verify.
+// than the hub will verify per key.
 //
 // It runs under the resolver role, which sees across tenants because deriving the tenant is the
 // one thing that cannot be done inside a tenant. That transaction is cross-tenant for its whole
 // life and does this and nothing else: it commits before anything is verified and long before
 // anything is written, and the tenant's own work happens in a second transaction under TenantTx
 // (architecture 4, and store.RoleTx, whose transaction refuses a bind for this reason).
+//
+// # Why both queries, and not the one the delivery looks most like
+//
+// A subscription is registered with a workspace id, with the registration's own id, or with both,
+// and which of them a provider can give is the provider's business, not ours: a ClickUp webhook
+// names a workspace, a Microsoft Graph notification names the subscription. A delivery that
+// carries both keys can therefore belong to a row that recorded only the other one, and asking
+// only the query that fits the delivery's shape would leave that row out of the candidate set.
+//
+// Leaving a row out is not a missed delivery, it is a wrong owner: "exactly one tenant verified"
+// is the whole of principle 2, and it cannot be told from "the one tenant we happened to ask
+// verified". The first review of this item reproduced exactly that, two tenants whose secrets both
+// verify being routed to one of them because only one of the two was ever a candidate.
+//
+// So each key the delivery carries runs its own equality probe, on its own index, and the union of
+// what they return is the candidate set. Each query also filters on the OTHER key, so a key that
+// both the delivery and the row carry must agree; a key either of them left empty says nothing
+// either way. Two probes rather than one OR keeps both lookups index-probed under the generic plan
+// pgx's statement cache ends up with, which a single statement would not: a delivery that carries
+// no registration id would probe the external id against the empty string and read every row
+// that recorded none.
 func (h *Hub) candidates(ctx context.Context, providerKey string, keys provider.DeliveryKeys) ([]candidate, error) {
 	// One more than the maximum, so that "too many" is visible rather than a set cut short.
 	limit := int32(h.maxCandidates) + 1 //nolint:gosec // bounded by New, which refuses less than 1
@@ -288,34 +312,61 @@ func (h *Hub) candidates(ctx context.Context, providerKey string, keys provider.
 	var found []candidate
 	err := h.db.RoleTx(ctx, store.RoleResolver, func(tx pgx.Tx) error {
 		q := hubdb.New(tx)
+		// A row that both queries return is one candidate and one HMAC, not two: a subscription
+		// that verified twice would look like two tenants and park a delivery it owns outright.
+		seen := make(map[string]struct{})
+		var union []candidate
+		add := func(cs []candidate) {
+			for _, c := range cs {
+				if _, dup := seen[c.id]; dup {
+					continue
+				}
+				seen[c.id] = struct{}{}
+				union = append(union, c)
+			}
+		}
 		// A delivery with neither key never gets here: deliveryKeys refuses it.
-		if keys.Workspace == "" {
-			rows, err := q.CandidatesBySubscription(ctx, hubdb.CandidatesBySubscriptionParams{
+		if keys.Workspace != "" {
+			rows, err := q.CandidatesByWorkspace(ctx, hubdb.CandidatesByWorkspaceParams{
 				Provider:      providerKey,
+				Workspace:     keys.Workspace,
 				Subscription:  keys.Subscription,
 				MaxCandidates: limit,
 			})
 			if err != nil {
 				return err
 			}
-			found, err = candidatesFrom(rows, func(r hubdb.CandidatesBySubscriptionRow) (string, string, []byte) {
+			cs, err := candidatesFrom(rows, func(r hubdb.CandidatesByWorkspaceRow) (string, string, []byte) {
 				return r.ID, r.TenantID, r.Secret
 			})
-			return err
+			if err != nil {
+				return err
+			}
+			add(cs)
 		}
-		rows, err := q.CandidatesByWorkspace(ctx, hubdb.CandidatesByWorkspaceParams{
-			Provider:      providerKey,
-			Workspace:     keys.Workspace,
-			Subscription:  keys.Subscription,
-			MaxCandidates: limit,
-		})
-		if err != nil {
-			return err
+		if keys.Subscription != "" {
+			rows, err := q.CandidatesBySubscription(ctx, hubdb.CandidatesBySubscriptionParams{
+				Provider:      providerKey,
+				Workspace:     keys.Workspace,
+				Subscription:  keys.Subscription,
+				MaxCandidates: limit,
+			})
+			if err != nil {
+				return err
+			}
+			cs, err := candidatesFrom(rows, func(r hubdb.CandidatesBySubscriptionRow) (string, string, []byte) {
+				return r.ID, r.TenantID, r.Secret
+			})
+			if err != nil {
+				return err
+			}
+			add(cs)
 		}
-		found, err = candidatesFrom(rows, func(r hubdb.CandidatesByWorkspaceRow) (string, string, []byte) {
-			return r.ID, r.TenantID, r.Secret
-		})
-		return err
+		// Each query orders by id; the union of two of them does not, and the order decides which
+		// candidate is verified first and which two the ambiguity is reported about.
+		slices.SortFunc(union, func(a, b candidate) int { return strings.Compare(a.id, b.id) })
+		found = union
+		return nil
 	})
 	if err != nil {
 		return nil, retryable(ctx, fmt.Errorf("hub: candidate subscriptions: %w", err))
@@ -353,6 +404,27 @@ func newCandidate(id, tenantID string, secret []byte) (candidate, error) {
 	return candidate{id: id, tenant: tenant, secret: secret}, nil
 }
 
+// maxStackInLog bounds the stack of a recovered panic in the log line. A Verify is a few frames
+// deep and this is room for dozens of them; the bound is here so that one provider bug cannot
+// write an unbounded amount per delivery into a log an operator has to keep and pay for.
+const maxStackInLog = 8 << 10
+
+// crash is what a recovered panic leaves behind for the log.
+//
+// It deliberately does NOT carry the recovered value. A panic value is whatever the provider
+// package passed to panic, which can be a string or an error it built out of the delivery, and a
+// provider that panics is by definition one whose promises are not being kept: it could carry a
+// body, a delivery key or the secret it was handed into a log line that is then in every backup.
+// What is kept is ours and is what actually finds the bug.
+type crash struct {
+	// kind is the dynamic type of the recovered value, as %T prints it. A type name is written in
+	// the provider's own source and cannot hold a byte of a delivery.
+	kind string
+	// stack is the goroutine's stack at the point of the panic: function names, files, lines and
+	// argument words. Argument words are pointers and lengths, never the bytes they point at.
+	stack []byte
+}
+
 // verifyAll runs the provider's verification once per candidate and returns every candidate whose
 // secret verified the exact bytes.
 //
@@ -365,12 +437,14 @@ func (h *Hub) verifyAll(ctx context.Context, providerKey string, source provider
 		switch {
 		case verifyErr != nil:
 			return nil, false, verifyErr
-		case crashed:
+		case crashed != nil:
 			// Architecture 7: Verify never panics, and nothing can enforce it. One that does has
 			// answered nothing, so the candidates that did answer cannot settle the owner either.
-			// This is a bug in a provider package, hence the error level.
+			// This is a bug in a provider package, hence the error level, and the stack is the
+			// whole reason the level is useful: without it the line says the provider's name and
+			// nothing else, and there is nowhere to start looking.
 			h.log.Error("hub: a provider's Verify panicked, so the delivery is parked instead of routed",
-				"provider", providerKey)
+				"provider", providerKey, "panic_type", crashed.kind, "stack", string(crashed.stack))
 			return nil, true, nil
 		case verified:
 			owners = append(owners, c)
@@ -402,17 +476,26 @@ func (h *Hub) verifyAll(ctx context.Context, providerKey string, source provider
 // then stored in the outbox. Copying per candidate makes it a guarantee for 0.9 microseconds at
 // 8 KiB and 57 at the 1 MiB cap, against a 200 ms target, and it is also what keeps a Verify that
 // was given up on from racing with the INSERT of the same bytes.
-func verifyOne(ctx context.Context, source provider.WebhookSource, req provider.Request, secret []byte) (ok, panicked bool, err error) {
+func verifyOne(ctx context.Context, source provider.WebhookSource, req provider.Request, secret []byte) (ok bool, panicked *crash, err error) {
 	req.Body = bytes.Clone(req.Body)
 
-	type answer struct{ ok, panicked bool }
+	type answer struct {
+		ok      bool
+		crashed *crash
+	}
 	// Buffered, so the goroutine finishes even when nobody is listening any more.
 	done := make(chan answer, 1)
 	go func() {
 		var a answer
 		defer func() {
 			if r := recover(); r != nil {
-				a = answer{panicked: true}
+				// Inside the deferred call of a panicking goroutine, so the frames that panicked
+				// are still on the stack and this is the trace that names the line.
+				stack := debug.Stack()
+				if len(stack) > maxStackInLog {
+					stack = stack[:maxStackInLog]
+				}
+				a = answer{crashed: &crash{kind: fmt.Sprintf("%T", r), stack: stack}}
 			}
 			done <- a
 		}()
@@ -421,17 +504,19 @@ func verifyOne(ctx context.Context, source provider.WebhookSource, req provider.
 
 	select {
 	case a := <-done:
-		return a.ok, a.panicked, nil
+		return a.ok, a.crashed, nil
 	case <-ctx.Done():
-		return false, false, fmt.Errorf("hub: verification did not finish: %w", ctx.Err())
+		return false, nil, fmt.Errorf("hub: verification did not finish: %w", ctx.Err())
 	}
 }
 
 // park stores a delivery nobody can be shown to own under the sentinel tenant, and answers 2xx.
 //
 // Parking cannot reach a real tenant: outbox.Park takes no tenant at all, so there is no argument
-// here for a crafted delivery to influence. What a sender contributes is the raw body, stored as
-// it arrived and read by nothing until a sweep re-resolves it (B25).
+// here for a crafted delivery to influence. What a sender contributes is the raw body, which the
+// outbox keeps as it arrived for the reasons a sweep can settle later (B25) and replaces with a
+// short note for the one it cannot: see outbox.Park. That matters here because ParkUnreadable is
+// the park a stranger can produce at will, with no credential and no knowledge of any tenant.
 func (h *Hub) park(ctx context.Context, providerKey string, body []byte, reason outbox.ParkReason) (ingress.Verdict, error) {
 	_, fresh, err := h.ob.Park(ctx, providerKey, body, reason)
 	if err != nil {

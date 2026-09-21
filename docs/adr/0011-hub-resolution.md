@@ -7,7 +7,9 @@ Status: accepted, 2026-09-21 (backlog item B07)
 The accept path has to turn bytes a stranger sent into one tenant, or into a refusal. Principle 2
 says the tenant comes from a row Lawang owns and never from the payload, and that a delivery more
 than one tenant could claim is refused rather than routed. Three questions had to be answered
-before that could be built, and none of them was settled anywhere.
+before that could be built, and none of them was settled anywhere. A fourth, which rows are
+candidates when a delivery carries both keys and a subscription recorded only one, was settled
+during the review of the first implementation and is decision 4 below.
 
 ## Decision
 
@@ -36,9 +38,11 @@ table":
 
 The cost is that the secret is in a plain column, so a database backup carries it and an operator
 with read access to that table can read it. When the vault lands (B13), encrypting this column with
-the vault's key is a change to one query and one function, because `hub.candidates` is the only
-reader. The interface it would need is different from `Vault.Fetch`, since it must work before the
-tenant is known.
+the vault's key is a change to the two candidate queries and to `hub.candidates`, which is the only
+code in the program that reads the column: `UpsertSubscription` writes it and deliberately does not
+return it, so `Subscriptions.Register` hands back the secret its own caller passed in and never one
+read out of the table. The interface the encryption would need is different from `Vault.Fetch`,
+since it must work before the tenant is known.
 
 ### 2. A delivery nobody can be shown to own is parked under a sentinel tenant, `_parked`
 
@@ -63,6 +67,19 @@ deliveries queues behind nothing. Why it was parked is `dead_reason`, one of fiv
 
 The first two are the ones a subscription registered later can settle, which is what B25 re-runs.
 
+**What a parked row stores.** The bytes as they arrived, for every reason B25 can settle: they are
+the delivery, and the sweep routes them once the subscription that owns them exists. Not for
+"unreadable delivery", which keeps a note of the delivery's length and of the delivery id the bytes
+had instead. That reason is the one a stranger produces at will (the ingress path takes any body up
+to the 1 MiB cap with no credential, and the delivery id is a hash of the body, so every distinct
+body is another row), and it is the one no later registration can ever make resolvable, so the
+payload is pure cost. "The provider's verification panicked" and "the delivery cannot be stored"
+also keep their bytes: the first is evidence for a bug of ours and needs a provider package to
+panic, and the second already has a verified owner, so neither is a stranger's to send. The choice
+is made by `outbox.Park` from the reason, not by its caller, so a later caller cannot forget it.
+Whether the re-resolvable reasons need a row quota or an age cap before retention exists is B25's
+question.
+
 ### 3. An accepted delivery's ordering key is the subscription it arrived on
 
 The outbox orders by an ordering key, and the guarantee is that two versions of one entity are
@@ -80,12 +97,36 @@ has already looked at, the way `DeliveryKeys` does, and for the hub to append it
 to one function and one interface, and it belongs with the pipeline (B08) and the first real
 provider (B11), where there is something to measure.
 
+### 4. The candidate set is every row either delivery key could select, not the rows one of them does
+
+A subscription is registered with a workspace id, with the registration's own id, or with both,
+because that is what the provider gives us: a ClickUp webhook names a workspace and a Microsoft
+Graph notification names the subscription. A delivery that carries both keys can therefore belong
+to a row that recorded only the other one.
+
+So each key a delivery carries runs its own equality probe, on its own index, and the candidate set
+is the union of what they return. Each probe also filters on the other key, so a key that both the
+delivery and the row carry must agree, and a key either of them left empty says nothing either way.
+
+Asking only the query that fits the delivery's shape is not a missed delivery, it is a wrong owner.
+The first review of this item reproduced it: two tenants whose secrets both verify, one registered
+with a workspace id and one with a registration id, and the delivery stored for whichever of them
+the chosen query happened to ask, because the hub never learned there was a second claimant.
+"Exactly one tenant verified" is the whole of principle 2, and it cannot be told from "the one
+tenant we asked verified".
+
+Two probes rather than one statement with an OR in it is what keeps both lookups index-probed under
+the generic plan pgx's statement cache ends up with: a single statement would probe the registration
+id against the empty string for every delivery that carries no registration id, and read every row
+that recorded none.
+
 ## Consequences
 
 - The accept path needs one cross-tenant read and one tenant-scoped write, in two transactions,
   and no vault call and no provider call at all. It holds one pooled connection per transaction
   and nothing across network I/O.
-- A delivery costs at most `hub.DefaultMaxCandidates` (32) HMAC computations, which is about 32 ms
+- A delivery costs one index probe per key it carries (at most two), and at most
+  `hub.DefaultMaxCandidates` (32) HMAC computations, which is about 32 ms
   at the 1 MiB body cap against a 200 ms target. More candidates than that is parked as an
   ambiguous owner, never truncated: a candidate set cut short could hide the second tenant that
   verifies and route what should have been parked.

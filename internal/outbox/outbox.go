@@ -219,6 +219,34 @@ const (
 	ParkUnstorable
 )
 
+// keepsBody reports whether a parked delivery's own bytes are stored, or a short note in their
+// place. See Park.
+//
+// Only ParkUnreadable answers false, and the two halves of the reason are separate. It can never
+// be re-resolved: the provider could not read its own keys out of those bytes, so no subscription
+// registered later makes them resolvable, and nothing will ever read them again. And it is the one
+// park a stranger produces at will: the ingress path takes any body up to the edge's 1 MiB cap
+// with no credential of any kind, the delivery id is a hash of the body, so every distinct body is
+// a distinct row, and twenty POSTs of garbage are twenty rows of garbage.
+//
+// The other two reasons no sweep re-resolves keep their bytes. ParkUnstorable has a verified owner
+// already, so the bytes are that tenant's own data and nobody without its secret can produce one.
+// ParkUnverifiable needs a candidate subscription to exist AND a provider package to panic, and
+// the body is then the evidence for a bug of ours. Neither is a stranger's to fill a disk with.
+func (r ParkReason) keepsBody() bool { return r != ParkUnreadable }
+
+// bodyNotKept is what Park stores in place of a delivery nothing will ever read again.
+//
+// It keeps the two things an operator can act on: how long the delivery was, and the delivery id
+// the bytes themselves had, which is what correlates this row with the provider's own record of
+// what it sent. Both are a function of the body alone, so two different bodies still make two
+// different rows and a re-send of one still dedupes onto its own row, exactly as a stored body
+// would. It is JSON because raw_body is JSON for every other row.
+func bodyNotKept(bodyDeliveryID string, n int) []byte {
+	return fmt.Appendf(nil, `{"lawang":"body not kept","body_delivery_id":%q,"body_bytes":%d}`,
+		bodyDeliveryID, n)
+}
+
 // parkReasonText is what each reason writes into dead_reason.
 var parkReasonText = map[ParkReason]string{
 	ParkNoOwner:        "unattributable: no owner",
@@ -254,17 +282,36 @@ var ErrNoParkReason = errors.New("outbox: a parked delivery needs a reason")
 // A parked row is auditable, re-resolvable once the missing subscription exists (B25) and deleted
 // by retention. It is never claimable: it is inserted dead and not the head of its key, and the
 // two states that would make it claimable are refused by the table itself.
+//
+// # What is stored, and what is not
+//
+// The bytes are stored as they arrived for every reason a sweep can settle later, because those
+// are the delivery: B25 routes them once the subscription that owns them exists. For a delivery
+// whose keys the provider could not read there is nothing to come back to, and storing a
+// stranger's megabyte forever for a row nothing will read is how a public endpoint fills a disk.
+// Those rows keep a short note instead (bodyNotKept), and keepsBody says which reasons are which.
+// The choice is made here rather than by the caller, so that a later caller cannot forget it.
+//
+// The row's delivery_id is blake3(provider, whatever this stores), which is the invariant the
+// table's own comment states, for a parked row as for an accepted one.
 func (o *Outbox) Park(ctx context.Context, providerKey string, rawBody []byte, reason ParkReason) (id string, fresh bool, err error) {
 	text, ok := parkReasonText[reason]
 	if !ok {
 		return "", false, ErrNoParkReason
 	}
-	deliveryID, err := ids.DeliveryID(providerKey, rawBody) // refuses an empty provider
+	bodyID, err := ids.DeliveryID(providerKey, rawBody) // refuses an empty provider
 	if err != nil {
 		return "", false, err
 	}
 	if !storable(providerKey) {
 		return "", false, errBadProvider
+	}
+	body, deliveryID := rawBody, bodyID
+	if !reason.keepsBody() {
+		body = bodyNotKept(bodyID, len(rawBody))
+		if deliveryID, err = ids.DeliveryID(providerKey, body); err != nil {
+			return "", false, err
+		}
 	}
 	id = ids.New()
 	err = o.db.TenantTx(ctx, tenancy.Sentinel, func(tx pgx.Tx) error {
@@ -273,7 +320,7 @@ func (o *Outbox) Park(ctx context.Context, providerKey string, rawBody []byte, r
 			TenantID:   tenancy.Sentinel.String(),
 			Provider:   providerKey,
 			DeliveryID: deliveryID,
-			RawBody:    rawBody,
+			RawBody:    body,
 			DeadReason: text,
 		})
 		if err != nil {

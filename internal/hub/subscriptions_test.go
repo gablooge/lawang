@@ -2,6 +2,7 @@ package hub_test
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/gablooge/lawang/internal/hub"
+	"github.com/gablooge/lawang/internal/hub/hubdb"
 	"github.com/gablooge/lawang/internal/ingress"
 	"github.com/gablooge/lawang/internal/provider"
 	"github.com/gablooge/lawang/internal/provider/fake"
@@ -30,11 +32,14 @@ func TestRegisteringTheSameResourceAgainUpdatesInPlace(t *testing.T) {
 	if again.ID != first.ID {
 		t.Errorf("the re-registered subscription has id %q, want the original %q", again.ID, first.ID)
 	}
-	if again.External != "S2" || string(again.Secret) != string(secretB) {
+	if again.External != "S2" {
 		t.Errorf("the row was not updated: %+v", again)
 	}
-	// And the new secret is the one that verifies, which is the thing an operator rotating a
-	// secret is actually asking for.
+	// The secret the row now holds is not asserted on the returned value: Register hands back the
+	// caller's own, because the upsert does not return the column (nothing but the two candidate
+	// queries reads it, which is what makes B13's encryption a change to them). The column is
+	// proved by the only thing that reads it, which is the accept path, and that is the thing an
+	// operator rotating a secret is actually asking for.
 	h, entry := e.hub(fake.New(fake.DefaultKey), hub.Options{})
 	if got := e.accept(h, entry, signed(delivery("W1", "S2", "1"), secretA)); got != ingress.Unverified {
 		t.Errorf("the old secret still verifies: verdict = %s", got)
@@ -243,6 +248,12 @@ func TestASubscriptionWithNoDeliveryKeyIsRefusedByTheTable(t *testing.T) {
 // TestTheCandidateLookupUsesAnIndex. The lookup runs once per delivery, on the accept path, so it
 // must not read the table. The plan is asked for on a table with enough rows that a sequential
 // scan would be the cheaper plan if the index were missing or unusable.
+//
+// It explains the statement the hub actually sends. The first round of review broke that: the test
+// ran EXPLAIN on a SQL string typed into the test, so it agreed with a copy while the checked-in
+// query went to a sequential scan. Rewriting the workspace equality in internal/hub/queries.sql
+// into a concatenation, which no index can serve, left the whole suite green and the accept path
+// reading 515 buffers per delivery instead of 3.
 func TestTheCandidateLookupUsesAnIndex(t *testing.T) {
 	t.Parallel()
 	e := setup(t)
@@ -258,52 +269,144 @@ func TestTheCandidateLookupUsesAnIndex(t *testing.T) {
 		  FROM generate_series(1, 50000) AS i;`)
 	e.analyze("lawang.subscriptions")
 
-	lookups := map[string]struct{ sql, index string }{
-		"by workspace": {`EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT id, tenant_id, secret FROM subscriptions
-		                    WHERE provider = 'fake' AND workspace_id = 'W42'
-		                      AND (external_id = '' OR 'S42' = '' OR external_id = 'S42')
-		                    ORDER BY id LIMIT 33`, "subscriptions_by_workspace"},
-		"by subscription": {`EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT id, tenant_id, secret FROM subscriptions
-		                      WHERE provider = 'fake' AND external_id = 'S42' ORDER BY id LIMIT 33`, "subscriptions_by_external"},
+	// The one row every lookup below goes looking for, and the limit the hub asks for.
+	const (
+		providerKey  = "fake"
+		workspace    = "W42"
+		subscription = "S42"
+		limit        = hub.DefaultMaxCandidates + 1
+	)
+	lookups := map[string]struct {
+		// query is the sqlc name of the statement, which is how it is found among everything else
+		// this connection has prepared. run is the generated method internal/hub itself calls, and
+		// args are values of the right types in the statement's own parameter order.
+		query string
+		run   func(q *hubdb.Queries) error
+		args  string
+		index string
+	}{
+		"by workspace": {
+			query: "CandidatesByWorkspace",
+			run: func(q *hubdb.Queries) error {
+				_, err := q.CandidatesByWorkspace(e.ctx, hubdb.CandidatesByWorkspaceParams{
+					Provider:      providerKey,
+					Workspace:     workspace,
+					Subscription:  subscription,
+					MaxCandidates: limit,
+				})
+				return err
+			},
+			args:  "'fake', 'W42', 'S42', 33",
+			index: "subscriptions_by_workspace",
+		},
+		"by subscription": {
+			query: "CandidatesBySubscription",
+			run: func(q *hubdb.Queries) error {
+				_, err := q.CandidatesBySubscription(e.ctx, hubdb.CandidatesBySubscriptionParams{
+					Provider:      providerKey,
+					Workspace:     workspace,
+					Subscription:  subscription,
+					MaxCandidates: limit,
+				})
+				return err
+			},
+			args:  "'fake', 'S42', 'W42', 33",
+			index: "subscriptions_by_external",
+		},
 	}
 	for name, lookup := range lookups {
-		sql := lookup.sql
-		var plan strings.Builder
-		err := e.db.RoleTx(e.ctx, store.RoleResolver, func(tx pgx.Tx) error {
-			rows, err := tx.Query(e.ctx, sql)
-			if err != nil {
-				return err
-			}
-			defer rows.Close()
-			for rows.Next() {
-				var line string
-				if err := rows.Scan(&line); err != nil {
-					return err
-				}
-				plan.WriteString(line + "\n")
-			}
-			return rows.Err()
-		})
-		if err != nil {
-			t.Fatalf("%s: EXPLAIN: %v", name, err)
-		}
+		plan := e.explainAsSent(lookup.query, lookup.args, lookup.run)
 		// The index by name, not merely "an index scan": ORDER BY id LIMIT means the planner can
 		// walk the primary key and filter, which is an Index Scan in the plan and a read of the
 		// whole table in fact. That is what dropping the index this lookup needs actually produces,
 		// and a test that accepted it would not notice.
-		if !strings.Contains(plan.String(), lookup.index) {
-			t.Errorf("%s does not use %s, on a path that runs once per delivery:\n%s", name, lookup.index, plan.String())
+		if !strings.Contains(plan, lookup.index) {
+			t.Errorf("%s does not use %s, on a path that runs once per delivery:\n%s", name, lookup.index, plan)
 		}
-		if strings.Contains(plan.String(), "Seq Scan") {
-			t.Errorf("%s has a sequential scan in its plan:\n%s", name, plan.String())
+		if strings.Contains(plan, "Seq Scan") {
+			t.Errorf("%s has a sequential scan in its plan:\n%s", name, plan)
+		}
+		// The probe found the row it went looking for. Without this the arguments could sit in the
+		// wrong parameters, match nothing, and still descend the right index in two buffers.
+		if got := actualRows(plan); got != 1 {
+			t.Errorf("%s returned %d rows, want the one subscription it names:\n%s", name, got, plan)
 		}
 		// And the cost is the matching rows, not the table. 50,000 rows are about 500 pages; a
 		// lookup that reads the whole thing shows up here whatever the plan is called.
-		if buffers := readBuffers(plan.String()); buffers > 100 {
-			t.Errorf("%s read %d buffers for at most 33 rows, which is the table and not an index probe:\n%s",
-				name, buffers, plan.String())
+		if buffers := readBuffers(plan); buffers < 1 || buffers > 100 {
+			t.Errorf("%s read %d buffers for at most %d rows, which is not an index probe:\n%s",
+				name, buffers, limit, plan)
 		}
 	}
+}
+
+// explainAsSent is the plan of the statement the hub actually sends for one sqlc query, and never
+// of a copy of it living in this file.
+//
+// run drives the generated method internal/hub itself calls, which makes pgx prepare the statement
+// on this connection. pg_prepared_statements then holds Postgres's own copy of the text, found by
+// the "-- name: <Name> :many" line sqlc writes at the top of every query it generates, and the plan
+// comes from EXECUTE of that statement. So a change to internal/hub/queries.sql is a change to what
+// is explained here, which is the whole point: the previous version of this test could not see one.
+//
+// plan_cache_mode = force_generic_plan is the other half of it. pgx caches the statement, so the
+// plan a delivery runs after the first few executions is the parameterized one, made without
+// knowing the values. That is the plan a partial index, or a wrapper around an indexed column,
+// quietly stops using, and a statement explained with its values written in would not show it: the
+// planner constant-folds a literal and cannot fold a parameter.
+func (e *env) explainAsSent(query, args string, run func(*hubdb.Queries) error) string {
+	e.t.Helper()
+	var plan strings.Builder
+	err := e.db.RoleTx(e.ctx, store.RoleResolver, func(tx pgx.Tx) error {
+		if err := run(hubdb.New(tx)); err != nil {
+			return fmt.Errorf("run %s: %w", query, err)
+		}
+		var name string
+		err := tx.QueryRow(e.ctx,
+			"SELECT name FROM pg_prepared_statements WHERE statement LIKE $1",
+			"%-- name: "+query+" :%").Scan(&name)
+		if err != nil {
+			return fmt.Errorf("find the statement pgx prepared for %s: %w", query, err)
+		}
+		if _, err := tx.Exec(e.ctx, "SET LOCAL plan_cache_mode = force_generic_plan"); err != nil {
+			return err
+		}
+		rows, err := tx.Query(e.ctx,
+			"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) EXECUTE "+pgx.Identifier{name}.Sanitize()+"("+args+")")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				return err
+			}
+			plan.WriteString(line + "\n")
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		e.t.Fatalf("explain %s as sent: %v", query, err)
+	}
+	return plan.String()
+}
+
+// actualRows is the row count of the outermost node of an EXPLAIN (ANALYZE) plan: the "rows=N" of
+// its "(actual time=... rows=N loops=1)", which is what the statement returned and not an estimate.
+func actualRows(plan string) int {
+	for _, line := range strings.Split(plan, "\n") {
+		i := strings.Index(line, "(actual ")
+		if i < 0 {
+			continue
+		}
+		for _, field := range strings.Fields(line[i:]) {
+			if n, err := strconv.Atoi(strings.TrimPrefix(field, "rows=")); err == nil && strings.HasPrefix(field, "rows=") {
+				return n
+			}
+		}
+	}
+	return -1
 }
 
 // readBuffers is the "shared hit=N read=M" total of the execution half of an

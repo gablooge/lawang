@@ -26,6 +26,15 @@ func (panicking) Verify(provider.Request, []byte) bool {
 	panic("a provider package that should not have panicked")
 }
 
+// panickingWithTheSecret is a provider whose Verify panics with a value built out of the secret it
+// was handed. A panic value is the provider package's to choose, so the hub must not put one in a
+// log line: the stack is ours and the type name is written in source, and those are what it keeps.
+type panickingWithTheSecret struct{ *fake.Provider }
+
+func (panickingWithTheSecret) Verify(_ provider.Request, secret []byte) bool {
+	panic("this provider leaked " + string(secret))
+}
+
 // blocking is a provider whose Verify never returns until release is closed. A test closes it in
 // a t.Cleanup, so a hub that waited for Verify fails the test with a deadline rather than hanging.
 type blocking struct {
@@ -128,6 +137,7 @@ func (l *lockedBuffer) String() string {
 // The doubles are what they claim to be.
 var (
 	_ provider.WebhookSource = panicking{}
+	_ provider.WebhookSource = panickingWithTheSecret{}
 	_ provider.WebhookSource = (*blocking)(nil)
 	_ provider.WebhookSource = mutating{}
 	_ provider.WebhookSource = keyless{}

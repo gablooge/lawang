@@ -46,11 +46,20 @@ func NewSubscriptions(db *store.DB) *Subscriptions { return &Subscriptions{db: d
 // updates, never duplicates). The stored row keeps its id, because the id is what the outbox
 // orders that subscription's deliveries by.
 //
-// It refuses anything that could not resolve a delivery: a tenant id that is not one, a provider
-// key that is not one (the same rule the registry and the scope id use, ADR 3), a resource that is
-// empty or unstorable, a delivery key over what the table stores, and an empty secret. Refusing
-// here rather than storing is what keeps "every delivery is a 401" from being a thing an operator
-// can configure by accident.
+// It refuses anything that could resolve NO delivery at all: a tenant id that is not one, a
+// provider key that is not one (the same rule the registry and the scope id use, ADR 3), a
+// resource that is empty or unstorable, a delivery key over what the table stores, a row with
+// neither delivery key, and an empty secret. Refusing here rather than storing is what keeps
+// "every delivery is a 401" from being a thing an operator can configure by accident.
+//
+// It does not refuse a row that carries only one of the two delivery keys, and it could not: which
+// keys a provider puts on a delivery is the provider's business, and the candidate lookup asks
+// every row either key could select (see Hub.candidates). A row with a workspace id alone is found
+// by a delivery that names that workspace, a row with a registration id alone by a delivery that
+// names that registration, and a row with both by either.
+//
+// The returned subscription carries the caller's own secret. Nothing reads that column back out of
+// the table here; see the field.
 func (s *Subscriptions) Register(ctx context.Context, sub provider.Subscription) (provider.Subscription, error) {
 	if err := validate(sub); err != nil {
 		return provider.Subscription{}, err
@@ -84,7 +93,12 @@ func (s *Subscriptions) Register(ctx context.Context, sub provider.Subscription)
 			Resource:  row.Resource,
 			Workspace: row.WorkspaceID,
 			External:  row.ExternalID,
-			Secret:    row.Secret,
+			// The caller's own secret, never one read back out of the table. The two candidate
+			// queries are the only readers of that column in the program, and that is what makes
+			// encrypting it (B13) a change to them and to one function; a RETURNING list with the
+			// secret in it would be a third reader, and its value would travel on to the operator
+			// API (B14). The upsert writes this value or nothing, so it is what is stored.
+			Secret: sub.Secret,
 		}
 		return nil
 	})

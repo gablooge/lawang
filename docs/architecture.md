@@ -208,9 +208,16 @@ registry entry and the delivery, and it does five things in order.
    subscription there is, which is work a stranger could ask for with an empty body, so it is
    parked.
 2. **Candidates, under `lawang_resolver`, in a transaction that does nothing else.** One equality
-   probe on an index of the subscriptions table, for at most `hub.DefaultMaxCandidates` (32) rows
-   plus one. That transaction commits before anything is verified: it is cross-tenant for its whole
-   life, and a bind inside it would narrow nothing (see [section 4](#4-trust-model)).
+   probe per key the delivery carries, each on its own index of the subscriptions table, for at
+   most `hub.DefaultMaxCandidates` (32) rows plus one; the candidate set is the union of what they
+   return. It is a union and not a choice between them because a subscription may be registered
+   with a workspace id, with the registration's own id, or with both, and which of those a delivery
+   carries is the provider's business: asking only the rows one key selects would leave a tenant
+   with a claim on the delivery out of the set, and "exactly one verified" cannot be told from "the
+   one we asked verified". Each probe also filters on the other key, so a key that both the
+   delivery and the row carry must agree. That transaction commits before anything is verified: it
+   is cross-tenant for its whole life, and a bind inside it would narrow nothing (see
+   [section 4](#4-trust-model)).
 3. **Verification, once per candidate.** Constant time, over the exact raw bytes, with the same
    `provider.Request` each time except that `Body` is copied per candidate, which turns that
    field's rule into a guarantee for 0.9 microseconds at 8 KiB. `Verify` is called inside a
@@ -229,9 +236,12 @@ registry entry and the delivery, and it does five things in order.
 credential is ever issued for it. `outbox.Park` takes no tenant from its caller at all, which is
 what keeps a crafted delivery from reaching a real one. A parked row is stored `dead`, finished and
 not the head of its key, so no worker ever claims it, and `dead_reason` says why it was parked, in
-one of five fixed texts that B25 re-resolves by. The details, and why the verification secret is a
-column of the subscription row rather than a vault entry, are in
-[ADR 11](adr/0011-hub-resolution.md).
+one of five fixed texts that B25 re-resolves by. A parked row keeps the delivery's own bytes for
+the reasons a sweep can settle later, and a short note (its length and the delivery id the bytes
+had) for the one it can never settle: a delivery whose keys the provider could not read is the
+park a stranger produces at will, with no credential, and nothing will ever read those bytes
+again. The details, and why the verification secret is a column of the subscription row rather
+than a vault entry, are in [ADR 11](adr/0011-hub-resolution.md).
 
 **An accepted delivery is ordered by the subscription it arrived on**, `{provider key}:{subscription
 id}`, because the hub does not parse a delivery and so cannot name an entity. That is coarser than
@@ -934,7 +944,7 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Body could not be read (a `Content-Length` that lies) | unstorable | 400, nothing stored |
 | Signature invalid | untrusted | 401, nothing stored |
 | Unknown workspace or ambiguous owner | unattributable | parked under the sentinel tenant `_parked`, answered 2xx, re-resolved periodically (B25), deleted after retention |
-| A delivery the provider cannot read its own keys out of, or whose keys identify nothing | unattributable | parked, answered 2xx: there is no signature claim to reject, so it is never a 401 |
+| A delivery the provider cannot read its own keys out of, or whose keys identify nothing | unattributable | parked, answered 2xx: there is no signature claim to reject, so it is never a 401. The row keeps a note of the delivery's length and id, not its body: no sweep can re-resolve it, and anyone can send one |
 | A provider's `Verify` panics | unattributable | parked, answered 2xx: no candidate's answer can settle the owner, and the connection is not dropped |
 | A resolved delivery that can never be stored (an ordering key the table refuses) | unstorable | parked as poison, answered 2xx, so the provider does not retry what cannot work |
 | Hydration fails | degradable | deliver a minimal record, the change is still tracked |

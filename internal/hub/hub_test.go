@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -528,5 +529,229 @@ func TestTheHubLogsNoSecret(t *testing.T) {
 		if strings.Contains(logged.String(), forbidden) {
 			t.Errorf("the log contains %q:\n%s", forbidden, logged.String())
 		}
+	}
+}
+
+// TestARowFoundOnlyByItsRegistrationIdIsStillACandidate is the cross-tenant attribution the first
+// review found, and the reason the candidate lookup is a union rather than an either/or.
+//
+// Tenant A registered a mailbox, which the provider names by the registration's own id and not by
+// a workspace. Tenant B registered a workspace, whose id the provider does send. A delivery that
+// carries both keys belongs to whichever of them signed it, and here both could have: they share a
+// secret. Asking only the rows the workspace selects would route it to B without ever learning
+// that A had a claim on it.
+func TestARowFoundOnlyByItsRegistrationIdIsStillACandidate(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	shared := []byte("a secret two tenants both hold")
+	e.register(tenantA, "mailbox-1", "", "S1", shared)
+	e.register(tenantB, "W1", "W1", "", shared)
+	h, entry := e.hub(fake.New(fake.DefaultKey), hub.Options{})
+
+	if got := e.accept(h, entry, signed(delivery("W1", "S1", "1"), shared)); got != ingress.Parked {
+		t.Fatalf("verdict = %s, want parked (200): both tenants' secrets verify these exact bytes", got)
+	}
+	e.wantParked(reasonAmbiguous,
+		"a delivery two tenants could own is parked whatever mix of key shapes they registered with")
+}
+
+// TestEveryRowTheKeysCouldBelongToIsACandidate is the whole table of key shapes: a subscription is
+// registered with a workspace id, with a registration id, or with both, and a delivery carries one
+// or the other or both.
+//
+// Every row in a case holds the SAME secret, so the verdict counts the rows the lookup actually
+// asked: none is parked as unowned, one is stored for its tenant, and two are parked as ambiguous.
+// With different secrets per row a lookup that skipped a row would still store the right delivery
+// for the right tenant, and the test would prove nothing about which rows were asked.
+//
+// The keys come from a double, because the strict fake always reads both of them out of its own
+// envelope and half of this table is about a provider that sends only one.
+func TestEveryRowTheKeysCouldBelongToIsACandidate(t *testing.T) {
+	t.Parallel()
+	shared := []byte("a secret every row in this table holds")
+
+	type row struct {
+		tenant                        tenancy.ID
+		resource, workspace, external string
+	}
+	cases := map[string]struct {
+		rows []row
+		// The keys the delivery carries. An empty string is a key the provider did not send.
+		workspace, subscription string
+		// want is the verdict, and owner is who the row belongs to when it is stored.
+		want   ingress.Verdict
+		owner  tenancy.ID
+		reason string
+	}{
+		"a workspace on both sides": {
+			rows:      []row{{tenantA, "W1", "W1", ""}},
+			workspace: "W1",
+			want:      ingress.Stored, owner: tenantA,
+		},
+		"a workspace row and a delivery that also names a registration": {
+			rows:      []row{{tenantA, "W1", "W1", ""}},
+			workspace: "W1", subscription: "S1",
+			want: ingress.Stored, owner: tenantA,
+		},
+		"a registration row and a delivery that also names a workspace": {
+			rows:      []row{{tenantA, "mailbox-1", "", "S1"}},
+			workspace: "W1", subscription: "S1",
+			want: ingress.Stored, owner: tenantA,
+		},
+		"a registration id on both sides": {
+			rows:         []row{{tenantA, "mailbox-1", "", "S1"}},
+			subscription: "S1",
+			want:         ingress.Stored, owner: tenantA,
+		},
+		"both keys on both sides": {
+			rows:      []row{{tenantA, "list-1", "W1", "S1"}},
+			workspace: "W1", subscription: "S1",
+			want: ingress.Stored, owner: tenantA,
+		},
+		"both keys registered, only the workspace delivered": {
+			rows:      []row{{tenantA, "list-1", "W1", "S1"}},
+			workspace: "W1",
+			want:      ingress.Stored, owner: tenantA,
+		},
+		"both keys registered, only the registration id delivered": {
+			rows:         []row{{tenantA, "list-1", "W1", "S1"}},
+			subscription: "S1",
+			want:         ingress.Stored, owner: tenantA,
+		},
+		"the delivery names another registration in the same workspace": {
+			rows:      []row{{tenantA, "list-1", "W1", "S2"}},
+			workspace: "W1", subscription: "S1",
+			want: ingress.Parked, reason: reasonNoOwner,
+		},
+		"the delivery names another workspace for the same registration": {
+			rows:      []row{{tenantA, "list-1", "W2", "S1"}},
+			workspace: "W1", subscription: "S1",
+			want: ingress.Parked, reason: reasonNoOwner,
+		},
+		"a workspace-only delivery cannot reach a registration-only row": {
+			rows:      []row{{tenantA, "mailbox-1", "", "S1"}},
+			workspace: "W1",
+			want:      ingress.Parked, reason: reasonNoOwner,
+		},
+		"a registration-only delivery cannot reach a workspace-only row": {
+			rows:         []row{{tenantA, "W1", "W1", ""}},
+			subscription: "S1",
+			want:         ingress.Parked, reason: reasonNoOwner,
+		},
+		"one tenant found by its workspace, another by its registration id": {
+			rows: []row{
+				{tenantA, "mailbox-1", "", "S1"},
+				{tenantB, "W1", "W1", ""},
+			},
+			workspace: "W1", subscription: "S1",
+			want: ingress.Parked, reason: reasonAmbiguous,
+		},
+		"one tenant found by both keys, another by its registration id": {
+			rows: []row{
+				{tenantA, "mailbox-1", "", "S1"},
+				{tenantB, "list-1", "W1", "S1"},
+			},
+			workspace: "W1", subscription: "S1",
+			want: ingress.Parked, reason: reasonAmbiguous,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e := setup(t)
+			for _, r := range tc.rows {
+				e.register(r.tenant, r.resource, r.workspace, r.external, shared)
+			}
+			source := keyed{fake.New(fake.DefaultKey), provider.DeliveryKeys{
+				Workspace:    tc.workspace,
+				Subscription: tc.subscription,
+			}}
+			h, entry := e.hub(source, hub.Options{})
+
+			got := e.accept(h, entry, signed(delivery("W1", "S1", "1"), shared))
+			if got != tc.want {
+				t.Fatalf("verdict = %s, want %s", got, tc.want)
+			}
+			if tc.want == ingress.Stored {
+				e.wantStored(tc.owner, "the delivery belongs to the one row its keys could have come from")
+				return
+			}
+			e.wantParked(tc.reason, "the keys select the rows, and how many verify decides the verdict")
+		})
+	}
+}
+
+// TestGarbageFromAStrangerDoesNotBecomeMegabytesOfDatabase. /ingress/<provider> answers anyone,
+// signed or not, and a body the provider cannot read its own keys out of is parked without ever
+// touching a tenant. That is right, and the first round of review pointed out what it cost: twenty
+// POSTs of distinct garbage were twenty rows holding twenty bodies, at up to the edge's 1 MiB cap
+// each, for a reason no sweep can ever re-resolve.
+func TestGarbageFromAStrangerDoesNotBecomeMegabytesOfDatabase(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	e.register(tenantA, "W1", "W1", "S1", secretA)
+	h, entry := e.hub(fake.New(fake.DefaultKey), hub.Options{})
+
+	const posts = 20
+	for i := range posts {
+		// Unsigned, unparseable, and distinct, so nothing dedupes it away.
+		body := fmt.Appendf(nil, `not json at all, delivery %d, %s`, i, strings.Repeat("x", 4096))
+		if got := e.accept(h, entry, signed(body, nil)); got != ingress.Parked {
+			t.Fatalf("delivery %d: verdict = %s, want parked (200)", i, got)
+		}
+	}
+	rows := e.outboxRows()
+	if len(rows) != posts {
+		t.Fatalf("the outbox holds %d rows, want %d: each distinct delivery is still its own row", len(rows), posts)
+	}
+	total := 0
+	for _, row := range rows {
+		if strings.Contains(row.body, "xxxx") || strings.Contains(row.body, "not json at all") {
+			t.Fatalf("a parked row holds the bytes a stranger sent: %.120q", row.body)
+		}
+		if row.deadReason != reasonUnreadable {
+			t.Fatalf("dead_reason = %q, want %q", row.deadReason, reasonUnreadable)
+		}
+		total += len(row.body)
+	}
+	// Twenty deliveries of 4 KiB each. The bound here is not the interesting number, the ratio is:
+	// what is kept is a note per delivery and not the delivery.
+	if total > posts*256 {
+		t.Errorf("%d unreadable deliveries kept %d bytes of body, want a note each", posts, total)
+	}
+}
+
+// TestAPanickingVerifyLogsWhereItPanicked. Parking is the right answer (the candidates that did
+// answer cannot settle an owner on their own), but it is silent: every delivery of that shape goes
+// to the sentinel and the tenant simply stops receiving them. The log line is the only sign, so it
+// has to name the line that panicked and not just the provider.
+//
+// What it must NOT carry is the panic value. A provider that panics is one whose promises are
+// already not being kept, and the value is whatever it passed to panic, which can be built out of
+// the body or the secret it was handed.
+func TestAPanickingVerifyLogsWhereItPanicked(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	e.register(tenantA, "W1", "W1", "S1", secretA)
+	var logged lockedBuffer
+	h, entry := e.hub(panickingWithTheSecret{fake.New(fake.DefaultKey)}, hub.Options{
+		Logger: slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	if got := e.accept(h, entry, signed(delivery("W1", "S1", "1"), secretA)); got != ingress.Parked {
+		t.Fatalf("verdict = %s, want parked (200)", got)
+	}
+	out := logged.String()
+	for _, want := range []string{
+		"panickingWithTheSecret", // the frame that panicked, by name
+		"fakes_test.go",          // and the file it is in
+		"panic_type=string",      // the kind of value, which a type name cannot leak
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the log does not say %q, so nobody can find the bug:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, string(secretA)) {
+		t.Errorf("the log carries the panic value, which this provider built out of the secret:\n%s", out)
 	}
 }
