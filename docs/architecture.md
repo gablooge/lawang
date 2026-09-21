@@ -261,12 +261,27 @@ and it costs parallelism: one subscription's deliveries drain one at a time (ADR
 3. Parse the stored raw body into changes. One delivery can produce several records (a comment and
    its parent task, for example).
 4. Hydrate each change into the full object. On failure, degrade to a minimal record built from the
-   webhook body rather than dropping the change.
-5. Normalize, drop automation noise, compute the record id, skip ids already in the ledger, link
-   the supersede chain forward only, mask PII.
+   webhook body (`provider.Degrader`) rather than dropping the change. A degraded record derives
+   its scope from the same inputs, through the same function, as the hydrated one would, or one
+   version of one entity gets two ids; where the body does not carry what the scope is made of the
+   change cannot be degraded at all, and waits for hydration
+   ([ADR 4](adr/0004-record-format-v1.md) decision 7).
+5. Normalize, drop automation noise, compute the record id, check the record against the claimed
+   row's tenant (`record.SealedFor`), skip ids already in the ledger, link the supersede chain
+   forward only, mask PII.
 6. Commit the ledger rows and the prepared records together, then deliver to the sink.
 7. Commit the delivered state. A crash between steps 6 and 7 re-drains the prepared records, and
-   the sink's idempotency turns the repeat into a no-op.
+   the sink's idempotency turns the repeat into a no-op. A row that is already `prepared` is
+   delivered from what step 6 stored and is **not** prepared again: its ids are in the ledger, so
+   re-deriving them would skip every one.
+
+Steps 3 to 5 are `internal/pipeline` ([ADR 12](adr/0012-ledger-supersede-masking.md)), in two
+calls, because step 4 talks to a provider's API and steps 5 and 6 hold a transaction, and those
+must not be one span (see [section 10](#10-design-principles-learned-the-hard-way)). `Normalize`
+does 3, 4 and the gate outside any transaction; `Prepare` does the rest inside the transaction the
+worker opened in step 2, so the worker can commit the ledger rows with everything else it stores.
+Everything `Prepare` refuses is classified once: an error that wraps `pipeline.ErrDeadLetter` is
+one the same bytes will produce again, and anything else goes back on the retry ladder.
 
 **Outbox row states.** `pending` to `prepared` (step 6) to `delivered` (step 7), or to `dead`. A
 claim is a **lease** (`lease_until` plus a `lease_token`), not a held lock, because the work spans
@@ -566,6 +581,23 @@ A **new version is a new record.** Edits never overwrite; the new record carries
 id of the version it replaces. Supersede links only point forward, so a late-arriving old version
 can never claim to replace a newer one.
 
+What "forward" is decided by is [ADR 12](adr/0012-ledger-supersede-masking.md): the provider's
+`version` compared **byte by byte**, which is what ADR 4's "monotonic per `external_id`" means for
+a string the format otherwise calls opaque, and for two records that carry the same version,
+arrival order, which the outbox makes a real order. A record older than its entity's newest is
+neither linked nor delivered: it is held back and counted, because the sink already has something
+newer and an unlinked older record would leave it holding two live versions of one entity. A
+normalizer therefore spells a version so that byte order is version order (an epoch in
+milliseconds, an RFC 3339 timestamp, a fixed-width counter), never as a bare decimal counter, where
+`"10"` sorts before `"9"`.
+
+The chain is kept in the **ledger** (`record_ledger`), one row per record id that has been prepared
+for delivery, with exactly one row per `(tenant, provider, external_id)` marked as the entity's
+head. It is keyed per entity and never per scope, so a record that moves supersedes what it was in
+the old scope and the sink replaces it. A record that was skipped or held back is not written
+there: a row means prepared, and a later legitimate arrival of that version must not be mistaken
+for something already delivered.
+
 ---
 
 ## 6. The record format
@@ -747,6 +779,16 @@ type Subscription struct {
 	Workspace, External    string // the provider's own ids, as they appear on a delivery
 	Secret                 []byte
 }
+// Degrader is the optional capability of a provider that can build a change's records from the
+// webhook body alone, when Hydrate could not reach its API. A degraded record MUST derive its
+// scope from the same inputs, through the same function, as Normalize does: the scope is hashed
+// into the record id, so two routes to it are two ids for one version of one entity. Where the
+// body does not carry what the scope is made of, Degrade returns ErrCannotDegrade and the
+// delivery waits for hydration. It never guesses a scope (ADR 4, decision 7).
+type Degrader interface {
+	Degrade(c Change) ([]Record, error)
+}
+
 type Reconciler interface {
 	ChangesSince(ctx context.Context, s Subscription, cursor Cursor, limit int) ([]Change, error)
 }
@@ -814,7 +856,8 @@ of the program rather than a decoded path segment.
 **What lands when.** `Provider` and `WebhookSource` are in `internal/provider` from B06, because
 the ingress edge is built on them. `Subscription`, `Registrar` and `URLSigner` land with B07, which
 is the item that decides what a subscription is: the hub resolves deliveries against those rows and
-the subscriptions table stores them. `Reconciler` and `MemberSource` still wait for the items that
+the subscriptions table stores them. `Degrader` lands with B08, which is the item that has a
+degraded path to take. `Reconciler` and `MemberSource` still wait for the items that
 decide the types they take: `Cursor` is B19's (reconciliation) and `ScopeMembers` is B23's (access
 sync). An interface written before its types are settled is a shape every later item has to
 rewrite, and the rewrite is not free once a provider package implements it.
@@ -834,7 +877,7 @@ Built-in implementations planned for v0.1:
 | Sink | `http` (the format above), `stub` (strict test double), `jsonl` (files, for development) |
 | Hydration | direct provider API clients; an MCP-backed hydrator is on the roadmap as an alternative |
 | Identity | email join (normalized, domain-restricted); replaceable |
-| Masking | conservative regex baseline (emails, phone numbers, IBANs); replaceable |
+| Masking | conservative regex baseline (emails, phone numbers, IBANs) in `internal/pipeline`, with the map from placeholder to value kept in `redaction_map` and never sent anywhere ([ADR 12](adr/0012-ledger-supersede-masking.md)); replaceable |
 
 ---
 

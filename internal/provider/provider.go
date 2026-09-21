@@ -10,6 +10,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -40,6 +41,34 @@ type Provider interface {
 	// unsealed, because sealing needs the tenant and is the pipeline's step: Normalize fills
 	// everything record.Seal then checks. It does no I/O.
 	Normalize(h Hydrated, c Change) ([]record.Record, error)
+}
+
+// ErrCannotDegrade reports a Change whose webhook body does not carry what the record's scope is
+// made of, so no record can be built from it without hydration. A Degrader returns it (wrapped, if
+// it has more to say) instead of falling back to a scope it guessed.
+var ErrCannotDegrade = errors.New("provider: this change cannot be degraded")
+
+// Degrader is the optional capability of a provider that can build a change's records from the
+// webhook body alone, when Hydrate could not reach its API. Without it a hydration failure simply
+// waits for the API to come back (architecture 3.2, step 4).
+//
+// The one rule that makes it safe is about the scope. A degraded record's visibility.scope is
+// hashed into its id exactly as a hydrated one's is, so the degraded path MUST derive the scope
+// from the same inputs, through the same function, as Normalize does. A degraded record that
+// derived a different scope would give one version of one entity two ids: it would be delivered
+// twice, and to the ledger the second would look like a move (ADR 4, decision 7).
+//
+// Where the webhook body does not carry what the scope is made of, there is no honest answer, so
+// Degrade returns ErrCannotDegrade and the delivery waits for hydration or dead-letters. It never
+// guesses a scope, and it never leaves the scope empty for something downstream to fill in.
+//
+// Like Normalize it does no I/O: the whole point of it is that the provider's API is unreachable.
+type Degrader interface {
+	// Degrade builds the records of c out of c.Payload alone. The records are complete but
+	// unsealed, exactly as Normalize returns them, and they carry the same external id, version
+	// and scope the hydrated ones would have carried. What they may lack is content the webhook
+	// body did not have: an empty author, a shorter text.
+	Degrade(c Change) ([]record.Record, error)
 }
 
 // Change is one thing that happened at a provider, as its webhook body or a reconciliation page
