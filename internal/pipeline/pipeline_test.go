@@ -129,32 +129,121 @@ func TestAnOlderVersionNeverSeenBeforeIsHeldBack(t *testing.T) {
 	}
 }
 
-// TestVersionsAreOrderedByBytes pins the sharp edge of the rule above, so that nobody has to
-// discover it in production.
+// TestTheVersionOrderWorksInBothDirections is the test the round 1 review asked for, and the
+// reason the version rule is not plain byte order any more.
 //
 // ADR 4 makes "monotonic per external_id" a promise the normalizer makes to this stage, and ADR 12
-// says what monotonic means for a string the format calls opaque: byte order, which is the only
-// order an opaque string has. A normalizer that spells its versions as bare decimal counters
-// therefore breaks the promise at the tenth change, because "10" sorts before "9", and this stage
-// holds the newer record back. The visible symptom is a Stale count that is not zero.
-func TestVersionsAreOrderedByBytes(t *testing.T) {
+// decision 1 says what a pipeline may read from that promise. It used to say "byte order", and
+// byte order puts "9" AFTER "10", which is the commonest spelling a real provider uses. In the
+// forward direction that only holds a newer record back, which is visible and safe. In the other
+// direction, the one this test exists for, an OLDER record supersedes a newer one, becomes the
+// head, and takes the scope that access is decided on with it, with nothing counted and nothing
+// raised. Both directions are here, because only one of them was.
+func TestTheVersionOrderWorksInBothDirections(t *testing.T) {
 	t.Parallel()
 	e := setup(t, pipeline.Options{})
 
-	// Zero padded, which is what a normalizer must do: byte order is version order.
+	// Zero padded, where byte order and number order agree.
 	e.mustDrain(tenantA, ev(entity, "009", listA))
 	if out := e.mustDrain(tenantA, ev(entity, "010", listA)); len(out.Records) != 1 {
 		t.Fatalf("a padded version 10 after 9 prepared %d records, want one", len(out.Records))
 	}
 
-	// Unpadded, which is the trap. Version 10 arrives after 9 and is held back.
-	other := "fake:task:unpadded"
-	e.mustDrain(tenantA, ev(other, "9", listA))
-	out := e.mustDrain(tenantA, ev(other, "10", listA))
-	if out.Stale != 1 || len(out.Records) != 0 {
-		t.Errorf("an unpadded version 10 after 9 prepared %d records and counted %d stale, want 0 and 1: "+
-			"the byte order rule is not what ADR 12 says", len(out.Records), out.Stale)
+	// Unpadded, forward: 9 then 10. Byte order calls the newer record stale; a number does not.
+	forward := "fake:task:forward"
+	e.mustDrain(tenantA, ev(forward, "9", listA))
+	up := e.mustDrain(tenantA, ev(forward, "10", listA))
+	if len(up.Records) != 1 || up.Stale != 0 {
+		t.Errorf("an unpadded version 10 after 9 prepared %d records and counted %d stale, want 1 and 0: "+
+			"a decimal counter is ordered by its number", len(up.Records), up.Stale)
 	}
+
+	// Unpadded, backward: 10 then 9, which is the dangerous direction and the one that was
+	// untested. The older record must be held back, not made the head.
+	backward := "fake:task:backward"
+	newer := e.mustDrain(tenantA, ev(backward, "10", listA)).Records[0]
+	down := e.mustDrain(tenantA, ev(backward, "9", listA))
+	if len(down.Records) != 0 || down.Stale != 1 {
+		t.Fatalf("an unpadded version 9 after 10 prepared %d records and counted %d stale, want 0 and 1: "+
+			"an older record took the head", len(down.Records), down.Stale)
+	}
+	wantHead(t, entityRows(e.ledgerRows(), backward), newer.ID)
+}
+
+// TestAReplayedDeadLetterNeverTakesTheHeadOrItsScope is the same rule in the shape the architecture
+// produces on purpose, and the exact reproduction the round 1 review posted.
+//
+// A dead letter replayed after a newer version has gone out (architecture 3.2, "Replay goes to the
+// back"), or a backfill running beside the live feed, arrives as an older version in a DIFFERENT
+// scope. Byte order said "9" is newer than "10", so the older record superseded the newer one,
+// became the head, and the scope access is decided on went from L1 back to L2, silently. What has
+// to be true is that the sink's live version and the scope on it both stay where the newer record
+// put them.
+func TestAReplayedDeadLetterNeverTakesTheHeadOrItsScope(t *testing.T) {
+	t.Parallel()
+	e := setup(t, pipeline.Options{})
+	newer := e.mustDrain(tenantA, ev(entity, "10", listA)).Records[0]
+
+	replay := e.mustDrain(tenantA, ev(entity, "9", listB))
+	if len(replay.Records) != 0 || replay.Stale != 1 {
+		t.Fatalf("the replayed older version prepared %d records and counted %d stale, want 0 and 1", len(replay.Records), replay.Stale)
+	}
+	rows := e.ledgerRows()
+	if len(rows) != 1 {
+		t.Fatalf("the ledger holds %d rows, want only the newer version: %+v", len(rows), rows)
+	}
+	wantHead(t, rows, newer.ID)
+	if rows[0].version != "10" {
+		t.Errorf("the head is version %q, want 10", rows[0].version)
+	}
+	if rows[0].scope != newer.Visibility.Scope {
+		t.Errorf("the head's scope is %q, want the newer record's %q: an older record took the scope "+
+			"that access is decided on", rows[0].scope, newer.Visibility.Scope)
+	}
+}
+
+// TestTwoVersionsThatCannotBeOrderedAreRefused is the other half of the new rule, and the reason
+// it can be safe at all.
+//
+// Two versions that are neither both decimal counters nor the same length carry no order anybody
+// can read. Guessing one is how the failure above happens, so the stage refuses instead: the head
+// does not move, nothing is delivered, the delivery is a dead letter naming both versions, and the
+// count says it happened.
+func TestTwoVersionsThatCannotBeOrderedAreRefused(t *testing.T) {
+	t.Parallel()
+	e := setup(t, pipeline.Options{})
+	first := e.mustDrain(tenantA, ev(entity, "r9", listA)).Records[0]
+
+	out, err := e.drain(tenantA, ev(entity, "r10", listB))
+	if !errors.Is(err, pipeline.ErrVersionNotComparable) {
+		t.Fatalf("draining a version no order can be read from returned %v, want ErrVersionNotComparable", err)
+	}
+	if !errors.Is(err, pipeline.ErrDeadLetter) {
+		t.Errorf("err = %v, want a dead letter: the same two strings will be just as unorderable next time", err)
+	}
+	if out.VersionUnordered != 1 {
+		t.Errorf("the refusal counted %d, want 1: ADR 12 asks for the refusal and the count", out.VersionUnordered)
+	}
+	if len(out.Records) != 0 {
+		t.Errorf("a failed Prepare returned %d records; nothing it decided may reach a sink", len(out.Records))
+	}
+	// The transaction rolled back, so the ledger is what it was before the refusal.
+	rows := e.ledgerRows()
+	if len(rows) != 1 {
+		t.Fatalf("the ledger holds %d rows, want only the first: %+v", len(rows), rows)
+	}
+	wantHead(t, rows, first.ID)
+}
+
+// entityRows narrows a ledger dump to one entity, for the tests that use several in one database.
+func entityRows(rows []ledgerRow, externalID string) []ledgerRow {
+	var out []ledgerRow
+	for _, r := range rows {
+		if r.externalID == externalID {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // TestAMoveWithAnUnchangedVersionSupersedesWhatItWas. Two records of one entity with the SAME
@@ -220,12 +309,24 @@ func TestAnEntityThatMovesBackIsDeadLetteredAndNotSkipped(t *testing.T) {
 	first := e.mustDrain(tenantA, ev(entity, "1", listA)).Records[0]
 	moved := e.mustDrain(tenantA, ev(entity, "1", listB)).Records[0]
 
-	_, err := e.drain(tenantA, ev(entity, "1", listA))
+	out, err := e.drain(tenantA, ev(entity, "1", listA))
 	if !errors.Is(err, pipeline.ErrScopeReturned) {
 		t.Fatalf("the move back gave %v, want ErrScopeReturned", err)
 	}
 	if !errors.Is(err, pipeline.ErrDeadLetter) {
 		t.Errorf("the move back is not marked as a dead letter: %v", err)
+	}
+	// ADR 4 decision 7 asks for the dead letter AND a count, because the dead letter tells an
+	// operator about one delivery and the count tells them whether it is happening at all. The
+	// count travels on Prepared beside the error, so a caller that dead-letters the row still logs
+	// it and B25 still adds it to a metric.
+	if out.ScopeReturned != 1 {
+		t.Errorf("the move back counted %d on Prepared, want 1: ADR 4 decision 7 asks for the count as well "+
+			"as the reason, and a Prepared{} beside the error loses it", out.ScopeReturned)
+	}
+	if len(out.Records) != 0 {
+		t.Errorf("a failed Prepare returned %d records; the transaction rolled back, so nothing it "+
+			"decided may reach a sink", len(out.Records))
 	}
 	// The dead letter has to name what an operator looks at: the entity, and the two scopes.
 	for _, want := range []string{entity, first.Visibility.Scope, moved.Visibility.Scope, string(tenantA)} {
@@ -239,6 +340,34 @@ func TestAnEntityThatMovesBackIsDeadLetteredAndNotSkipped(t *testing.T) {
 		t.Fatalf("the ledger holds %d rows, want the two from before the move back: %+v", len(rows), rows)
 	}
 	wantHead(t, rows, moved.ID)
+}
+
+// TestADeliveryThatDiesHalfwayStillReportsWhatItDecided. Prepare used to return Prepared{} beside
+// every error, so a delivery that refused one record threw away everything it had decided about
+// the others: the bot noise it dropped, the records the ledger already held, and the count ADR 4
+// decision 7 asks for by name. A caller logs one struct per delivery, and an empty one says the
+// delivery did nothing, which is false.
+func TestADeliveryThatDiesHalfwayStillReportsWhatItDecided(t *testing.T) {
+	t.Parallel()
+	e := setup(t, pipeline.Options{})
+	const other = "fake:task:2"
+	e.mustDrain(tenantA, ev(entity, "1", listA))
+	e.mustDrain(tenantA, ev(other, "1", listA))
+	e.mustDrain(tenantA, ev(other, "1", listB))
+
+	bot := ev("fake:task:bot", "1", listA)
+	bot.Automation = true
+	// In order: one the gate drops, one the ledger already holds, and one that moved back.
+	out, err := e.drain(tenantA, bot, ev(entity, "1", listA), ev(other, "1", listA))
+	if !errors.Is(err, pipeline.ErrScopeReturned) {
+		t.Fatalf("the delivery gave %v, want ErrScopeReturned from its third record", err)
+	}
+	if out.Automation != 1 || out.Skipped != 1 || out.ScopeReturned != 1 {
+		t.Errorf("the failed delivery reported %+v, want one dropped, one skipped and one scope returned", out)
+	}
+	if len(out.Records) != 0 {
+		t.Errorf("the failed delivery returned %d records, want none", len(out.Records))
+	}
 }
 
 // TestTheMoveBackRuleAlsoCatchesABCB. The rule is about the head's scope and not about the scope

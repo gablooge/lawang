@@ -4,28 +4,29 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
 )
 
-// Kind is a class of value the masker recognizes. The three of them are the conservative regex
+// secretKind is a class of value the masker recognizes. The three of them are the conservative regex
 // baseline of architecture section 7: an email address, a telephone number and an IBAN. The
 // strings are what the redaction_map.kind column holds, and its CHECK is the same closed set.
-type Kind string
+type secretKind string
 
 // The kinds the masker recognizes.
 const (
-	KindEmail Kind = "email"
-	KindPhone Kind = "phone"
-	KindIBAN  Kind = "iban"
+	kindEmail secretKind = "email"
+	kindPhone secretKind = "phone"
+	kindIBAN  secretKind = "iban"
 )
 
-// Secret is one value the masker found, and the unit the redaction map is keyed by: one token
+// foundSecret is one value the masker found, and the unit the redaction map is keyed by: one token
 // stands for one (kind, value) within one tenant, so the same address reads as the same
 // placeholder everywhere in that tenant's records.
-type Secret struct {
-	Kind  Kind
+type foundSecret struct {
+	Kind  secretKind
 	Value string
 }
 
@@ -62,11 +63,10 @@ var emailRe = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9
 //     such groups, each behind one separator ("0812-3456-7890", "(555) 010-1234",
 //     "555.010.1234").
 //
-// The grouped form insists on a separator between every group, which is what keeps dotted
-// quads, dates and long bare digit runs out: 192.168.1.100 has no group of three or four digits
-// after the second dot, 2026-09-21 has two-digit groups, and 1752064245000 has no separator at
-// all. A bare run of digits is never a phone number here, whatever its length, because an id, a
-// timestamp and an amount are all bare runs of digits too.
+// The pattern is the shape only, and it is deliberately loose: a bare run of digits is never a
+// phone number here, whatever its length (an id, an epoch and an amount are bare runs of digits
+// too), but everything else is left to validPhone, which is where the rules that keep an address,
+// a version and a date out actually live. Read that function before trusting this one.
 var phoneRe = regexp.MustCompile(
 	`\+[1-9][0-9]{0,3}(?:[ .()\-]{0,2}[0-9]{2,4}){2,5}` +
 		`|\(?[0-9]{3,4}\)?[ .\-][0-9]{3,4}[ .\-][0-9]{3,4}(?:[ .\-][0-9]{2,4})?`)
@@ -83,18 +83,18 @@ var ibanRe = regexp.MustCompile(`[A-Z]{2}[0-9]{2}(?: [A-Z0-9]{4}){2,7}(?: [A-Z0-
 // span is one stretch of a string that will be replaced.
 type span struct {
 	start, end int
-	secret     Secret
+	secret     foundSecret
 }
 
-// Scan is one string together with everything the masker found in it. Finding and replacing are
-// two steps because the token that replaces a value comes from the database (see redactor): the
+// textScan is one string together with everything the masker found in it. Finding and replacing
+// are two steps because the token that replaces a value comes from the database (see redactor): the
 // pure part is here and is tested on its own, with no database in sight.
-type Scan struct {
+type textScan struct {
 	text  string
 	spans []span
 }
 
-// Find returns what the masker recognizes in text.
+// findSecrets returns what the masker recognizes in text.
 //
 // Overlaps are resolved by taking the match that starts earliest. That is what keeps the digit
 // groups of an IBAN from also being read as a telephone number, and it holds whatever order the
@@ -104,15 +104,15 @@ type Scan struct {
 // (email, then IBAN, then phone), which is why the sort is stable. No input is known that produces
 // one: an address and an account number begin with different characters, and where one pattern's
 // match would begin where another's does, the boundary rule has already refused it.
-func Find(text string) Scan {
+func findSecrets(text string) textScan {
 	var found []span
 	// An address is not boundary checked, because the contexts it hides in end in exactly the
 	// characters a boundary check would refuse: the slash of a URL path and the angle bracket of a
 	// display name. Its own character classes already keep it from starting inside a word, since
 	// the local part is greedy leftwards.
-	found = appendMatches(found, text, emailRe, KindEmail, nil, false)
-	found = appendMatches(found, text, ibanRe, KindIBAN, validIBAN, true)
-	found = appendMatches(found, text, phoneRe, KindPhone, validPhone, true)
+	found = appendMatches(found, text, emailRe, kindEmail, nil, false)
+	found = appendMatches(found, text, ibanRe, kindIBAN, validIBAN, true)
+	found = appendMatches(found, text, phoneRe, kindPhone, validPhone, true)
 	sort.SliceStable(found, func(i, j int) bool { return found[i].start < found[j].start })
 	kept := make([]span, 0, len(found))
 	end := 0
@@ -123,16 +123,16 @@ func Find(text string) Scan {
 		kept = append(kept, s)
 		end = s.end
 	}
-	return Scan{text: text, spans: kept}
+	return textScan{text: text, spans: kept}
 }
 
 // appendMatches adds every match of re that ok accepts, with the boundary rule applied when
 // bounded is set.
-func appendMatches(dst []span, text string, re *regexp.Regexp, kind Kind, ok func(string) bool, bounded bool) []span {
+func appendMatches(dst []span, text string, re *regexp.Regexp, kind secretKind, ok func(string) bool, bounded bool) []span {
 	for _, m := range re.FindAllStringIndex(text, -1) {
 		v := text[m[0]:m[1]]
 		// A value longer than the redaction map can store is not one of the three things the
-		// masker knows, and taking it would leave a value Apply has no token for.
+		// masker knows, and taking it would leave a value apply has no token for.
 		if len(v) > maxSecretBytes {
 			continue
 		}
@@ -142,7 +142,7 @@ func appendMatches(dst []span, text string, re *regexp.Regexp, kind Kind, ok fun
 		if ok != nil && !ok(v) {
 			continue
 		}
-		dst = append(dst, span{start: m[0], end: m[1], secret: Secret{Kind: kind, Value: v}})
+		dst = append(dst, span{start: m[0], end: m[1], secret: foundSecret{Kind: kind, Value: v}})
 	}
 	return dst
 }
@@ -179,21 +179,77 @@ func isAlnum(c byte) bool {
 	return isDigit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
-// validPhone is the digit count the pattern cannot express. E.164 allows at most 15 digits, and
-// nothing shorter than eight is a number somebody could be called on.
+// validPhone holds every rule the pattern cannot express. It is the whole of the phone rule, and
+// the pattern above only narrows what it has to look at.
+//
+// A leading plus is a country code, and a country code is what makes a run of grouped digits a
+// telephone number rather than something else that is written the same way. So the international
+// form needs nothing but E.164's own bounds: at most 15 digits, and at least eight, because
+// nothing shorter is a number somebody could be called on.
+//
+// The national form has no country code, so it has to be told apart from the other things people
+// write as groups of digits, and getting that wrong is expensive in one direction: an over-reach
+// replaces somebody's text with a placeholder, the sink never sees the original and the value is
+// written into redaction_map, which the migration calls personal data by construction. A miss only
+// costs a number reaching the sink. So the national form is narrow on purpose:
+//
+//   - nine to fifteen digits, since eight grouped digits is a date as often as a number;
+//   - EXACTLY THREE groups. Four groups is a dotted quad (192.168.100.200, 172.217.169.110) or a
+//     build number, and nobody writes a national telephone number in four groups;
+//   - AT LEAST ONE group of exactly four digits. Every national spelling has one (0812-3456-7890,
+//     (555) 010-1234, 555.010.1234), and three groups of three digits is an address
+//     (100.200.300), an invoice total (123.456.789) or a version;
+//   - a FIRST GROUP THAT IS NOT A YEAR. 2024.100.200 and 2026-0921-1234 have the shape of a
+//     number and read as a release and a reference; no national numbering plan starts an area
+//     code with 19 or 20 and four digits.
+//
+// What this gives up is a real number whose first group happens to read as a year, which reaches
+// the sink unmasked. ADR 12 takes that trade explicitly: the masker is a conservative baseline and
+// what it misses is recoverable, while what it destroys is not.
 func validPhone(s string) bool {
+	groups := digitGroups(s)
 	digits := 0
-	for i := range len(s) {
-		if isDigit(s[i]) {
-			digits++
-		}
+	for _, g := range groups {
+		digits += len(g)
 	}
 	if strings.HasPrefix(s, "+") {
 		return digits >= 8 && digits <= 15
 	}
-	// Without a country code the number has to be longer before it is worth believing: eight
-	// grouped digits is a date as often as it is a telephone number.
-	return digits >= 9 && digits <= 15
+	if digits < 9 || digits > 15 {
+		return false
+	}
+	if len(groups) != 3 {
+		return false
+	}
+	if !slices.ContainsFunc(groups, func(g string) bool { return len(g) == 4 }) {
+		return false
+	}
+	return !looksLikeAYear(groups[0])
+}
+
+// digitGroups is the runs of decimal digits in s, in order. Everything between them is a
+// separator, which is the only thing the phone patterns put there.
+func digitGroups(s string) []string {
+	var out []string
+	for i := 0; i < len(s); {
+		if !isDigit(s[i]) {
+			i++
+			continue
+		}
+		j := i
+		for j < len(s) && isDigit(s[j]) {
+			j++
+		}
+		out = append(out, s[i:j])
+		i = j
+	}
+	return out
+}
+
+// looksLikeAYear reports whether g is four digits that read as a year of this era (1900 to 2099).
+// A date, a release and a reference number all begin with one; a national area code does not.
+func looksLikeAYear(g string) bool {
+	return len(g) == 4 && (strings.HasPrefix(g, "19") || strings.HasPrefix(g, "20"))
 }
 
 // validIBAN is the ISO 7064 mod-97 check, which is what makes the masker's IBAN rule conservative:
@@ -222,11 +278,11 @@ func validIBAN(s string) bool {
 	return rem == 1
 }
 
-// Secrets is every distinct value the scan found, in the order they first appear. The caller maps
-// each one to a token and hands the map back to Apply.
-func (s Scan) Secrets() []Secret {
-	seen := make(map[Secret]struct{}, len(s.spans))
-	out := make([]Secret, 0, len(s.spans))
+// secrets is every distinct value the scan found, in the order they first appear. The caller maps
+// each one to a token and hands the map back to apply.
+func (s textScan) secrets() []foundSecret {
+	seen := make(map[foundSecret]struct{}, len(s.spans))
+	out := make([]foundSecret, 0, len(s.spans))
 	for _, sp := range s.spans {
 		if _, dup := seen[sp.secret]; dup {
 			continue
@@ -237,12 +293,12 @@ func (s Scan) Secrets() []Secret {
 	return out
 }
 
-// Apply returns the text with every value replaced by its token, refusing a result longer than
+// apply returns the text with every value replaced by its token, refusing a result longer than
 // maxChars characters (the record format's limit for the field).
 //
 // A missing token is an error and never a value left in place: a masker that silently passed
 // something through would be worse than no masker, because the record would look masked.
-func (s Scan) Apply(field string, tokens map[Secret]string, maxChars int) (string, error) {
+func (s textScan) apply(field string, tokens map[foundSecret]string, maxChars int) (string, error) {
 	if len(s.spans) == 0 {
 		return s.text, nil
 	}

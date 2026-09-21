@@ -81,6 +81,19 @@ var ErrNotSealedForTenant = errors.New("pipeline: the record was not sealed for 
 // the entity at the source. ADR 4 says what they do then.
 var ErrScopeReturned = errors.New("pipeline: a prepared record id has come back in a different scope")
 
+// ErrVersionNotComparable reports two versions of one entity that this stage cannot order.
+//
+// ADR 4 makes "monotonic per external_id" a promise the provider's normalizer makes to the
+// pipeline, and ADR 12 decision 1 says what a pipeline may read from that promise: a number from
+// two decimal counters, byte order from two versions of equal length, and nothing at all from two
+// strings that are neither. Nothing is what this reports.
+//
+// It is a dead letter because guessing is the failure this whole item exists to prevent: the wrong
+// guess lets an older record supersede a newer one at the sink and take the scope that access is
+// decided on with it. The head does not move, nothing is delivered, the error names both versions,
+// and the fix is on the normalizer, which has to spell its versions so that an order can be read.
+var ErrVersionNotComparable = errors.New("pipeline: the versions of this entity carry no order")
+
 // ErrExternalIDTooLong reports an entity whose external id does not fit the ledger's chain key.
 //
 // The record format bounds an external id in characters (1,024) and the ledger has to bound it in
@@ -162,8 +175,15 @@ type Normalized struct {
 
 // Prepared is what Prepare decided. Records is what the caller hands to the sink, in order; the
 // counters are everything else that happened.
+//
+// When Prepare returns an error, Records is nil and the counters hold what the stage had already
+// decided before it stopped. A delivery that dies halfway still dropped automation noise, skipped
+// records the ledger held and refused whatever it refused, and a caller that logged Prepared{}
+// instead would lose all of it, including the one count ADR 4 decision 7 asks for by name.
 type Prepared struct {
-	// Records are sealed, linked and masked, in the order they must be delivered.
+	// Records are sealed, linked and masked, in the order they must be delivered. It is nil
+	// whenever Prepare returned an error: the caller rolls the transaction back, so nothing this
+	// call decided may reach a sink.
 	Records []record.Record
 	// Skipped counts the records whose id the ledger already held: a re-drain, a backfill that
 	// overlaps the live feed, or a provider that sent the same version twice.
@@ -174,6 +194,19 @@ type Prepared struct {
 	// commonest cause is a replayed dead letter, which architecture 3.2 sends to the back of the
 	// queue on purpose.
 	Stale int
+	// ScopeReturned counts the records refused by the A, B, back to A rule (ErrScopeReturned).
+	// ADR 4 decision 7 asks for the dead letter AND a count, because the dead letter tells an
+	// operator about one delivery and the count tells them whether it is happening at all. B25
+	// reads it into a Prometheus counter; until then the caller logs it.
+	//
+	// It can only ever be 1, because the refusal stops the delivery, and it is a counter rather
+	// than a flag so that a caller adds it to a metric without asking which error it holds.
+	ScopeReturned int
+	// VersionUnordered counts the records refused because this stage could not order their
+	// version against the entity's newest (ErrVersionNotComparable). Like ScopeReturned it can
+	// only be 1, and like ScopeReturned it is a number an operator watches: a normalizer whose
+	// versions cannot be ordered shows up here on the first entity that changes twice.
+	VersionUnordered int
 	// Automation and Degraded are carried over from Normalize, so that one struct is the whole
 	// account of one delivery and the caller logs one thing.
 	Automation int
@@ -303,9 +336,9 @@ func (p *Pipeline) Prepare(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, n 
 	out := Prepared{Automation: n.Automation, Degraded: n.Degraded}
 	for _, r := range n.records {
 		linked, what, err := l.admit(ctx, r)
-		if err != nil {
-			return Prepared{}, err
-		}
+		// The decision is counted before the error is looked at, because a refusal IS a decision
+		// and ADR 4 decision 7 asks for it to be counted. admitNone is the ledger not answering at
+		// all, and counts as nothing.
 		switch what {
 		case admitPrepare:
 			out.Records = append(out.Records, linked)
@@ -313,17 +346,40 @@ func (p *Pipeline) Prepare(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, n 
 			out.Skipped++
 		case admitStale:
 			out.Stale++
+		case admitScopeReturned:
+			out.ScopeReturned++
+		case admitVersionUnordered:
+			out.VersionUnordered++
+		case admitNone:
+		}
+		if err != nil {
+			return failed(out), err
 		}
 	}
 	if err := maskRecords(ctx, queriesOn(tx), tenant, out.Records); err != nil {
-		// Masking is the last thing that happens to a record, and everything that can go wrong in
-		// it is about the record and not about the database: a field that no longer fits once the
-		// placeholders are in, or a value the map could not take. Retrying the same bytes gives
-		// the same answer, so this is a dead letter and the fix is on the normalizer.
-		if errors.Is(err, ErrMaskedTooLong) {
-			return Prepared{}, fmt.Errorf("%w: %w", ErrDeadLetter, err)
+		// Two of the things that can go wrong in masking are about the record and not about the
+		// database: a field that no longer fits once the placeholders are in, and more distinct
+		// values than one delivery may map. Retrying the same bytes gives the same answer, so
+		// those are dead letters and the fix is on the normalizer.
+		//
+		// Everything else here IS the database (a cancelled context, a lost connection, a refused
+		// write), and classifying that as a dead letter would destroy a delivery that the next
+		// attempt would have carried. So the test for the two is by name, and everything else
+		// walks the retry ladder.
+		if errors.Is(err, ErrMaskedTooLong) || errors.Is(err, ErrTooManySecrets) {
+			return failed(out), fmt.Errorf("%w: %w", ErrDeadLetter, err)
 		}
-		return Prepared{}, err
+		return failed(out), err
 	}
 	return out, nil
+}
+
+// failed is what Prepare returns beside an error: the counters it had reached, and no records.
+//
+// The caller rolls the transaction back, so nothing this call linked may be delivered; the
+// counters are still the truth about what the stage decided, and they are what a caller logs and
+// what B25 adds to a metric.
+func failed(out Prepared) Prepared {
+	out.Records = nil
+	return out
 }

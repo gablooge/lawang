@@ -581,15 +581,19 @@ A **new version is a new record.** Edits never overwrite; the new record carries
 id of the version it replaces. Supersede links only point forward, so a late-arriving old version
 can never claim to replace a newer one.
 
-What "forward" is decided by is [ADR 12](adr/0012-ledger-supersede-masking.md): the provider's
-`version` compared **byte by byte**, which is what ADR 4's "monotonic per `external_id`" means for
-a string the format otherwise calls opaque, and for two records that carry the same version,
-arrival order, which the outbox makes a real order. A record older than its entity's newest is
-neither linked nor delivered: it is held back and counted, because the sink already has something
-newer and an unlinked older record would leave it holding two live versions of one entity. A
-normalizer therefore spells a version so that byte order is version order (an epoch in
-milliseconds, an RFC 3339 timestamp, a fixed-width counter), never as a bare decimal counter, where
-`"10"` sorts before `"9"`.
+What "forward" is decided by is [ADR 12](adr/0012-ledger-supersede-masking.md), and it is three
+rules rather than one, because ADR 4 calls `version` opaque to a sink and "monotonic per
+`external_id`" has to mean something a pipeline can check. **Two runs of decimal digits are ordered
+by the number they spell** (an unpadded counter is what most providers send, and byte order puts
+`"9"` after `"10"`). **Two versions of equal length are ordered by their bytes** (a ULID, an epoch
+in milliseconds, an RFC 3339 timestamp, a padded counter: every encoding whose byte order is its
+value order is fixed width while it is in use). **Anything else carries no order and the delivery
+is refused by name**, because guessing one is how an older record supersedes a newer one at the
+sink and takes the scope access is decided on with it. For two records that carry the same version
+there is only arrival order, and that decides nothing else. A record older than its entity's newest
+is neither linked nor delivered: it is held back and counted, because the sink already has
+something newer and an unlinked older record would leave it holding two live versions of one
+entity.
 
 The chain is kept in the **ledger** (`record_ledger`), one row per record id that has been prepared
 for delivery, with exactly one row per `(tenant, provider, external_id)` marked as the entity's

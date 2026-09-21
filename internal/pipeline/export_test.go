@@ -24,6 +24,49 @@ var (
 	ValidPhone = validPhone
 )
 
+// CompareVersions is the version order of ADR 12 decision 1, exported for the table test that
+// pins it. No caller in the program needs it: the ledger is the only thing that orders a version,
+// and it does so with the entity's head in hand.
+var CompareVersions = compareVersions
+
+// The masker's pure half, reachable from the external test package and from nowhere else.
+//
+// It is not exported from the package itself, and that is the point: findSecrets(r.Text).secrets()
+// is a one-line way to get every address, number and account in a record in the clear, outside the
+// redaction map, with no tenant and no audit trail, which is the one thing this package exists to
+// prevent. A later item reaching for it in a log line or a metric label would undo the masking
+// without touching a file the masker owns. The tests need it because the finding half is worth
+// testing with no database in sight, so it lives here, the way RecordsOf, ValidIBAN, ValidPhone
+// and EntityKeys already do.
+type (
+	// Secret is one value the masker found.
+	Secret = foundSecret
+	// Kind is the class of a found value.
+	Kind = secretKind
+)
+
+// The kinds, under the names the tests read them by.
+const (
+	KindEmail = kindEmail
+	KindPhone = kindPhone
+	KindIBAN  = kindIBAN
+)
+
+// Scan is one string and everything the masker found in it.
+type Scan struct{ inner textScan }
+
+// Find is findSecrets.
+func Find(text string) Scan { return Scan{findSecrets(text)} }
+
+// Secrets is every distinct value the scan found, in the order they first appear.
+func (s Scan) Secrets() []Secret { return s.inner.secrets() }
+
+// Apply is the replacement half: every value swapped for its token, refusing a result longer than
+// the field allows.
+func (s Scan) Apply(field string, tokens map[Secret]string, maxChars int) (string, error) {
+	return s.inner.apply(field, tokens, maxChars)
+}
+
 // EntityKeys is the order the entity locks of one delivery are taken in. It is exported for the
 // test that pins that order, because a deadlock is what a wrong order costs and a deadlock is not
 // something a test can produce on demand.

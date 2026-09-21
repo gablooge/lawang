@@ -40,19 +40,50 @@ var (
 		"555.010.1234",      // national, dots
 	}
 	keptPhones = []string{
-		// Refused by the pattern.
+		// Refused by the pattern, which needs a separator between groups and three digits in the
+		// first group.
 		"1752064245000",     // an epoch in milliseconds: digits, no separators
-		"192.168.1.100",     // a dotted quad: no group of four digits
+		"192.168.1.100",     // a dotted quad whose third octet is one digit
 		"2026-09-21",        // a date: eight digits is not enough
 		"1.0.0",             // a version
 		"1752064245.000200", // a Slack timestamp
 		"86a1xyz",           // a ClickUp task id
+
 		// Refused by the digit count, which the pattern cannot express. Without these three the
 		// rule would have no evidence outside its own unit test: every fixture above is already
 		// refused a step earlier, so a masker that counted nothing would still pass.
 		"+4420794",            // seven digits behind a country code
 		"+4420794609581234",   // sixteen, one over what E.164 allows
 		"1234 5678 9012 3456", // sixteen again, written as a person writes a number
+
+		// IPv4 addresses, every one of which the pattern matches and validPhone refuses for having
+		// four groups. These are the class the round 1 review found being replaced by a phone
+		// token: for a connector whose first providers are a task tracker and a chat tool, "prod
+		// is at 172.217.169.110" is ordinary content, and a masked address is gone from the sink
+		// for good while the value sits in redaction_map.
+		"192.168.100.200",      // every octet three digits
+		"172.217.169.110",      // a public address, every octet three digits
+		"198.051.100.042",      // zero-padded octets
+		"192.168.100.200:8080", // an address and a port
+		"10.0.0.1",             // the other end of the range, refused by the pattern
+
+		// Three groups of three digits, which is not how anybody writes a telephone number and is
+		// how people write plenty of other things.
+		"100.200.300", // a commit or a build
+		"123.456.789", // an invoice total written the Indonesian way
+
+		// A first group that reads as a year: a date, a release, a reference.
+		"2024.100.200",   // a version string
+		"2026-0921-1234", // an order reference
+		"1999-0102-0304", // the same shape in the other century
+
+		// The classes the round 1 review asked for by name, which a pattern this shape has to be
+		// held against: an order id, a version, a hash and a timestamp.
+		"ORD-2026-0001-0042",   // an order id
+		"v2026.100.200",        // a version with a prefix
+		"e3b0c44298fc1c149afb", // a hash
+		"2026-09-21T10:30:00Z", // a timestamp
+		"1758448800.123456",    // a timestamp with microseconds
 	}
 	maskedIBANs = []string{
 		"GB82 WEST 1234 5698 7654 32", // with spaces

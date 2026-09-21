@@ -58,10 +58,64 @@ func TestTheRedactionMapStaysHereAndTheTokenGoesOut(t *testing.T) {
 	if !strings.Contains(out.Records[0].Text, rows[0].token) {
 		t.Errorf("the record does not carry the token %q: %q", rows[0].token, out.Records[0].Text)
 	}
-	// The token says nothing about the value. A token derived from the address would let a sink
-	// confirm a guessed address by computing its token, which is the fact masking withholds.
+	// The token says nothing about the value. This one only catches a token that quotes it;
+	// TestMintingOneValueTwiceGivesTwoTokens is the test of the property itself.
 	if strings.Contains(rows[0].token, "jane") || strings.Contains(rows[0].token, "example") {
 		t.Errorf("the token quotes the value it stands for: %q", rows[0].token)
+	}
+}
+
+// TestMintingOneValueTwiceGivesTwoTokens is ADR 12 decision 5's first bullet, pinned as the
+// property it actually is.
+//
+// The bullet says the placeholder is "a ULID, not a hash of the value", because a token that any
+// sink could compute from a guess would hand it an oracle: guess an address, compute its token,
+// look for that token in the records it holds, and the fact masking withholds (that this address
+// appears in this tenant's records) comes straight back. Salting with the tenant does not close
+// it, because a tenant id is not a secret and every sink holds one.
+//
+// Asserting that the token does not quote the value cannot see any of that: a digest quotes
+// nothing. The distinguishing fact is that the token must not be a function of its inputs AT ALL,
+// so the test mints the same value twice, from nothing but the same inputs, and requires two
+// different answers. The redaction map is emptied in between, the way B25's retention sweep will
+// empty it, so the second minting has nothing to look up and nothing but the minting decides.
+//
+// Any digest of (value), (tenant, value) or (tenant, kind, value) fails this. A random placeholder
+// passes it.
+func TestMintingOneValueTwiceGivesTwoTokens(t *testing.T) {
+	t.Parallel()
+	e := setup(t, pipeline.Options{})
+	const addr = "jane.doe@example.test"
+
+	first := ev(entity, "1", listA)
+	first.Text = "write to " + addr
+	a := e.mustDrain(tenantA, first).Records[0]
+	rows := e.redactionRows()
+	if len(rows) != 1 {
+		t.Fatalf("the map holds %d rows after one delivery, want one: %+v", len(rows), rows)
+	}
+	before := rows[0].token
+
+	// Take the mapping away, as retention does. Nothing about the address, the tenant or the kind
+	// has changed; the only thing gone is the row that remembers the answer.
+	e.exec(`DELETE FROM lawang.redaction_map`)
+
+	second := ev("fake:task:2", "1", listA)
+	second.Text = "write to " + addr
+	b := e.mustDrain(tenantA, second).Records[0]
+	rows = e.redactionRows()
+	if len(rows) != 1 {
+		t.Fatalf("the map holds %d rows after the second delivery, want one: %+v", len(rows), rows)
+	}
+	if rows[0].token == before {
+		t.Errorf("minting %q twice gave the same token %q: the placeholder is a function of its inputs, "+
+			"which is the offline oracle ADR 12 decision 5 exists to prevent", addr, before)
+	}
+	if !strings.Contains(a.Text, before) || !strings.Contains(b.Text, rows[0].token) {
+		t.Fatalf("a record does not carry the token its delivery minted: %q, then %q", a.Text, b.Text)
+	}
+	if a.Text == b.Text {
+		t.Errorf("two mintings of one address produced the same masked text: %q", a.Text)
 	}
 }
 

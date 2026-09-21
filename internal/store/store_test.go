@@ -703,6 +703,83 @@ func TestEveryTableForcesRowLevelSecurity(t *testing.T) {
 	}
 }
 
+// TestHelperRolesHoldOnlyTheGrantsTheDesignNames is the grant half of the test above, and it
+// guards every future migration the same way.
+//
+// Row-level security decides which rows a role may touch. It decides nothing about which TABLES a
+// role may touch, and that is a grant, which no test watched until now. The two helper roles exist
+// to do one narrow thing each with one table each: lawang_resolver reads six columns of
+// subscriptions across tenants, because deriving the tenant is its whole job, and lawang_worker
+// reads and updates a few columns of outbox. Every other table in the schema must be closed to
+// both of them, and redaction_map is the sharpest case: it holds, by construction, the personal
+// data that masking took out of records, and one grant on it would hand whoever holds a helper
+// role every tenant's values at once.
+//
+// So the whole privilege surface of both roles is listed here, and anything that is not on the
+// list fails. A migration that grants something new has to say so in this table, where a reviewer
+// sees it, rather than passing every test in the repository in silence.
+func TestHelperRolesHoldOnlyTheGrantsTheDesignNames(t *testing.T) {
+	// role, table, privilege. Both grants in the schema today are column-level, and
+	// has_any_column_privilege is what sees one, so a grant cannot hide behind a column list.
+	allowed := map[string]string{
+		"lawang_resolver/subscriptions/SELECT": "deriving the tenant is the resolver's whole job, six columns, read only (migration 00003)",
+		"lawang_worker/outbox/SELECT":          "the worker claims and leases rows (migration 00002)",
+		"lawang_worker/outbox/UPDATE":          "attempts, lease_until and lease_token (migration 00002)",
+	}
+
+	db := open(t, "")
+	ctx := testCtx(t)
+	err := db.Tx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT r.rolname, c.relname, p.priv
+			  FROM pg_class c
+			  JOIN pg_namespace n ON n.oid = c.relnamespace
+			 CROSS JOIN (VALUES ('lawang_resolver'), ('lawang_worker')) AS r(rolname)
+			 CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'),
+			                    ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) AS p(priv)
+			 WHERE n.nspname = $1
+			   AND c.relkind IN ('r', 'p')
+			   -- DELETE, TRUNCATE and TRIGGER exist only on a whole table, which is why the two
+			   -- tests are separate rather than one.
+			   AND (has_table_privilege(r.rolname, c.oid, p.priv)
+			        OR (p.priv IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
+			            AND has_any_column_privilege(r.rolname, c.oid, p.priv)))
+			 ORDER BY r.rolname, c.relname, p.priv`, store.Schema)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		held := map[string]bool{}
+		for rows.Next() {
+			var role, table, priv string
+			if err := rows.Scan(&role, &table, &priv); err != nil {
+				return err
+			}
+			key := role + "/" + table + "/" + priv
+			held[key] = true
+			if _, ok := allowed[key]; !ok {
+				t.Errorf("%s may %s %s, and nothing in the design says it should: either take the grant "+
+					"away or add it to this test with the reason", role, priv, table)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// The other direction, so that a migration which quietly drops a grant the program needs
+		// is caught here rather than at runtime, and so that a query returning nothing at all
+		// cannot pass this test.
+		for key, why := range allowed {
+			if !held[key] {
+				t.Errorf("%s is not granted: %s", key, why)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func assertRLSViolation(t *testing.T, err error) {
 	t.Helper()
 	var pgErr *pgconn.PgError
