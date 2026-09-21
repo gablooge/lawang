@@ -104,8 +104,9 @@ func Variables() []Variable {
 				"(HubSpot v3) is checked against this, and Host, X-Forwarded-Host and " +
 				"X-Forwarded-Proto are all chosen by whoever sent the request, so building the " +
 				"signed URL from them would let a sender pick part of what it signed.",
-			Default: "none. The edge still serves, and a provider whose signature covers the URL " +
-				"refuses every delivery rather than verify against a URL Lawang guessed.",
+			Default: "none. serve refuses to start when a registered provider's signature covers " +
+				"the URL, because every one of its deliveries would be answered 401. With no such " +
+				"provider registered it starts and serves as usual.",
 		},
 		{
 			Name:    "LAWANG_LOG_LEVEL",

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gablooge/lawang/internal/config"
+	"github.com/gablooge/lawang/internal/testdb"
 )
 
 func noEnv(string) string { return "" }
@@ -227,10 +228,13 @@ func TestRunServeExitsZeroAfterACleanShutdown(t *testing.T) {
 	//
 	// It cannot collide (loopback, ephemeral port) and it cannot hang: every wait below is bounded,
 	// and the cleanup cancels the role whatever happened.
+	// serve opens the database before it binds a socket, because everything that can refuse to
+	// start should do so before a provider can reach it.
+	tdb := testdb.New(t)
 	getenv := func(k string) string {
 		switch k {
-		case "LAWANG_ENV":
-			return "development"
+		case "LAWANG_DATABASE_URL":
+			return tdb.URL
 		case "LAWANG_LISTEN_ADDR":
 			return "127.0.0.1:0"
 		case "LAWANG_LOG_FORMAT":
@@ -377,12 +381,15 @@ func TestRunNeverPrintsTheListenAddress(t *testing.T) {
 		{"host that does not resolve", "leakhost.invalid:8080", "LAWANG_LISTEN_ADDR", []string{"leakhost"}},
 		{"address of no local interface", "192.0.2.77:8080", "LAWANG_LISTEN_ADDR", []string{"192.0.2.77"}},
 	}
+	// serve opens the database before it binds a socket, so the two cases that get as far as the
+	// listener need one that opens. The three that Load refuses never reach it.
+	tdb := testdb.New(t)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			getenv := func(k string) string {
 				switch k {
 				case "LAWANG_DATABASE_URL":
-					return "postgres://app@db:5432/lawang"
+					return tdb.URL
 				case "LAWANG_LISTEN_ADDR":
 					return tc.addr
 				}
@@ -421,9 +428,12 @@ func TestServeSaysWhenTheAddressIsInUse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	err = serve(ctx, config.Config{ListenAddr: ln.Addr().String()}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// A database that opens, because serve refuses on that first: the failure under test is the
+	// listener's.
+	cfg := config.Config{DatabaseURL: testdb.New(t).URL, ListenAddr: ln.Addr().String()}
+	err = serve(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("serve on a taken port returned %v, want EADDRINUSE", err)
 	}
@@ -518,7 +528,11 @@ func TestServeAnswersHealthzAndShutsDownCleanly(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serveOn(ctx, ln, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
+	handler, err := newHandler(emptyRegistry(t), stubHub{}, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { done <- serveOn(ctx, ln, handler, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
 
 	resp, err := http.Get("http://" + ln.Addr().String() + "/healthz")
 	if err != nil {

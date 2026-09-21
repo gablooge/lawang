@@ -40,6 +40,26 @@ VALUES (@id, @tenant_id::text, @provider, @delivery_id, @ordering_key::text, @ra
 ON CONFLICT (tenant_id, delivery_id) DO NOTHING
 RETURNING id;
 
+-- name: Park :one
+-- Stores a delivery nobody can be shown to own, under the sentinel tenant, already finished.
+--
+-- It takes no advisory lock, and that is not an omission. The lock exists to keep queue order and
+-- the head marker within one ordering key, and a parked row has neither: it is inserted 'dead' and
+-- is_head false, so nothing ever claims it, nothing waits behind it, and the "is the key
+-- unfinished?" test that Accept and Replay make (which counts only pending and prepared rows)
+-- cannot see it. Its ordering key is its own delivery id, so no two parked rows share a key and a
+-- flood of unattributable deliveries queues on nothing at all.
+--
+-- A repeated delivery returns no row, exactly as Accept does: the unique key is
+-- (tenant_id, delivery_id), and the sentinel is one tenant, so re-sending an unowned delivery
+-- parks it once.
+INSERT INTO outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body,
+                    state, is_head, dead_reason, finished_at)
+VALUES (@id, @tenant_id::text, @provider, @delivery_id::text, @delivery_id::text, @raw_body,
+        'dead', false, @dead_reason, now())
+ON CONFLICT (tenant_id, delivery_id) DO NOTHING
+RETURNING id;
+
 -- name: Claim :many
 -- Runs as the worker role, across tenants. Only the HEAD of an ordering key is ever eligible, and
 -- being the head is a stored column (is_head), so this statement walks outbox_due_heads from its

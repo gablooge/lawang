@@ -19,7 +19,7 @@ import (
 func TestTheServerTimeoutsAreSetAndOrdered(t *testing.T) {
 	t.Parallel()
 
-	srv := newServer(newMux())
+	srv := newServer(testHandler(t))
 	switch {
 	case srv.ReadHeaderTimeout <= 0:
 		t.Fatal("ReadHeaderTimeout is not set: a client could dribble headers forever")
@@ -63,7 +63,7 @@ func TestASlowClientIsCutOff(t *testing.T) {
 			if err != nil {
 				t.Fatalf("listen: %v", err)
 			}
-			srv := newServer(newMux())
+			srv := newServer(testHandler(t))
 			srv.ReadHeaderTimeout = 100 * time.Millisecond
 			srv.ReadTimeout = 200 * time.Millisecond
 			go func() { _ = srv.Serve(ln) }()
@@ -103,13 +103,13 @@ func TestASlowClientIsCutOff(t *testing.T) {
 	}
 }
 
-// TestHealthzStillAnswers keeps the refactor of serveOn honest: the mux newServer is handed is the
-// one that serves.
+// TestHealthzStillAnswers keeps the wiring honest: /healthz is an ingress.Route now, behind the
+// same path guard as the webhook endpoint, and the handler ingress.New returns is the one served.
 func TestHealthzStillAnswers(t *testing.T) {
 	t.Parallel()
 
 	rec := httptest.NewRecorder()
-	newMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	testHandler(t).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
 		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
 	}
