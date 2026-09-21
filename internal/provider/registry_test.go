@@ -90,6 +90,36 @@ func (s *shifty) Normalize(_ provider.Hydrated, _ provider.Change) ([]record.Rec
 
 func (s *shifty) VersionOrder() provider.VersionOrder { return provider.VersionOrderDecimal }
 
+// TestAVersionOrderNamesItselfAndKnowsWhatItIs covers the two methods an operator's refusal
+// message and the registry's own check are built on.
+//
+// Valid is the check, and the thing worth pinning is that it is a list of what IS known and not a
+// test for the zero value: a stray conversion (a value from a later program, a cast of an int) has
+// to be as invalid as VersionOrderUnset, or a provider could declare one and be ordered by the
+// default branch of a switch. String is what a start-up refusal and a dead letter quote, so an
+// unknown value has to say what it was rather than say nothing.
+func TestAVersionOrderNamesItselfAndKnowsWhatItIs(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		order provider.VersionOrder
+		valid bool
+		name  string
+	}{
+		{provider.VersionOrderUnset, false, "no version order"},
+		{provider.VersionOrderDecimal, true, "decimal"},
+		{provider.VersionOrderLexical, true, "lexical"},
+		{provider.VersionOrderBase64, true, "base64"},
+		{provider.VersionOrder(200), false, "unknown version order 200"},
+	} {
+		if got := tc.order.Valid(); got != tc.valid {
+			t.Errorf("VersionOrder(%d).Valid() = %v, want %v", uint8(tc.order), got, tc.valid)
+		}
+		if got := tc.order.String(); got != tc.name {
+			t.Errorf("VersionOrder(%d).String() = %q, want %q", uint8(tc.order), got, tc.name)
+		}
+	}
+}
+
 // TestNewRegistryRefusesAProviderWithNoVersionOrder is the start-up half of ADR 12 decision 1.
 //
 // How a version is spelled is the only thing that lets internal/pipeline decide which of two
