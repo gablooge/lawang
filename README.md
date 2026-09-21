@@ -15,9 +15,14 @@ delivered exactly once to your memory, search, or RAG system.
 > edge, and the hub behind it that resolves which tenant a delivery belongs to, verifies the exact
 > bytes against that tenant's own subscription, and writes the outbox row. `lawang serve` wires
 > both, so a signed delivery for a registered subscription is stored, a forged one is a 401 that
-> stores nothing, and one nobody can be shown to own is parked rather than routed. **No provider is
+> stores nothing, and one nobody can be shown to own is parked rather than routed. The pipeline
+> that turns a stored delivery into records exists too: it hydrates, normalizes, drops automation
+> noise, checks every record against the tenant of the row being drained, keeps the supersede chain
+> forward only (under the version spelling each provider declares, refusing what it cannot order
+> rather than guessing), and masks addresses, telephone numbers and bank accounts with the map from
+> placeholder to value kept locally. **No provider is
 > registered yet**, so every `/ingress/{provider}` segment is a 404 until ClickUp lands, and
-> nothing drains the outbox: the worker, the pipeline and the sinks are the next items. The design
+> nothing drains the outbox: the worker and the sinks are the next items. The design
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in
 > [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the

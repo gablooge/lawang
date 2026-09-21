@@ -165,6 +165,8 @@ func (noWebhooks) Normalize(provider.Hydrated, provider.Change) ([]record.Record
 	return nil, errors.New("no_webhooks: nothing to normalize")
 }
 
+func (noWebhooks) VersionOrder() provider.VersionOrder { return provider.VersionOrderDecimal }
+
 // lockedBuffer is a bytes.Buffer a test can read while a logger writes to it.
 type lockedBuffer struct {
 	mu sync.Mutex

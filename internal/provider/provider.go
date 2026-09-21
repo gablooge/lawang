@@ -10,6 +10,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -39,7 +40,144 @@ type Provider interface {
 	// more when a delivery carries an entity and its parent. The records are complete but
 	// unsealed, because sealing needs the tenant and is the pipeline's step: Normalize fills
 	// everything record.Seal then checks. It does no I/O.
+	//
+	// One field of the record has a rule the format cannot state, and this is where a provider
+	// author meets it: record.Version must be spelled the way VersionOrder declares, for every
+	// entity, on every change. The pipeline orders an entity's versions to keep its supersede
+	// chain pointing forward, and a version it cannot read under the declared order is a dead
+	// letter (pipeline.ErrVersionNotComparable), never a guess.
+	//
+	// The shapes that catch people out, all of them ordinary and all of them refused:
+	//
+	//   - A dotted version ("1.9.3" against "1.10.2", a SharePoint file at "9.0" then "10.0").
+	//     It is neither one decimal run nor a fixed width, and it inverts byte-wise at every
+	//     tenth change. Mint a comparable version instead: zero-pad each component to a fixed
+	//     width and declare VersionOrderLexical, or use the provider's modified timestamp.
+	//   - An RFC 3339 timestamp that grows a fractional second between two records. The width
+	//     changes, so it is not fixed width. Format it with a fixed number of fractional digits,
+	//     in UTC, and it is VersionOrderLexical.
+	//   - A base64 change token passed straight through under VersionOrderLexical. Declare
+	//     VersionOrderBase64 for it: base64's ASCII order is not its value order, so the pipeline
+	//     has to decode it rather than compare the characters.
+	//
+	// None of this changes what a sink sees. To a sink a version is opaque (ADR 4), so a
+	// normalizer is free to re-spell the provider's own token into something orderable.
 	Normalize(h Hydrated, c Change) ([]record.Record, error)
+
+	// VersionOrder says how this provider spells record.Record.Version. It is the only thing
+	// that lets the pipeline put two versions of one entity in order, so it is declared once,
+	// by the provider that mints them, rather than guessed at from the strings.
+	//
+	// It is a constant of the program. NewRegistry calls it once, refuses VersionOrderUnset and
+	// anything it does not recognize (ErrNoVersionOrder), and keeps its own copy, so a provider
+	// that changes its mind later cannot change how a stored delivery is ordered.
+	VersionOrder() VersionOrder
+}
+
+// VersionOrder is how a provider spells record.Record.Version, and therefore how internal/pipeline
+// may order two versions of one entity.
+//
+// ADR 4 makes "monotonic per external_id" a promise the provider's normalizer makes to the
+// pipeline, and calls a version opaque to a sink. Opaque to a sink is not opaque to the pipeline:
+// the supersede chain points forward only, so the pipeline has to decide which of two versions is
+// newer, and the wrong answer lets an older record supersede a newer one at a sink and take the
+// scope that access is decided on with it.
+//
+// The pipeline cannot work that out from the strings, and this type exists because it tried. Two
+// versions being the same length proves nothing: a base64 counter (a Microsoft Graph changeKey, an
+// Exchange ETag), a hash and a UUID are all fixed width, and none of them sorts by value in ASCII.
+// Base64 is the plain case: its alphabet puts 'z' at value 51 and '0' at value 52, while ASCII puts
+// 'z' at 122 and '0' at 48, so a counter ticking from "...z" to "...0" sorts backwards byte-wise.
+// Inferring an order from a coincidence of length is how that goes unnoticed.
+//
+// So the spelling is declared. A provider that declares nothing does not register, and a version
+// the declared order cannot read is a dead letter rather than a guess: both ends fail closed.
+type VersionOrder uint8
+
+const (
+	// VersionOrderUnset names no order. It is the zero value on purpose: a provider author who
+	// has not thought about this gets a refusal at start-up (ErrNoVersionOrder) and never a
+	// silent guess, and a Normalized that did not come from a registered provider orders nothing.
+	VersionOrderUnset VersionOrder = iota
+
+	// VersionOrderDecimal means every version is one run of decimal digits and nothing else,
+	// ordered by the NUMBER it spells. "9" is older than "10", whatever their lengths, and leading
+	// zeros count for nothing, so "009" and "9" are one version.
+	//
+	// This is what an unpadded counter and an epoch are, and it is the commonest thing a real
+	// provider sends: ClickUp's date_updated is an epoch in milliseconds as a decimal string. The
+	// pipeline proves this one rather than trusting it, since it can see whether a string is a
+	// digit run, and a version that is not one is refused.
+	VersionOrderDecimal
+
+	// VersionOrderLexical means every version of one entity is the same number of bytes AND that
+	// their byte order is their value order. A ULID, Crockford base32, uppercase hex, an epoch in
+	// milliseconds, an RFC 3339 timestamp in UTC with a fixed number of fractional digits.
+	//
+	// This one is a PROMISE the provider makes, and the only part of it the pipeline can prove is
+	// the fixed width: two versions of different lengths are refused. The rest rests on the
+	// declaration, which is why it must never be declared for base64, for RFC 4648 base32 (whose
+	// alphabet runs A-Z then 2-7, while ASCII runs 2-7 then A-Z), for a UUID (fixed width and in
+	// no order at all), or for anything that mixes upper and lower case.
+	VersionOrderLexical
+
+	// VersionOrderBase64 means every version is base64 of a fixed-width big-endian value, ordered
+	// by the BYTES it decodes to. Either alphabet, padded or not, but one provider uses one.
+	//
+	// This one is proved and not promised: the pipeline decodes both versions and compares the
+	// bytes, so the alphabet's own ASCII order cannot mislead it. It is what a Microsoft Graph
+	// changeKey and an Exchange ETag are, once the W/"..." wrapper is stripped. Two versions that
+	// do not decode, or that decode to different widths, are refused.
+	VersionOrderBase64
+)
+
+// Valid reports whether o is an order this program knows. The zero value is not one.
+func (o VersionOrder) Valid() bool {
+	return o == VersionOrderDecimal || o == VersionOrderLexical || o == VersionOrderBase64
+}
+
+// String names the order for an operator reading a start-up refusal or a dead letter.
+func (o VersionOrder) String() string {
+	switch o {
+	case VersionOrderUnset:
+		return "no version order"
+	case VersionOrderDecimal:
+		return "decimal"
+	case VersionOrderLexical:
+		return "lexical"
+	case VersionOrderBase64:
+		return "base64"
+	default:
+		return fmt.Sprintf("unknown version order %d", uint8(o))
+	}
+}
+
+// ErrCannotDegrade reports a Change whose webhook body does not carry what the record's scope is
+// made of, so no record can be built from it without hydration. A Degrader returns it (wrapped, if
+// it has more to say) instead of falling back to a scope it guessed.
+var ErrCannotDegrade = errors.New("provider: this change cannot be degraded")
+
+// Degrader is the optional capability of a provider that can build a change's records from the
+// webhook body alone, when Hydrate could not reach its API. Without it a hydration failure simply
+// waits for the API to come back (architecture 3.2, step 4).
+//
+// The one rule that makes it safe is about the scope. A degraded record's visibility.scope is
+// hashed into its id exactly as a hydrated one's is, so the degraded path MUST derive the scope
+// from the same inputs, through the same function, as Normalize does. A degraded record that
+// derived a different scope would give one version of one entity two ids: it would be delivered
+// twice, and to the ledger the second would look like a move (ADR 4, decision 7).
+//
+// Where the webhook body does not carry what the scope is made of, there is no honest answer, so
+// Degrade returns ErrCannotDegrade and the delivery waits for hydration or dead-letters. It never
+// guesses a scope, and it never leaves the scope empty for something downstream to fill in.
+//
+// Like Normalize it does no I/O: the whole point of it is that the provider's API is unreachable.
+type Degrader interface {
+	// Degrade builds the records of c out of c.Payload alone. The records are complete but
+	// unsealed, exactly as Normalize returns them, and they carry the same external id, version
+	// and scope the hydrated ones would have carried. What they may lack is content the webhook
+	// body did not have: an empty author, a shorter text.
+	Degrade(c Change) ([]record.Record, error)
 }
 
 // Change is one thing that happened at a provider, as its webhook body or a reconciliation page

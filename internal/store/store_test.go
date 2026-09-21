@@ -703,6 +703,188 @@ func TestEveryTableForcesRowLevelSecurity(t *testing.T) {
 	}
 }
 
+// policy is what one row-level security policy says, as the catalog spells it.
+type policy struct {
+	cmd, roles, using, check, why string
+}
+
+// TestEveryPolicySaysWhatTheDesignSaysItSays is the predicate half of the test above.
+//
+// TestEveryTableForcesRowLevelSecurity counts policies and never reads one, so a policy that
+// isolates nothing passes it: `USING (true)` on redaction_map, which holds by construction the
+// personal data the masker took out of records, was green across the whole repository in review
+// round 2. What isolation rested on then was every query in every package remembering
+// `tenant_id = @tenant_id`, and on nothing else, so the first query written without that predicate
+// would have been a cross-tenant read of personal data with every test still passing.
+//
+// So the predicates themselves are listed here, for EVERY table that has one and not only for the
+// two that were new at the time. A migration that adds, widens or drops a policy has to say so in
+// this table, where a reviewer sees it. The two `true` policies are the deliberate ones: they are
+// granted to a single helper role each, they are read as the design's own exception, and
+// TestHelperRolesHoldOnlyTheGrantsTheDesignNames is what keeps those roles' reach to one table.
+//
+// The behaviour behind the predicate is pinned separately, because a predicate that reads right
+// and does nothing would pass this: TestTenantCannotReadOrWriteAnotherTenant for tenants, and
+// TestAnotherTenantsLedgerAndRedactionMapAreInvisible in internal/pipeline for the two tables of
+// B08.
+func TestEveryPolicySaysWhatTheDesignSaysItSays(t *testing.T) {
+	// The catalog renders the predicate from the parse tree, so tenant_id's domain shows as a
+	// cast. Matching the rendered text is the point: it is what the database will actually apply.
+	const (
+		byTenantID = "((tenant_id)::text = current_tenant())"
+		byID       = "((id)::text = current_tenant())"
+	)
+	want := map[string]policy{
+		"tenants/tenant_isolation":       {"*", "public", byID, byID, "a tenant sees its own row (migration 00001)"},
+		"outbox/tenant_isolation":        {"*", "public", byTenantID, byTenantID, "migration 00002"},
+		"outbox/worker_claim_select":     {"r", "lawang_worker", "true", "", "the worker claims across tenants, which is its whole job (migration 00002)"},
+		"outbox/worker_claim_update":     {"w", "lawang_worker", "true", "true", "attempts, lease_until and lease_token (migration 00002)"},
+		"subscriptions/tenant_isolation": {"*", "public", byTenantID, byTenantID, "migration 00003"},
+		"subscriptions/resolver_read":    {"r", "lawang_resolver", "true", "", "deriving the tenant is the resolver's whole job (migration 00003)"},
+		"record_ledger/tenant_isolation": {"*", "public", byTenantID, byTenantID, "the supersede chain is per tenant (migration 00004)"},
+		"redaction_map/tenant_isolation": {"*", "public", byTenantID, byTenantID, "personal data by construction (migration 00004)"},
+	}
+
+	db := open(t, "")
+	ctx := testCtx(t)
+	err := db.Tx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT c.relname, p.polname, p.polcmd::text, p.polpermissive,
+			       coalesce((SELECT string_agg(r.rolname, ',' ORDER BY r.rolname)
+			                   FROM pg_roles r WHERE r.oid = ANY(p.polroles)), 'public'),
+			       coalesce(pg_get_expr(p.polqual, p.polrelid), ''),
+			       coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '')
+			  FROM pg_policy p
+			  JOIN pg_class c ON c.oid = p.polrelid
+			  JOIN pg_namespace n ON n.oid = c.relnamespace
+			 WHERE n.nspname = $1`, store.Schema)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		seen := map[string]bool{}
+		for rows.Next() {
+			var rel, name, cmd, roles, using, check string
+			var permissive bool
+			if err := rows.Scan(&rel, &name, &cmd, &permissive, &roles, &using, &check); err != nil {
+				return err
+			}
+			key := rel + "/" + name
+			seen[key] = true
+			// A restrictive policy narrows rather than grants, and reading one as though it
+			// granted would read the whole set wrongly. None exists today; if one is added, this
+			// test has to learn how to combine them before it can go on meaning anything.
+			if !permissive {
+				t.Errorf("policy %s is RESTRICTIVE, which this test does not know how to read: teach it before adding one", key)
+				continue
+			}
+			got := policy{cmd: cmd, roles: roles, using: using, check: check}
+			exp, ok := want[key]
+			if !ok {
+				t.Errorf("policy %s exists and nothing in the design names it: %+v", key, got)
+				continue
+			}
+			exp.why = ""
+			if got != exp {
+				t.Errorf("policy %s is %+v, want %+v (%s): a policy that does not say what the design "+
+					"says it says is a table whose isolation rests on every query remembering to filter",
+					key, got, exp, want[key].why)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// The other direction, so that a migration which quietly drops a policy fails here rather
+		// than at the first cross-tenant read, and so that a query returning nothing cannot pass.
+		for key, p := range want {
+			if !seen[key] {
+				t.Errorf("policy %s is gone: %s", key, p.why)
+			}
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestHelperRolesHoldOnlyTheGrantsTheDesignNames is the grant half of the test above, and it
+// guards every future migration the same way.
+//
+// Row-level security decides which rows a role may touch. It decides nothing about which TABLES a
+// role may touch, and that is a grant, which no test watched until now. The two helper roles exist
+// to do one narrow thing each with one table each: lawang_resolver reads six columns of
+// subscriptions across tenants, because deriving the tenant is its whole job, and lawang_worker
+// reads and updates a few columns of outbox. Every other table in the schema must be closed to
+// both of them, and redaction_map is the sharpest case: it holds, by construction, the personal
+// data that masking took out of records, and one grant on it would hand whoever holds a helper
+// role every tenant's values at once.
+//
+// So the whole privilege surface of both roles is listed here, and anything that is not on the
+// list fails. A migration that grants something new has to say so in this table, where a reviewer
+// sees it, rather than passing every test in the repository in silence.
+func TestHelperRolesHoldOnlyTheGrantsTheDesignNames(t *testing.T) {
+	// role, table, privilege. Both grants in the schema today are column-level, and
+	// has_any_column_privilege is what sees one, so a grant cannot hide behind a column list.
+	allowed := map[string]string{
+		"lawang_resolver/subscriptions/SELECT": "deriving the tenant is the resolver's whole job, six columns, read only (migration 00003)",
+		"lawang_worker/outbox/SELECT":          "the worker claims and leases rows (migration 00002)",
+		"lawang_worker/outbox/UPDATE":          "attempts, lease_until and lease_token (migration 00002)",
+	}
+
+	db := open(t, "")
+	ctx := testCtx(t)
+	err := db.Tx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT r.rolname, c.relname, p.priv
+			  FROM pg_class c
+			  JOIN pg_namespace n ON n.oid = c.relnamespace
+			 CROSS JOIN (VALUES ('lawang_resolver'), ('lawang_worker')) AS r(rolname)
+			 CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'),
+			                    ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) AS p(priv)
+			 WHERE n.nspname = $1
+			   AND c.relkind IN ('r', 'p')
+			   -- DELETE, TRUNCATE and TRIGGER exist only on a whole table, which is why the two
+			   -- tests are separate rather than one.
+			   AND (has_table_privilege(r.rolname, c.oid, p.priv)
+			        OR (p.priv IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
+			            AND has_any_column_privilege(r.rolname, c.oid, p.priv)))
+			 ORDER BY r.rolname, c.relname, p.priv`, store.Schema)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		held := map[string]bool{}
+		for rows.Next() {
+			var role, table, priv string
+			if err := rows.Scan(&role, &table, &priv); err != nil {
+				return err
+			}
+			key := role + "/" + table + "/" + priv
+			held[key] = true
+			if _, ok := allowed[key]; !ok {
+				t.Errorf("%s may %s %s, and nothing in the design says it should: either take the grant "+
+					"away or add it to this test with the reason", role, priv, table)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// The other direction, so that a migration which quietly drops a grant the program needs
+		// is caught here rather than at runtime, and so that a query returning nothing at all
+		// cannot pass this test.
+		for key, why := range allowed {
+			if !held[key] {
+				t.Errorf("%s is not granted: %s", key, why)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func assertRLSViolation(t *testing.T, err error) {
 	t.Helper()
 	var pgErr *pgconn.PgError
