@@ -160,6 +160,27 @@ type candidate struct {
 	secret []byte
 }
 
+// ownersForLog names the subscriptions an ambiguous delivery could have arrived on, and the
+// tenants that hold them, so that the park is something an operator can act on. A count says a
+// delivery stopped; these two say which rows to compare, and whether the collision is between two
+// tenants or inside one.
+//
+// Both are this program's own identifiers and neither is a sender's text: the subscription id is
+// the table's primary key, bounded by maxIDLen and written by Register, and the tenant id has been
+// through tenancy.Parse. The secret, the body and the delivery's keys stay out of the line.
+//
+// The order is the candidate order, which candidates sorts by subscription id, so the same
+// collision reads the same way every time and in the same way for anyone comparing two logs.
+func ownersForLog(owners []candidate) (subscriptions, tenants string) {
+	ids := make([]string, 0, len(owners))
+	holders := make([]string, 0, len(owners))
+	for _, c := range owners {
+		ids = append(ids, c.id)
+		holders = append(holders, c.tenant.String())
+	}
+	return strings.Join(ids, ","), strings.Join(holders, ",")
+}
+
 // Accept resolves the delivery's owner and stores it, and returns what the provider is told.
 //
 // It returns an error only for a failure on our side. Everything a sender can cause is a verdict,
@@ -209,10 +230,15 @@ func (h *Hub) Accept(ctx context.Context, e provider.Entry, req provider.Request
 		// The one thing that answers 401, and the one thing that stores nothing.
 		return ingress.Unverified, nil
 	case len(owners) > 1:
-		// Principle 2. Two tenants' secrets verified the same bytes, so either could be the owner
-		// and neither can be shown to be. Routing to the first is the defect this refuses.
-		h.log.Warn("hub: more than one tenant's secret verified one delivery, so it is parked and not routed",
-			"provider", e.Key(), "owners", len(owners))
+		// Principle 2. More than one subscription's secret verified the same bytes, so the
+		// delivery could have arrived on any of them and none can be shown to own it. Routing to
+		// the first is the defect this refuses, and it refuses it just as firmly when the rows
+		// belong to one tenant: the ordering key names the subscription, so choosing one is
+		// choosing a queue on no evidence (ADR 11, decision 5).
+		subscriptions, tenants := ownersForLog(owners)
+		h.log.Warn("hub: more than one subscription's secret verified one delivery, so it is parked and not routed",
+			"provider", e.Key(), "owners", len(owners),
+			"subscriptions", subscriptions, "tenants", tenants)
 		return h.park(ctx, e.Key(), req.Body, outbox.ParkAmbiguousOwner)
 	}
 
@@ -362,8 +388,10 @@ func (h *Hub) candidates(ctx context.Context, providerKey string, keys provider.
 			}
 			add(cs)
 		}
-		// Each query orders by id; the union of two of them does not, and the order decides which
-		// candidate is verified first and which two the ambiguity is reported about.
+		// Each query orders by id; the union of two of them does not. The order decides which
+		// candidate is verified first, and therefore which subscriptions an ambiguous delivery is
+		// reported about, because verifyAll stops at the second that verifies and those are the
+		// ids the park's log line names. Sorting makes that report the same every time.
 		slices.SortFunc(union, func(a, b candidate) int { return strings.Compare(a.id, b.id) })
 		found = union
 		return nil
@@ -391,8 +419,14 @@ func candidatesFrom[R any](rows []R, cols func(R) (id, tenantID string, secret [
 
 // newCandidate turns a resolver row into a candidate, and refuses one that cannot be an owner. A
 // tenant id the domain would not have allowed, or a secret that verifies nothing, means a row that
-// did not come from this program: it is left out of the candidates rather than trusted, because
-// the whole of the isolation argument is that the tenant comes from a row Lawang owns.
+// did not come from this program.
+//
+// The error it returns fails the whole resolution, and the delivery becomes a 5xx. That is
+// deliberate, and it is stronger than dropping the bad row: with the row skipped, a delivery the
+// unaccountable row might have owned would be routed to whichever other candidate verified, and
+// nothing would ever say that the table holds a row nobody can account for. A candidate set that
+// cannot be reasoned about resolves nothing, because the whole of the isolation argument is that
+// the tenant comes from a row Lawang owns.
 func newCandidate(id, tenantID string, secret []byte) (candidate, error) {
 	tenant, err := tenancy.Parse(tenantID)
 	if err != nil {
@@ -407,7 +441,56 @@ func newCandidate(id, tenantID string, secret []byte) (candidate, error) {
 // maxStackInLog bounds the stack of a recovered panic in the log line. A Verify is a few frames
 // deep and this is room for dozens of them; the bound is here so that one provider bug cannot
 // write an unbounded amount per delivery into a log an operator has to keep and pay for.
+//
+// It truncates mid line, which costs nothing: the frames that matter are the ones nearest the
+// panic, and debug.Stack puts those first.
 const maxStackInLog = 8 << 10
+
+// maxTypeNameInLog bounds the type name of a recovered panic value. No type written in source
+// comes near it, and the bound is the other half of the check below: a name can pass every
+// character test and still be as long as the provider likes, because nesting is free
+// ([][][]...int), so one panicking delivery could write as much of it as it wanted into the log.
+const maxTypeNameInLog = 128
+
+// refusedTypeName stands in for a panic value whose type name typeNameForLog will not vouch for.
+// It says which of the two things happened (the type is unusual, not the log line missing), so an
+// operator who meets it can go and look at the provider package.
+const refusedTypeName = "(not a plain type name)"
+
+// typeNameForLog is the dynamic type of a recovered value, as %T prints it, when that name is one
+// only a plainly written type can have, and refusedTypeName otherwise.
+//
+// A type name is NOT a compile-time constant, which is the mistake this function exists to undo.
+// reflect.StructOf builds a type at run time and takes arbitrary bytes in a struct tag, and %T
+// prints the tag, so a Verify holding a tenant's secret can panic with a value whose type name is
+// that secret. Dynamic struct libraries do the same with a delivery's own field names.
+//
+// What is left after this check cannot carry those bytes. Every run-time construction that can
+// hold text of its own prints it inside braces and after a space (a struct tag or field name in
+// "struct { ... }", a method name in "interface { ... }"), and a func type prints a parenthesis;
+// space, brace and parenthesis are all refused here. The names that pass are built out of
+// identifiers, package paths, and the six punctuation bytes below, all of which are written in a
+// provider package's source.
+//
+// This narrows and does not close. A provider package that panics is already holding the secret
+// in its own process and could log it directly, so the type name is trusted exactly as far as the
+// provider package is, and no further; what this refuses is the trivial way to smuggle it into
+// OUR log line, at error level, in every backup of it.
+func typeNameForLog(v any) string {
+	name := fmt.Sprintf("%T", v)
+	if name == "" || len(name) > maxTypeNameInLog {
+		return refusedTypeName
+	}
+	for i := 0; i < len(name); i++ {
+		switch c := name[i]; {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '_', c == '.', c == '*', c == '[', c == ']', c == '/':
+		default:
+			return refusedTypeName
+		}
+	}
+	return name
+}
 
 // crash is what a recovered panic leaves behind for the log.
 //
@@ -417,8 +500,8 @@ const maxStackInLog = 8 << 10
 // body, a delivery key or the secret it was handed into a log line that is then in every backup.
 // What is kept is ours and is what actually finds the bug.
 type crash struct {
-	// kind is the dynamic type of the recovered value, as %T prints it. A type name is written in
-	// the provider's own source and cannot hold a byte of a delivery.
+	// kind is the dynamic type of the recovered value, as typeNameForLog vouched for it. A type
+	// name is not a compile-time constant, so it is not trusted on that ground: see the function.
 	kind string
 	// stack is the goroutine's stack at the point of the panic: function names, files, lines and
 	// argument words. Argument words are pointers and lengths, never the bytes they point at.
@@ -495,7 +578,7 @@ func verifyOne(ctx context.Context, source provider.WebhookSource, req provider.
 				if len(stack) > maxStackInLog {
 					stack = stack[:maxStackInLog]
 				}
-				a = answer{crashed: &crash{kind: fmt.Sprintf("%T", r), stack: stack}}
+				a = answer{crashed: &crash{kind: typeNameForLog(r), stack: stack}}
 			}
 			done <- a
 		}()
@@ -515,8 +598,11 @@ func verifyOne(ctx context.Context, source provider.WebhookSource, req provider.
 // Parking cannot reach a real tenant: outbox.Park takes no tenant at all, so there is no argument
 // here for a crafted delivery to influence. What a sender contributes is the raw body, which the
 // outbox keeps as it arrived for the reasons a sweep can settle later (B25) and replaces with a
-// short note for the one it cannot: see outbox.Park. That matters here because ParkUnreadable is
-// the park a stranger can produce at will, with no credential and no knowledge of any tenant.
+// short note for the one it cannot: see outbox.Park. That matters here because ParkUnreadable
+// takes no credential and no knowledge of any tenant to produce, and no later registration can
+// ever make those bytes resolvable, so keeping them would be cost with no use. ParkNoOwner is as
+// cheap for a stranger to produce and does keep its bytes, because B25 re-resolves rows from
+// exactly those bytes; what that costs is #25's to bound.
 func (h *Hub) park(ctx context.Context, providerKey string, body []byte, reason outbox.ParkReason) (ingress.Verdict, error) {
 	_, fresh, err := h.ob.Park(ctx, providerKey, body, reason)
 	if err != nil {

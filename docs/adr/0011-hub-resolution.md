@@ -9,7 +9,9 @@ says the tenant comes from a row Lawang owns and never from the payload, and tha
 than one tenant could claim is refused rather than routed. Three questions had to be answered
 before that could be built, and none of them was settled anywhere. A fourth, which rows are
 candidates when a delivery carries both keys and a subscription recorded only one, was settled
-during the review of the first implementation and is decision 4 below.
+during the review of the first implementation and is decision 4 below. A fifth, what "ambiguous"
+means when the colliding rows belong to one tenant, was settled during the second review and is
+decision 5.
 
 ## Decision
 
@@ -60,7 +62,7 @@ deliveries queues behind nothing. Why it was parked is `dead_reason`, one of fiv
 | Reason | What happened |
 |---|---|
 | no owner | nothing is registered for the delivery's keys |
-| ambiguous owner | more than one tenant's secret verified it, or it selected more candidates than the hub will verify |
+| ambiguous owner | more than one subscription's secret verified it (two tenants, or two rows of one tenant: decision 5), or it selected more candidates than the hub will verify |
 | unreadable delivery | the provider could not read its own keys out of it, or the keys cannot identify anything |
 | the provider's verification panicked | `Verify` broke its contract, so no candidate's answer can be trusted |
 | the delivery cannot be stored | poison: an owner was resolved and the row still cannot be written |
@@ -73,7 +75,11 @@ the delivery, and the sweep routes them once the subscription that owns them exi
 had instead. That reason is the one a stranger produces at will (the ingress path takes any body up
 to the 1 MiB cap with no credential, and the delivery id is a hash of the body, so every distinct
 body is another row), and it is the one no later registration can ever make resolvable, so the
-payload is pure cost. "The provider's verification panicked" and "the delivery cannot be stored"
+payload is pure cost. It is not the only reason a stranger produces at will: "no owner" is as cheap
+to send, needing only a body the provider package can parse and a workspace id nobody registered,
+and it does keep every byte, because those bytes are what B25 re-resolves. What that costs, and
+whether it wants a quota or an age cap, is B25's question and is written on #25.
+"The provider's verification panicked" and "the delivery cannot be stored"
 also keep their bytes: the first is evidence for a bug of ours and needs a provider package to
 panic, and the second already has a verified owner, so neither is a stranger's to send. The choice
 is made by `outbox.Park` from the reason, not by its caller, so a later caller cannot forget it.
@@ -119,6 +125,42 @@ Two probes rather than one statement with an OR in it is what keeps both lookups
 the generic plan pgx's statement cache ends up with: a single statement would probe the registration
 id against the empty string for every delivery that carries no registration id, and read every row
 that recorded none.
+
+### 5. Two subscriptions of the SAME tenant that both verify are parked too, and the park says so
+
+The review of the second implementation asked the obvious next question: two rows of one tenant,
+on one workspace, with one secret. The tenant is then unambiguous, so "more than one tenant's
+secret verified it" is not what happened, and parking looks like fail-closed reflex rather than a
+decision.
+
+**It is still parked.** What is ambiguous is not the tenant, it is which subscription the delivery
+arrived on, and by decision 3 that is the ordering key. Choosing one of the two rows is choosing a
+queue on no evidence, and the queue is the ordering guarantee:
+
+- A stable choice (the lowest id, say) is stable only while both rows are. Delete or re-register
+  the row that was being chosen and the next delivery of the same entity joins the other queue,
+  while an earlier version of it is still in flight in the first. Two versions of one entity in
+  flight together is exactly what the outbox exists to prevent.
+- The subscription row is also where a delivery's `resource` lives, which is what B11 hydrates
+  against. A wrong row is a wrong resource, not just a wrong queue.
+- Routing to both is not an option either: the outbox dedupes on the delivery id per tenant, so
+  the second insert is a no-op and which queue won would be decided by a race.
+
+So the rule is "exactly one subscription verified", not "exactly one tenant verified", and the two
+were only ever the same thing by accident. The log line says `more than one subscription's secret
+verified one delivery` and carries `subscriptions` and `tenants`, both of them ids of rows Lawang
+wrote, so the operator sees the two rows to compare and whether the collision is inside one tenant
+or across two.
+
+**The cost, which belongs to B11 (#11).** A tenant in this state receives nothing for that
+workspace, permanently, until a human removes the collision. It is not an exotic shape: ClickUp
+issues one webhook secret per workspace, so a registration design that writes one subscription row
+per list, each carrying the workspace id and that one secret, produces it on the first delivery.
+The answer is in the registration shape rather than in the hub: at most one subscription row per
+(provider, workspace) per tenant, with any finer scoping carried inside that row. Two rows of one
+tenant on one workspace with *different* secrets resolve correctly today and are not the case at
+issue. Whether the table should enforce the rule with a unique index needs the real registration
+shape, so it is B11's and B14's to settle, not this one's.
 
 ## Consequences
 

@@ -222,12 +222,20 @@ const (
 // keepsBody reports whether a parked delivery's own bytes are stored, or a short note in their
 // place. See Park.
 //
-// Only ParkUnreadable answers false, and the two halves of the reason are separate. It can never
+// Only ParkUnreadable answers false, and it takes both halves of the reason together. It can never
 // be re-resolved: the provider could not read its own keys out of those bytes, so no subscription
-// registered later makes them resolvable, and nothing will ever read them again. And it is the one
-// park a stranger produces at will: the ingress path takes any body up to the edge's 1 MiB cap
-// with no credential of any kind, the delivery id is a hash of the body, so every distinct body is
-// a distinct row, and twenty POSTs of garbage are twenty rows of garbage.
+// registered later makes them resolvable, and nothing will ever read them again. And a stranger
+// produces it at will: the ingress path takes any body up to the edge's 1 MiB cap with no
+// credential of any kind, the delivery id is a hash of the body, so every distinct body is a
+// distinct row, and twenty POSTs of garbage are twenty rows of garbage. Bytes nothing will read,
+// in a row anyone can write, are pure cost.
+//
+// It is not the only park a stranger produces at will. ParkNoOwner is just as cheap, needing only
+// a body the provider package can parse and a workspace id nobody registered, and it keeps every
+// byte: twenty 4 KiB posts of that shape are 84 KB of a stranger's payload. That is deliberate,
+// because B25 re-resolves those rows from exactly those bytes, which is the half ParkUnreadable
+// does not have. Whether the re-resolvable reasons need a quota or an age cap is #25's question,
+// and it is written there.
 //
 // The other two reasons no sweep re-resolves keep their bytes. ParkUnstorable has a verified owner
 // already, so the bytes are that tenant's own data and nobody without its secret can produce one.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -96,6 +97,89 @@ func TestTwoTenantsWhoseSecretsBothVerifyAreParkedNeverRouted(t *testing.T) {
 		t.Fatalf("verdict = %s, want parked (200)", got)
 	}
 	e.wantParked(reasonAmbiguous, "two verifying tenants must produce a parked row and nothing else")
+}
+
+// TestAnAmbiguousParkNamesTheSubscriptionsThatCollided. Parking is the right answer and it is also
+// a dead stop: every delivery of that shape goes to the sentinel and the tenants simply stop
+// receiving them. A count of owners says that happened; it does not say which rows to look at, and
+// the rows are the only thing a human can act on. A subscription id is the table's primary key and
+// a tenant id has been through tenancy.Parse, so neither is a sender's text and both can be logged.
+//
+// This is also the only thing that observes candidate order, and therefore the test that holds the
+// sort in candidates to its job: the ids are reported lowest first, so one collision reads the same
+// way every time.
+func TestAnAmbiguousParkNamesTheSubscriptionsThatCollided(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	shared := []byte("a secret two tenants both hold")
+	subA := e.register(tenantA, "W1", "W1", "S1", shared)
+	subB := e.register(tenantB, "W1", "W1", "S1", shared)
+	var logged lockedBuffer
+	h, entry := e.hub(fake.New(fake.DefaultKey), hub.Options{Logger: jsonLogger(&logged)})
+
+	if got := e.accept(h, entry, signed(delivery("W1", "S1", "1"), shared)); got != ingress.Parked {
+		t.Fatalf("verdict = %s, want parked (200)", got)
+	}
+	e.wantParked(reasonAmbiguous, "two verifying subscriptions must produce a parked row")
+
+	// The expectation is sorted here rather than written out, so that the assertion is about the
+	// hub's ordering and not about which of two generated ids happened to be smaller.
+	tenantOf := map[string]string{subA.ID: tenantA.String(), subB.ID: tenantB.String()}
+	ids := []string{subA.ID, subB.ID}
+	slices.Sort(ids)
+	tenants := []string{tenantOf[ids[0]], tenantOf[ids[1]]}
+
+	rec := ambiguityLine(t, logged.String())
+	if got, want := rec.Subscriptions, strings.Join(ids, ","); got != want {
+		t.Errorf("the park names subscriptions %q, want %q (lowest id first)", got, want)
+	}
+	if got, want := rec.Tenants, strings.Join(tenants, ","); got != want {
+		t.Errorf("the park names tenants %q, want %q", got, want)
+	}
+	if strings.Contains(logged.String(), string(shared)) {
+		t.Errorf("the log carries the secret that verified:\n%s", logged.String())
+	}
+}
+
+// TestTwoSubscriptionsOfOneTenantThatBothVerifyAreParked. One ClickUp workspace, one webhook
+// secret, two rows: the shape a registration that writes one subscription per list would produce,
+// and not an exotic one. The tenant is not in doubt, so this looks at first like fail-closed
+// reflex.
+//
+// It is not (ADR 11, decision 5). The ordering key is the subscription the delivery arrived on, so
+// choosing one of the two rows is choosing a queue on no evidence, and the row is also where the
+// resource that B11 hydrates against lives. What the park owes the operator is a line that says
+// what actually happened: two subscriptions, one tenant, and which rows.
+func TestTwoSubscriptionsOfOneTenantThatBothVerifyAreParked(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	subOne := e.register(tenantA, "list-1", "W1", "", secretA)
+	subTwo := e.register(tenantA, "list-2", "W1", "", secretA)
+	var logged lockedBuffer
+	h, entry := e.hub(fake.New(fake.DefaultKey), hub.Options{Logger: jsonLogger(&logged)})
+
+	if got := e.accept(h, entry, signed(delivery("W1", "S1", "1"), secretA)); got != ingress.Parked {
+		t.Fatalf("verdict = %s, want parked (200): one tenant's two rows still cannot both own it", got)
+	}
+	e.wantParked(reasonAmbiguous, "which of two subscriptions owns it decides which queue it joins")
+
+	ids := []string{subOne.ID, subTwo.ID}
+	slices.Sort(ids)
+	rec := ambiguityLine(t, logged.String())
+	if got, want := rec.Subscriptions, strings.Join(ids, ","); got != want {
+		t.Errorf("the park names subscriptions %q, want %q", got, want)
+	}
+	if got, want := rec.Tenants, tenantA.String()+","+tenantA.String(); got != want {
+		t.Errorf("the park names tenants %q, want %q: the collision is inside one tenant", got, want)
+	}
+	// The line that used to be written here claimed two tenants, which is false of this delivery
+	// and would send an operator looking for a second tenant that does not exist.
+	if strings.Contains(rec.Msg, "tenant's secret") {
+		t.Errorf("the park says %q, which claims a second tenant that does not exist", rec.Msg)
+	}
+	if !strings.Contains(rec.Msg, "more than one subscription's secret") {
+		t.Errorf("the park says %q, which does not say what was ambiguous", rec.Msg)
+	}
 }
 
 // TestTwoTenantsOnOneWorkspaceWithDifferentSecretsRouteToTheOwner is the other half of the pair:
@@ -409,27 +493,46 @@ func TestASubscriptionRowThatCouldNotHaveComeFromLawangIsNotAnOwner(t *testing.T
 			INSERT INTO lawang.subscriptions (id, tenant_id, provider, resource, workspace_id, external_id, secret)
 			VALUES ('01SUB', '` + tenantA.String() + `', 'fake', 'W1', 'W1', 'S1', '');`,
 	}
-	for name, write := range cases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			e := setup(t)
-			testdb.Exec(t, e.tdb.AdminURL, write)
-			// A second, perfectly good subscription on the same workspace, whose secret DOES
-			// verify the delivery. This is what makes the test about the hub's own refusal: with
-			// the bad row simply skipped, the delivery would be routed to this tenant and stored,
-			// and nothing would ever say that the table holds a row nobody can account for. A
-			// candidate set with a row that could not have come from Lawang is a table that cannot
-			// be reasoned about, so the whole resolution is refused.
-			e.register(tenantB, "W1", "W1", "S1", secretB)
-			h, entry := e.hub(fake.New(fake.DefaultKey), hub.Options{})
-
-			_, err := h.Accept(e.ctx, entry, signed(delivery("W1", "S1", "1"), secretB))
-			if err == nil {
-				t.Fatal("Accept resolved an owner from a candidate set holding a row that could not have come from Lawang")
-			}
-			e.wantNothingStored("a resolution that cannot be reasoned about stores nothing")
-		})
+	// Both candidate queries build their rows through the same function, and both have to refuse
+	// the same row: the by-workspace probe runs for a delivery that carries a workspace, and the
+	// by-subscription probe for one that carries only the registration's own id, which is the
+	// branch this item added last and the one no test reached.
+	probes := map[string]func() provider.Provider{
+		"found by the workspace probe": func() provider.Provider { return fake.New(fake.DefaultKey) },
+		"found by the subscription probe": func() provider.Provider {
+			return keyed{fake.New(fake.DefaultKey), provider.DeliveryKeys{Subscription: "S1"}}
+		},
 	}
+	for name, write := range cases {
+		for probe, newProvider := range probes {
+			t.Run(name+", "+probe, func(t *testing.T) {
+				runBadRowCase(t, write, newProvider())
+			})
+		}
+	}
+}
+
+// runBadRowCase writes one unaccountable row, registers a good one beside it, and asserts that the
+// delivery resolves nothing at all.
+func runBadRowCase(t *testing.T, write string, p provider.Provider) {
+	t.Helper()
+	t.Parallel()
+	e := setup(t)
+	testdb.Exec(t, e.tdb.AdminURL, write)
+	// A second, perfectly good subscription on the same workspace, whose secret DOES verify the
+	// delivery. This is what makes the test about the hub's own refusal: with the bad row simply
+	// skipped, the delivery would be routed to this tenant and stored, and nothing would ever say
+	// that the table holds a row nobody can account for. A candidate set with a row that could not
+	// have come from Lawang is a table that cannot be reasoned about, so the whole resolution is
+	// refused.
+	e.register(tenantB, "W1", "W1", "S1", secretB)
+	h, entry := e.hub(p, hub.Options{})
+
+	_, err := h.Accept(e.ctx, entry, signed(delivery("W1", "S1", "1"), secretB))
+	if err == nil {
+		t.Fatal("Accept resolved an owner from a candidate set holding a row that could not have come from Lawang")
+	}
+	e.wantNothingStored("a resolution that cannot be reasoned about stores nothing")
 }
 
 // TestTheHubRefusesAProviderThatIsNotAWebhookSource. The edge answers 404 before this, so it is
@@ -745,7 +848,7 @@ func TestAPanickingVerifyLogsWhereItPanicked(t *testing.T) {
 	for _, want := range []string{
 		"panickingWithTheSecret", // the frame that panicked, by name
 		"fakes_test.go",          // and the file it is in
-		"panic_type=string",      // the kind of value, which a type name cannot leak
+		"panic_type=string",      // the kind of value, as typeNameForLog vouched for it
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the log does not say %q, so nobody can find the bug:\n%s", want, out)
@@ -753,5 +856,96 @@ func TestAPanickingVerifyLogsWhereItPanicked(t *testing.T) {
 	}
 	if strings.Contains(out, string(secretA)) {
 		t.Errorf("the log carries the panic value, which this provider built out of the secret:\n%s", out)
+	}
+}
+
+// TestAPanicValueCannotWriteWhatItLikesAsItsTypeName. The type name was kept where the panic value
+// was dropped, on the reasoning that a type name is written in a provider's source. It is not: a
+// type can be built at run time, and reflect.StructOf takes arbitrary bytes in a struct tag that
+// %T then prints. A provider whose Verify does that put the secret in a log line at error level,
+// in every backup of that log. Nesting makes the same name as long as the provider likes.
+//
+// So a type name is logged only when it is one a plainly written type could have, short and out of
+// the characters an identifier, a package path and Go's type punctuation use. It narrows rather
+// than closes (a provider package holding the secret could log it itself), which is what the
+// function's own comment says.
+func TestAPanicValueCannotWriteWhatItLikesAsItsTypeName(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		source        provider.Provider
+		frame         string
+		mustNotAppear string
+	}{
+		"the secret in a struct tag": {
+			source:        panickingWithASecretInATypeName{fake.New(fake.DefaultKey)},
+			frame:         "panickingWithASecretInATypeName",
+			mustNotAppear: string(secretA),
+		},
+		"a name longer than the hub will log": {
+			source: panickingWithALongTypeName{fake.New(fake.DefaultKey)},
+			frame:  "panickingWithALongTypeName",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e := setup(t)
+			e.register(tenantA, "W1", "W1", "S1", secretA)
+			var logged lockedBuffer
+			h, entry := e.hub(tc.source, hub.Options{Logger: jsonLogger(&logged)})
+
+			if got := e.accept(h, entry, signed(delivery("W1", "S1", "1"), secretA)); got != ingress.Parked {
+				t.Fatalf("verdict = %s, want parked (200)", got)
+			}
+			rec := crashLine(t, logged.String())
+			if rec.PanicType != hub.RefusedTypeName {
+				t.Errorf("panic_type = %q, want %q: a type built at run time is not a name to trust",
+					rec.PanicType, hub.RefusedTypeName)
+			}
+			if tc.mustNotAppear != "" && strings.Contains(logged.String(), tc.mustNotAppear) {
+				t.Errorf("the log carries what the provider put in the type's name:\n%s", logged.String())
+			}
+			// The refusal must not cost the line its point, which is where to look.
+			if !strings.Contains(rec.Stack, tc.frame) {
+				t.Errorf("the stack does not name the frame that panicked:\n%s", rec.Stack)
+			}
+		})
+	}
+}
+
+// TestALongStackIsTruncatedInTheLog. A Verify that recurses before it panics is an ordinary bug,
+// and every delivery of that shape writes its whole stack into a log an operator keeps and pays
+// for. The bound is what keeps one provider bug from being a disk bill; it truncates mid line,
+// which costs nothing, because debug.Stack puts the frames nearest the panic first and those are
+// the ones that say where to look.
+func TestALongStackIsTruncatedInTheLog(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	e.register(tenantA, "W1", "W1", "S1", secretA)
+	var logged lockedBuffer
+	// Deep enough that the untruncated stack is several times the bound, so the assertion is not
+	// about a frame or two either way.
+	h, entry := e.hub(deeplyPanicking{fake.New(fake.DefaultKey), 500}, hub.Options{
+		Logger: jsonLogger(&logged),
+	})
+
+	if got := e.accept(h, entry, signed(delivery("W1", "S1", "1"), secretA)); got != ingress.Parked {
+		t.Fatalf("verdict = %s, want parked (200)", got)
+	}
+	rec := crashLine(t, logged.String())
+	if len(rec.Stack) > hub.MaxStackInLog {
+		t.Errorf("the logged stack is %d bytes, want at most %d", len(rec.Stack), hub.MaxStackInLog)
+	}
+	// A bound that logged nothing, or that kept the wrong end, would pass the length assertion and
+	// be useless. debug.Stack writes the goroutine header and then the frames nearest the panic, so
+	// a trace that still begins at its own first line is one that was cut from the far end.
+	if !strings.HasPrefix(rec.Stack, "goroutine ") {
+		t.Errorf("the logged stack does not begin where debug.Stack begins, so the frames nearest the panic were the ones dropped:\n%.200s", rec.Stack)
+	}
+	if !strings.Contains(rec.Stack, "deeplyPanicking") {
+		t.Errorf("the truncated stack does not name the frame that panicked:\n%s", rec.Stack)
+	}
+	if !strings.Contains(rec.Stack, "fakes_test.go") {
+		t.Errorf("the truncated stack does not name the file it is in:\n%s", rec.Stack)
 	}
 }

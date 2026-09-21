@@ -943,8 +943,8 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Body over the size cap | unstorable | 413, the body is never accumulated |
 | Body could not be read (a `Content-Length` that lies) | unstorable | 400, nothing stored |
 | Signature invalid | untrusted | 401, nothing stored |
-| Unknown workspace or ambiguous owner | unattributable | parked under the sentinel tenant `_parked`, answered 2xx, re-resolved periodically (B25), deleted after retention |
-| A delivery the provider cannot read its own keys out of, or whose keys identify nothing | unattributable | parked, answered 2xx: there is no signature claim to reject, so it is never a 401. The row keeps a note of the delivery's length and id, not its body: no sweep can re-resolve it, and anyone can send one |
+| Unknown workspace or ambiguous owner | unattributable | parked under the sentinel tenant `_parked` as `unattributable: no owner` or `unattributable: ambiguous owner`, **keeping the body as it arrived**, answered 2xx, re-resolved periodically (B25), deleted after retention |
+| A delivery the provider cannot read its own keys out of, or whose keys are ones no lookup can use (longer than the column, or unstorable text) | unattributable | parked as `unattributable: unreadable delivery`, answered 2xx: there is no signature claim to reject, so it is never a 401. This reason alone keeps a note of the delivery's length and id in place of the body, because no sweep can ever re-resolve it and anyone can send one |
 | A provider's `Verify` panics | unattributable | parked, answered 2xx: no candidate's answer can settle the owner, and the connection is not dropped |
 | A resolved delivery that can never be stored (an ordering key the table refuses) | unstorable | parked as poison, answered 2xx, so the provider does not retry what cannot work |
 | Hydration fails | degradable | deliver a minimal record, the change is still tracked |
