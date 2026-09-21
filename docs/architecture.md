@@ -59,6 +59,8 @@ sequenceDiagram
   participant E as /ingress/{provider}
   participant DB as Postgres
   P->>E: POST (signed, often a thin body)
+  E->>E: registered provider? 404 if not, before anything is read
+  E->>E: capture the raw body under the size cap
   E->>E: handshake? answer and stop
   E->>DB: candidate subscriptions for the delivery keys (resolver role)
   E->>E: verify signature over the EXACT raw bytes, per candidate
@@ -75,6 +77,125 @@ sequenceDiagram
 
 Response codes are part of the contract: **401 only for a signature failure**, 2xx for everything
 else including poison, because providers retry non-2xx responses and a retry storm helps nobody.
+The full table, which `internal/ingress` implements:
+
+| Status | When |
+|---|---|
+| 202 | stored |
+| 200 | a re-send of something already stored, a delivery nobody owns, or poison that was parked |
+| 401 | **only** a signature that did not verify |
+| 404 | no such provider, or a path that is not already canonical, answered before anything is read or stored |
+| 413 | the body is over the cap |
+| 400 | the body could not be read: a `Content-Length` that lies, a connection that stopped |
+| 503 | the accept path did not finish in time, for example a saturated connection pool |
+| 500 | a bug or an outage on our side |
+
+**The 404 is the one deliberate exception** to "2xx for everything else", and it is safe because
+nothing has happened by the time it is answered: no body read, no tenant resolved, nothing stored.
+No provider can storm on it either, since a provider only ever posts to the URL Lawang gave it,
+which names a registered provider. What reaches that branch is a scanner. The same answer covers a
+registered provider that is not a `WebhookSource`, so a registered provider and an unregistered one
+are indistinguishable from outside.
+
+**The path segment is request text.** `net/http` percent-decodes it, so `/ingress/%00` arrives as a
+NUL byte and a 500 byte segment arrives whole. The segment is used for exactly one thing, a lookup
+in the provider registry, and everything downstream is handed **the registry's own key**, which is
+a constant of the program: `outbox.Delivery.Provider` must never be text a sender chose
+([section 5](#5-idempotency) hashes it into the delivery id, and `outbox.Accept` treats an
+unstorable provider as a caller bug rather than as poison).
+
+**A path that is not already canonical is refused, not redirected.** `net/http.ServeMux` cleans a
+request path and answers 307 with a `Location` before any handler runs, so `//ingress/slack`,
+`/ingress//slack` and `/ingress/slack/../slack` would each redirect to `/ingress/slack`. A 307
+preserves the method and the body, so the provider re-POSTs, the edge signs the cleaned path and
+the provider signed the original: every delivery would be a 401, which the table above reserves for
+a forged signature. So `ingress.New` returns the handler the server serves, which is a mux this
+package builds itself with a guard in front of it, and a path the mux would have cleaned gets the
+same 404 an unknown provider gets. Nothing legitimate is refused, because a provider only ever
+posts to the one URL Lawang gave it. The guard reads the request's **escaped** path, which is the
+string the mux cleans, so a wildcard segment that carries an encoded slash still reaches its
+handler. The Cloudflare Tunnel in front of a development machine already refuses these shapes;
+this is the same rule for a deployment with no tunnel in front of it.
+
+**The mux's other redirect is taken away from it, not guarded against.** `ServeMux` also answers
+307 from `/x` to `/x/` when `/x/` is a registered pattern and `/x` is not, and that one runs after
+any guard in front of the mux, because it depends on the routing table rather than on the request.
+So the routing table is `ingress`'s: every other route the server answers (`/healthz` now, the
+`/v1` operator API later) is given to `ingress.New` as a `Route`, and wherever the mux would
+redirect from a slash-less path, `New` registers that path itself with the same 404. Whether it
+would redirect is a property of the whole table and not of any one pattern, so `New` does not
+predict it from the pattern strings: it builds the table, builds a second mux carrying the same
+patterns and handlers that do nothing, and puts the question to that one. Predicting it was wrong
+in both directions, burying a route the mux already answered exactly and refusing a table
+`net/http` accepts. The question is put for one representative path per pattern, and a wildcard
+segment is asked about as the text it is written as (`{x}`), which generalises to the whole family
+only because nothing in the table can single that text out. A `Route` under the webhook endpoint's
+own prefix (`/ingress/`) is refused at start, because such a route is more specific than the
+webhook pattern and would answer deliveries in the edge's place. Both of those depend on a
+`Route.Path` being spelled the way `net/http` stores it, so **a percent-escape in a `Route.Path`
+is refused**: the pattern parser decodes a literal segment, so `/%69ngress/fake` is the pattern
+`/ingress/fake` and `/a/%7Bx%7D` is the literal segment `{x}`, and a check that reads the written
+string sees neither. No route this program wires needs one. No bare mux exists for a caller to
+serve by mistake, which is what an earlier `Mount(mux)` shape allowed with nothing in `go build`,
+`go vet` or `golangci-lint` to say so.
+
+**A routing table `net/http` would accept can still be refused at start**, because the route `New`
+adds to take a redirect away is a route like any other. It carries the method of the route that
+needed it, so a `Route` with no `Method` gets a method-less guard, and in `net/http` a method-less
+literal conflicts with a method-specific wildcard at the same depth: `{Path: "/v1/tenants/"}` plus
+`{Method: "GET", Path: "/v1/{name}"}` is legal for a bare `ServeMux` and is refused here, with a
+message naming the pattern `ingress` tried to add rather than one the caller wrote. Naming the
+method on the subtree route makes the guard method-specific too and removes the conflict, so a
+caller that gives every `Route` a `Method` never meets it. The `/v1` operator API (B08) is the
+caller this applies to.
+
+**The body is captured once, under a cap** (`ingress.DefaultMaxBody`, 1 MiB), by an
+`http.MaxBytesReader` in front of everything that touches it, hashing included. Those exact bytes
+go to the handshake hook, to verification, to the delivery id and into the outbox row. Nothing on
+this path parses or re-serializes them (principle 1).
+
+**The URL a signature covers comes from configuration.** A provider that signs the request URL
+(HubSpot v3 signs the method, the full request URI, the body and a timestamp) signed the **public**
+URL, and behind a Cloudflare Tunnel or a reverse proxy that is not what the Go server sees. The
+edge builds `provider.Request.URL` from `LAWANG_PUBLIC_BASE_URL` plus the request's own escaped
+path and raw query, and **never** from `Host`, `X-Forwarded-Host` or `X-Forwarded-Proto`: all three
+are written by whoever sent the request, and a sender that chooses part of its own signed input can
+make a signature verify over content it picked, which is not a check at all. With the variable
+unset the edge still serves and `provider.Request.URL` is the empty string; a scheme that needs it
+returns `false` rather than guess, because a signature verified against a URL Lawang invented
+proves nothing (see [section 4](#4-trust-model)); `ingress.New` says so once at warn level, naming
+the variable, because otherwise the only sign of a missing variable is a 401 on a provider's own
+dashboard. `config.NormalizePublicBaseURL` owns the spelling and `ingress.New` calls it rather than
+carrying a copy, since the two strings end up compared byte for byte inside an HMAC. Normalizing
+its own output returns it unchanged, which is a property test and not a table row: the same value
+is normalized by `config.Load`, again by `ingress.New`, and registered with the provider by a
+`Registrar`, so a rule that moved a string on the second pass would have the edge verify against
+one spelling while the provider signed another.
+
+**The handshake hook** (`WebhookSource.Handshake`) runs before any tenant exists to resolve,
+because a challenge arrives before any subscription does. Its reply is bytes and a content type,
+not JSON: Slack echoes a challenge inside a JSON object and Microsoft Graph echoes a
+`validationToken` as `text/plain`. What a provider may answer with is bounded, because a handshake
+echoes a stranger's text and a provider package must not be able to turn this origin into one that
+serves content: the body is capped at 8 KiB; the status must be a 2xx or a 4xx, never a 3xx (which
+would redirect whoever sent the challenge), never a 5xx (which asks for a retry of an answer that
+will not change), and **never 401 or 403**, because the table above reserves 401 for a signature
+failure and a handshake has nothing to verify (a challenge it cannot read is a 400); and the
+content type must be `text/plain` or `application/json`, with no parameter but `charset=utf-8`.
+`text/html` with an echoed `<script>` would be reflected script execution, and
+`X-Content-Type-Options: nosniff` does not help, because nosniff stops a browser guessing a type
+and not honouring the one that was sent. Anything outside those bounds is a bug in a provider
+package: it is logged at error and answered 500, with none of the reply written.
+
+**The accept is bounded** (`ingress.DefaultAcceptTimeout`, 2 seconds, an order of magnitude over
+the 200 ms target). Every accept holds one pool connection for its resolve and its insert, and the
+pool is `pgxpool`'s default of `max(4, NumCPU)` connections shared by every in-flight webhook, so
+past that number the requests queue inside the pool. Without a bound they would queue until the
+provider's own client gave up, and the provider would see a timeout, which many treat as an
+outage. With it they get a 503 and a `Retry-After`, which is a retry instruction every provider
+already understands. Four to eight concurrent accepts of a few milliseconds each are hundreds of
+deliveries a second, which is far past what v0.1 needs; an operator who needs more raises
+`pool_max_conns` in `LAWANG_DATABASE_URL` (see [section 4](#4-trust-model)).
 
 ### 3.2 Drain path (inside `worker`)
 
@@ -207,8 +328,36 @@ Three roots of trust, and nothing else can establish a tenant:
 | Surface | Trust root | Tenant comes from |
 |---|---|---|
 | `/v1` operator API | operator credential | the credential |
-| `/ingress/{provider}` | provider signature over the raw bytes | the owned subscription row that verified it |
+| `/ingress/{provider}` | provider signature over the raw bytes, and over the public URL where the scheme covers it | the owned subscription row that verified it |
 | sink delivery | per-tenant sink credential | Lawang, from the outbox row |
+
+**Nothing a sender writes may reach a signature base string.** Some schemes sign more than the
+body: HubSpot v3 signs the request method, the full public request URI, the body and a timestamp
+header. The method, the body and the timestamp are the sender's and are supposed to be, because
+the signature is what proves they were not changed. The **URL is different**: it is the one piece
+of the base string the receiver has to supply, and the obvious sources for it (`Host`,
+`X-Forwarded-Host`, `X-Forwarded-Proto`, `Forwarded`) are all written by whoever sent the request
+and passed through unchanged by a tunnel. A receiver that built the signed URL from them would let
+a sender choose part of what it is proving, and the check would pass over content the sender
+picked. So the public base URL is **configuration**: `LAWANG_PUBLIC_BASE_URL`, validated at start
+by `config.NormalizePublicBaseURL` (absolute, `http` or `https`, a host that names a machine and
+is written in ASCII, no credentials, no query, no fragment, a clean path prefix written with no
+percent-escape, no trailing slash) and refused
+rather than guessed at. Host case and a default port are deliberately **kept**: the string has to
+match the URL the operator registered with the provider, which they copied from its dashboard, so
+lowercasing a host or dropping `:443` would create the mismatch rather than remove it. An
+internationalized host is given in its punycode (`xn--`) form for the same reason, and the other
+spelling is refused at start rather than turned into a 401 per delivery: `http://:8080`, which
+names a port and no machine, is refused for that reason too.
+
+**Unset is a refusal, not a default.** With no public base URL configured the edge still serves,
+because most schemes never look at the URL, but `provider.Request.URL` is empty and a scheme that
+signs the URL must return `false`. That answers 401 for every delivery of that provider, which is
+loud and correct: the alternative is a signature checked against a URL Lawang made up, which
+passes or fails for reasons nobody can reason about. The operator's fix is one variable, and
+`ingress.New` names it in a warning at start so the fix is findable from the logs rather than only
+from the provider's dashboard. Refusing to start belongs to the hub (B07), which is the layer that
+knows which providers are registered and which of their schemes cover the URL.
 
 **Row-level security.** Every tenant-scoped table has RLS enabled and forced, with the policy keyed
 on a transaction-local setting. If the setting is missing, a query returns zero rows. Three roles:
@@ -282,6 +431,16 @@ function returns is reduced in the same way, along with anything the function wr
 because a statement on a connection that has just died fails with exactly such an error. So a
 transaction function does database work only: no provider call, no sink delivery, no lookup inside
 it, which principle 6 of section 10 asks for anyway.
+
+**Pool size.** The pool is `pgxpool`'s default, `max(4, NumCPU)` connections, shared by every
+in-flight request of the process. An accept holds one for its resolve and its insert, a worker
+holds one per claimed row for each of its two transactions. That is sized for v0.1: a few
+milliseconds per accept over four to eight connections is hundreds of deliveries a second. An
+operator who needs more sets `pool_max_conns` in `LAWANG_DATABASE_URL`, which `pgxpool` reads from
+the URL, and the same URL takes `pool_min_conns` and `pool_max_conn_lifetime`. What must never
+happen is a wait with no end, so every path that acquires a connection is under a deadline and
+answers rather than hangs: the webhook edge answers 503 with a `Retry-After`
+([section 3.1](#31-accept-path-inside-serve-target-under-200-ms)).
 
 See [ADR 2](adr/0002-migrations-goose.md).
 
@@ -474,10 +633,27 @@ type Provider interface {
 // Optional capabilities.
 type WebhookSource interface {
 	Handshake(r *http.Request, body []byte) (Reply, bool)          // challenge echoes
-	DeliveryKeys(body []byte, h http.Header) (DeliveryKeys, error) // what resolves the owner
-	Verify(body []byte, h http.Header, secret []byte) bool         // never errors, never panics
+	DeliveryKeys(body []byte, h Header) (DeliveryKeys, error)      // what resolves the owner
+	Verify(r Request, secret []byte) bool                          // never errors, never panics
 	Parse(body []byte) ([]Change, error)
 }
+
+// Request is one delivery as a signature scheme sees it: the union of what the schemes cover.
+// ClickUp signs the body, Slack v0 a timestamp header and the body, HubSpot v3 the method, the
+// full public URL, the body and a timestamp header. It is a struct so that the next scheme to
+// need one more field does not break every implementation written before it.
+type Request struct {
+	Method string // always "POST": the route fixes the method. HubSpot v3 signs it
+	URL    string // the PUBLIC URL, from configuration; empty when none is configured
+	Header Header // readable, with no way to change what another candidate reads
+	Body   []byte // the exact request bytes, never re-serialized, never modified
+}
+
+// Header is the delivery's header fields. It is not an http.Header because the hub hands one
+// Request to Verify once per candidate subscription, and a map would let one implementation's
+// Set or Del change what the candidates after it see: an intermittent signature failure on the
+// second candidate only. Get and Values read; Values returns a copy; nothing writes.
+type Header struct{ /* wraps the request's own map, copies nothing */ }
 type Registrar interface {
 	Register(ctx context.Context, t Tenant, cred Credential) ([]Subscription, error)
 	Renew(ctx context.Context, s Subscription) (Subscription, error)
@@ -506,6 +682,52 @@ type AccessSink interface {
 }
 ```
 
+**The registry.** `provider.NewRegistry(providers...)` is built once, from a list known at compile
+time, and never changes, so every read of it on the accept path is safe with no lock. It validates
+each `Key()` by calling `record.ValidProviderKey`, the one function that owns
+[ADR 3](adr/0003-scope-id-format.md)'s grammar (`[a-z][a-z0-9_]{0,31}`, no hyphen), and not by
+carrying a copy of the pattern: a registry that accepted `ms-graph` would register a provider
+whose every record fails in `Seal`. It calls `Key()` exactly once, at registration, and hands back
+its own copy of the string from then on, which is what makes `outbox.Delivery.Provider` a constant
+of the program rather than a decoded path segment.
+
+**Three things a provider author has to know, which the hub (B07) is where they bite.**
+
+- `Handshake` runs on **unauthenticated bytes, on every delivery**, not only on a challenge,
+  because a challenge arrives before any subscription exists and nothing else can tell the two
+  apart. It is the one place where a stranger's bytes drive real work before verification, so a
+  provider looks at a cheap discriminator first (a header, a query parameter, the first field) and
+  only then parses. Slack and Microsoft Graph both allow this.
+- `Verify` **never errors and never panics**, and nothing in the type system can enforce it. A
+  panic there is recovered per connection by `net/http` and the provider sees a dropped response
+  rather than a status. `Verify` runs once per candidate subscription, so B07's per-candidate loop
+  recovers around it: one provider's panic parks a delivery, it does not drop the connection.
+- `Request` is handed to `Verify` **once per candidate**, and the same value each time. That is why
+  `Request.Header` is this package's `Header` and not an `http.Header`: a provider that normalized
+  a header in place would change what the candidates after it read, and the symptom would be a
+  signature that fails for the second candidate only, in a tenant that happens to have two
+  subscriptions on one workspace. The header is a guarantee, because the type has no mutating
+  method and nothing is copied to get it. **`Request.Body` is a rule and not a guarantee**: it is a
+  `[]byte` that aliases the edge's own buffer, an implementation that normalizes it in place
+  changes what every later candidate verifies and what B07 stores in the outbox, and only a review
+  of the provider package catches that. Making it a guarantee belongs in B07's per-candidate loop,
+  where a copy per candidate costs 0.9 us for an 8 KiB delivery and 57 us at the 1 MiB cap against
+  a 200 ms target, and it is on [#7](https://github.com/gablooge/lawang/issues/7) with those
+  numbers.
+- The 503 the edge answers on a slow accept rests on `errors.Is(err, context.DeadlineExceeded)`.
+  Both error shapes pgx produces for a saturated pool match it today, but a statement cancelled
+  server side comes back as a `*pgconn.PgError` with SQLSTATE 57014 and no context error in its
+  chain, which would land on 500 where 503 with a `Retry-After` is the honest answer. B07 treats
+  `ctx.Err() != nil` after the call as the deadline case too.
+
+**What lands when.** `Provider` and `WebhookSource` are in `internal/provider` from B06, because
+the ingress edge is built on them. `Registrar`, `Reconciler` and `MemberSource` arrive with the
+items that decide the types they take, and not before: `Subscription` is B07's (the hub and the
+subscription table), `Credential` is B13's and B14's (the vault and `connect`), `Cursor` is B19's
+(reconciliation) and `ScopeMembers` is B23's (access sync). An interface written before its types
+are settled is a shape every later item has to rewrite, and the rewrite is not free once a
+provider package implements it.
+
 Built-in implementations planned for v0.1:
 
 | Seam | Implementations |
@@ -531,8 +753,8 @@ internal/
   store/              pgx pool, preflight, transaction helpers, migrate
   testdb/             a real Postgres for integration tests, as the application role
   outbox/             accept insert, FIFO-head claim, retry ladder, dead letters
-  ingress/            the /ingress/{provider} HTTP edge
-  hub/                handshake, verify, resolve owner, accept
+  ingress/            the /ingress/{provider} HTTP edge: raw body, size cap, handshake
+  hub/                verify, resolve owner, accept
   pipeline/           normalize, gate, ledger, supersede, mask, deliver
   worker/             drain and sweeps as independent goroutines
   reconcile/          cursors and chunked replay
@@ -541,6 +763,7 @@ internal/
   vault/              Vault interface and implementations
   sink/               Sink interface and implementations
   provider/           Provider interfaces and the registry
+    fake/             a strict test double of a webhook provider, imported by tests only
     clickup/  slack/  teams/  outlook/  hubspot/
 migrations/           SQL, embedded into the binary; bootstrap/ is the one-time admin script
 docs/
@@ -618,6 +841,9 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 
 | Failure | Class | Action |
 |---|---|---|
+| No such provider on the path | unroutable | 404, before anything is read, nothing stored |
+| Body over the size cap | unstorable | 413, the body is never accumulated |
+| Body could not be read (a `Content-Length` that lies) | unstorable | 400, nothing stored |
 | Signature invalid | untrusted | 401, nothing stored |
 | Unknown workspace or ambiguous owner | unattributable | parked under a sentinel tenant, re-resolved periodically, deleted after retention |
 | Hydration fails | degradable | deliver a minimal record, the change is still tracked |
@@ -626,6 +852,7 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered; ops is alerted |
 | Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; replay is always safe |
 | Vault unreachable | fail closed | retry on the ladder; nothing is delivered unverified |
+| Accept path out of time (a saturated pool, a slow database) | retryable | 503 with a `Retry-After`, nothing stored |
 
 ---
 

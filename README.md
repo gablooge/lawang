@@ -10,8 +10,14 @@ receives their webhooks directly, and turns every change into a clean, permissio
 delivered exactly once to your memory, search, or RAG system.
 
 > **Status: pre-alpha.** The foundations are built (M0: configuration, id recipes, Postgres with
-> row-level security, the outbox) and the record format is settled
-> ([schema](internal/record/record.v1.schema.json)), but nothing ingests a webhook yet. The design
+> row-level security, the outbox), the record format is settled
+> ([schema](internal/record/record.v1.schema.json)), and the webhook edge now exists: the provider
+> interfaces, the registry and `/ingress/{provider}` with raw-body capture, a size cap and the
+> handshake hook. What is still missing is the half that makes a delivery belong to somebody:
+> signature verification against owned subscriptions, and the outbox insert. So no webhook is
+> stored yet, **and `lawang serve` does not mount the route at all**: an edge with no hub would
+> answer a provider without storing anything, so B07 is the item that wires it and until then a
+> POST to `/ingress/{provider}` is a 404 from the mux. The design
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in
 > [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the
