@@ -112,8 +112,9 @@ roadmap yourself. Search existing issues first and do not propose a duplicate.
 
 ### 3. Community readiness
 
-What must exist before strangers arrive (milestone M6, when the repository becomes public), and
-does it? Check and draft, under `growth/drafts/` for the maintainer to move into place: a
+The repository is public already, from 2026-09-20, earlier than the roadmap planned. So strangers
+can arrive today and the answer to "what must exist before they do" is overdue, not upcoming.
+What is missing, and what should it say? Check and draft, under `growth/drafts/` for the maintainer to move into place: a
 `CONTRIBUTING.md` that gets a first pull request merged (build, test, the review a contributor
 will get, how long it takes), a `CODE_OF_CONDUCT.md` (propose the Contributor Covenant and name
 who receives reports), a `SECURITY.md` with a private way to report a vulnerability, issue and
@@ -156,7 +157,7 @@ first response) and treat stars as the vanity figure they are.
   description, an issue, a draft, a document) carries a "Generated with Claude Code" line or any
   other tool attribution. No em dash anywhere.
 - `growth/` holds working notes about other projects and about strategy. Before the repository
-  becomes public the maintainer reviews it and decides what stays. Write everything in it as if
+  is public, so the maintainer reviews it and decides what stays. Write everything in it as if
   the people you describe will read it, because one day they may.
 
 ## Final message
