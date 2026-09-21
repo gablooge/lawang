@@ -1,4 +1,4 @@
-// Package outbox is Sluiceway's only queue: a Postgres table whose row states are the retry and
+// Package outbox is Lawang's only queue: a Postgres table whose row states are the retry and
 // dead-letter machinery.
 //
 // A row moves pending -> prepared -> delivered, or to dead. A claim is a lease on the HEAD of an
@@ -33,10 +33,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/gablooge/sluiceway/internal/ids"
-	"github.com/gablooge/sluiceway/internal/outbox/outboxdb"
-	"github.com/gablooge/sluiceway/internal/store"
-	"github.com/gablooge/sluiceway/internal/tenancy"
+	"github.com/gablooge/lawang/internal/ids"
+	"github.com/gablooge/lawang/internal/outbox/outboxdb"
+	"github.com/gablooge/lawang/internal/store"
+	"github.com/gablooge/lawang/internal/tenancy"
 )
 
 // Row states.

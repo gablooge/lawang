@@ -16,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/gablooge/sluiceway/internal/outbox"
+	"github.com/gablooge/lawang/internal/outbox"
 )
 
 // adminConn is a superuser session that stays open for the whole test.
@@ -125,15 +125,15 @@ func (e *env) closeGate() (admin *pgx.Conn, open func()) {
 func (e *env) gateClaimOn(id string) (admin *pgx.Conn, open func()) {
 	e.t.Helper()
 	e.admin(fmt.Sprintf(`
-		CREATE FUNCTION sluiceway.test_gate(row_id text) RETURNS boolean LANGUAGE plpgsql VOLATILE AS $$
+		CREATE FUNCTION lawang.test_gate(row_id text) RETURNS boolean LANGUAGE plpgsql VOLATILE AS $$
 		BEGIN
 		  IF row_id = '%s' AND pg_try_advisory_xact_lock(%d) THEN
 		    PERFORM pg_advisory_xact_lock(%d);
 		  END IF;
 		  RETURN true;
 		END $$;
-		CREATE POLICY test_gate ON sluiceway.outbox AS RESTRICTIVE FOR SELECT TO sluiceway_worker
-		  USING (sluiceway.test_gate(id));`, id, firstLock, gateLock))
+		CREATE POLICY test_gate ON lawang.outbox AS RESTRICTIVE FOR SELECT TO lawang_worker
+		  USING (lawang.test_gate(id));`, id, firstLock, gateLock))
 	e.holdFirstInLine(id)
 	return e.closeGate()
 }
@@ -143,7 +143,7 @@ func (e *env) gateClaimOn(id string) (admin *pgx.Conn, open func()) {
 func (e *env) acceptGateRow() string {
 	e.t.Helper()
 	id := e.accept(tenantA, "gate", 1)
-	e.admin("UPDATE sluiceway.outbox SET next_attempt_at = now() + interval '1 day' WHERE id = '" + id + "'")
+	e.admin("UPDATE lawang.outbox SET next_attempt_at = now() + interval '1 day' WHERE id = '" + id + "'")
 	return id
 }
 
@@ -154,12 +154,12 @@ func (e *env) acceptGateRow() string {
 // which needs the table to itself.
 func (e *env) holdFirstInLine(id string) {
 	e.t.Helper()
-	e.admin("UPDATE sluiceway.outbox SET next_attempt_at = now() - interval '1 year' WHERE id = '" + id + "'")
+	e.admin("UPDATE lawang.outbox SET next_attempt_at = now() - interval '1 year' WHERE id = '" + id + "'")
 	holder := e.adminConn() // closing it, when the test ends, ends the transaction and the lock
 	if _, err := holder.Exec(e.ctx, "BEGIN"); err != nil {
 		e.t.Fatalf("hold the gate row: %v", err)
 	}
-	if _, err := holder.Exec(e.ctx, "SELECT id FROM sluiceway.outbox WHERE id = $1 FOR UPDATE", id); err != nil {
+	if _, err := holder.Exec(e.ctx, "SELECT id FROM lawang.outbox WHERE id = $1 FOR UPDATE", id); err != nil {
 		e.t.Fatalf("hold the gate row: %v", err)
 	}
 }
@@ -185,15 +185,15 @@ var planners = map[string][]string{
 func (e *env) gateInsertOf(body []byte) (admin *pgx.Conn, open func()) {
 	e.t.Helper()
 	e.admin(fmt.Sprintf(`
-		CREATE FUNCTION sluiceway.test_insert_gate() RETURNS trigger LANGUAGE plpgsql AS $$
+		CREATE FUNCTION lawang.test_insert_gate() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 		  IF NEW.raw_body = decode(TG_ARGV[0], 'hex') THEN
 		    PERFORM pg_advisory_xact_lock(%d);
 		  END IF;
 		  RETURN NEW;
 		END $$;
-		CREATE TRIGGER test_insert_gate BEFORE INSERT ON sluiceway.outbox
-		  FOR EACH ROW EXECUTE FUNCTION sluiceway.test_insert_gate('%x');`, gateLock, body))
+		CREATE TRIGGER test_insert_gate BEFORE INSERT ON lawang.outbox
+		  FOR EACH ROW EXECUTE FUNCTION lawang.test_insert_gate('%x');`, gateLock, body))
 	return e.closeGate()
 }
 
@@ -317,7 +317,7 @@ const headsBroken = `
 	               count(*) FILTER (WHERE is_head) AS heads,
 	               coalesce((array_agg(is_head ORDER BY seq) FILTER (WHERE state IN ('pending', 'prepared')))[1], false) AS first_is_head,
 	               bool_or(is_head AND state NOT IN ('pending', 'prepared')) AS finished_head
-	          FROM sluiceway.outbox
+	          FROM lawang.outbox
 	         GROUP BY tenant_id, ordering_key
 	       ) k
 	 WHERE finished_head OR (unfinished = 0 AND heads <> 0) OR (unfinished > 0 AND (heads <> 1 OR NOT first_is_head))`
@@ -498,7 +498,7 @@ func TestAKeyNeverHasTwoHeads(t *testing.T) {
 	v2 := e.accept(tenantA, "task:1", 2)
 	e.claimOne(v2)
 
-	const late = `INSERT INTO sluiceway.outbox (id, seq, tenant_id, provider, delivery_id, ordering_key, raw_body, is_head)
+	const late = `INSERT INTO lawang.outbox (id, seq, tenant_id, provider, delivery_id, ordering_key, raw_body, is_head)
 	              OVERRIDING SYSTEM VALUE VALUES ('%s', 0, 'tenant_a', 'fake', '%[1]s', 'task:1', '', %v)`
 	if err := e.adminErr(fmt.Sprintf(late, "second-head", true)); sqlState(err) != "23505" {
 		t.Fatalf("a second head for a key whose head is in flight: err = %v, want a unique violation", err)
@@ -510,7 +510,7 @@ func TestAKeyNeverHasTwoHeads(t *testing.T) {
 	e.claimNone("v2 is in flight, so nothing else of its entity is claimable, not even an earlier row")
 
 	// When v2's lease runs out it is v2 that is taken over. The earlier row is still not a head.
-	e.admin("UPDATE sluiceway.outbox SET lease_until = now() - interval '1 second' WHERE id = '" + v2 + "'")
+	e.admin("UPDATE lawang.outbox SET lease_until = now() - interval '1 second' WHERE id = '" + v2 + "'")
 	c2 := e.claimOne(v2)
 	e.claimNone("v2 is in flight again")
 
@@ -523,7 +523,7 @@ func TestAKeyNeverHasTwoHeads(t *testing.T) {
 	}
 
 	// And a finished row can never be a head, even of a key that has none.
-	err := e.adminErr("UPDATE sluiceway.outbox SET is_head = true WHERE id = '" + v2 + "'")
+	err := e.adminErr("UPDATE lawang.outbox SET is_head = true WHERE id = '" + v2 + "'")
 	if sqlState(err) != "23514" {
 		t.Errorf("making a delivered row a head: err = %v, want a check violation", err)
 	}
@@ -536,7 +536,7 @@ func TestAFinishedRowIsNeverAHead(t *testing.T) {
 	e := setup(t)
 	v1 := e.accept(tenantA, "task:1", 1)
 	for _, state := range []string{outbox.StateDelivered, outbox.StateDead} {
-		err := e.adminErr(fmt.Sprintf("UPDATE sluiceway.outbox SET state = '%s', finished_at = now() WHERE id = '%s'", state, v1))
+		err := e.adminErr(fmt.Sprintf("UPDATE lawang.outbox SET state = '%s', finished_at = now() WHERE id = '%s'", state, v1))
 		if sqlState(err) != "23514" {
 			t.Errorf("a head made %s and left a head: err = %v, want a check violation", state, err)
 		}
@@ -556,7 +556,7 @@ func TestClaimRechecksARowFinishedAfterItsSnapshot(t *testing.T) {
 			gate := e.acceptGateRow()
 			v1 := e.accept(tenantA, "task:1", 1)
 			slow := e.claimOne(v1)
-			e.admin("UPDATE sluiceway.outbox SET lease_until = now() - interval '1 second' WHERE id = '" + v1 + "'")
+			e.admin("UPDATE lawang.outbox SET lease_until = now() - interval '1 second' WHERE id = '" + v1 + "'")
 
 			admin, open := e.gateClaimOn(gate)
 			result, finished := e.claimInBackground()
@@ -681,7 +681,7 @@ func TestClaimLeasesARowReplayedOntoAnEmptyKeyAfterItsSnapshot(t *testing.T) {
 				t.Fatal(err)
 			}
 			// As in the test below: a replay that began before the paused claim did.
-			e.admin("UPDATE sluiceway.outbox SET next_attempt_at = now() - interval '1 hour' WHERE id = '" + v1 + "'")
+			e.admin("UPDATE lawang.outbox SET next_attempt_at = now() - interval '1 hour' WHERE id = '" + v1 + "'")
 
 			open()
 			got := <-result
@@ -708,7 +708,7 @@ func TestClaimSkipsARowSomeoneHasLocked(t *testing.T) {
 	if _, err := holder.Exec(e.ctx, "BEGIN"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := holder.Exec(e.ctx, "SELECT id FROM sluiceway.outbox WHERE id = $1 FOR UPDATE", held); err != nil {
+	if _, err := holder.Exec(e.ctx, "SELECT id FROM lawang.outbox WHERE id = $1 FOR UPDATE", held); err != nil {
 		t.Fatal(err)
 	}
 
@@ -759,7 +759,7 @@ func TestClaimRechecksARowReplayedAfterItsSnapshot(t *testing.T) {
 			// start of the paused claim's, as for a replay that began first and then waited for
 			// the key's lock: otherwise the paused claim drops v1 for not being due, and its seq
 			// is never looked at.
-			e.admin("UPDATE sluiceway.outbox SET next_attempt_at = now() - interval '1 hour' WHERE id = '" + v1 + "'")
+			e.admin("UPDATE lawang.outbox SET next_attempt_at = now() - interval '1 hour' WHERE id = '" + v1 + "'")
 
 			open()
 			if got := <-result; len(got) != 0 {
@@ -917,14 +917,14 @@ func TestAFailedFinishIsNotALostLease(t *testing.T) {
 	// A trigger that refuses one kind of change, as a stand-in for any error of the statement
 	// that makes it.
 	const refuse = `
-		CREATE FUNCTION sluiceway.test_refuse() RETURNS trigger LANGUAGE plpgsql AS $$
+		CREATE FUNCTION lawang.test_refuse() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 		  IF %s THEN RAISE EXCEPTION 'test: refused'; END IF;
 		  RETURN NEW;
 		END $$;
-		CREATE TRIGGER test_refuse BEFORE UPDATE ON sluiceway.outbox
-		  FOR EACH ROW EXECUTE FUNCTION sluiceway.test_refuse();`
-	const allow = "DROP TRIGGER test_refuse ON sluiceway.outbox; DROP FUNCTION sluiceway.test_refuse();"
+		CREATE TRIGGER test_refuse BEFORE UPDATE ON lawang.outbox
+		  FOR EACH ROW EXECUTE FUNCTION lawang.test_refuse();`
+	const allow = "DROP TRIGGER test_refuse ON lawang.outbox; DROP FUNCTION lawang.test_refuse();"
 
 	// unchanged runs the finish, which must fail, and reports the error. v1 and v2 must be as before.
 	unchanged := func(t *testing.T, e *env, v1, v2 string, finish func() error) error {
@@ -1051,7 +1051,7 @@ func TestTheMarkerFollowsTheQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	heads("v1 backing off", map[string]bool{v1: true, v2: false, v3: false})
-	e.admin("UPDATE sluiceway.outbox SET next_attempt_at = now() - interval '1 second' WHERE id = '" + v1 + "'")
+	e.admin("UPDATE lawang.outbox SET next_attempt_at = now() - interval '1 second' WHERE id = '" + v1 + "'")
 
 	// A dead letter gives it up, to the next row and not to the last.
 	if err := e.ob.MarkDead(e.ctx, e.claimOne(v1), badShape); err != nil {

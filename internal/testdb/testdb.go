@@ -25,13 +25,13 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/gablooge/sluiceway/internal/ids"
-	"github.com/gablooge/sluiceway/migrations"
+	"github.com/gablooge/lawang/internal/ids"
+	"github.com/gablooge/lawang/migrations"
 )
 
 const (
 	image       = "postgres:17-alpine"
-	appPassword = "sluiceway_test" //nolint:gosec // a throwaway container that lives as long as the test process
+	appPassword = "lawang_test" //nolint:gosec // a throwaway container that lives as long as the test process
 )
 
 var (
@@ -66,7 +66,7 @@ func Bootstrap(t testing.TB, connURL string) {
 	if err := TryBootstrap(t, connURL); err != nil {
 		t.Fatalf("testdb: bootstrap: %v", err)
 	}
-	Exec(t, connURL, fmt.Sprintf("ALTER ROLE sluiceway PASSWORD '%s'", appPassword))
+	Exec(t, connURL, fmt.Sprintf("ALTER ROLE lawang PASSWORD '%s'", appPassword))
 }
 
 // TryBootstrap applies the bootstrap script and returns the server's verdict, for tests that
@@ -141,7 +141,7 @@ func newDatabase(t testing.TB, cluster *url.URL) Database {
 	admin := *cluster
 	admin.Path = "/" + name
 	app := admin
-	app.User = url.UserPassword("sluiceway", appPassword)
+	app.User = url.UserPassword("lawang", appPassword)
 	return Database{URL: app.String(), AdminURL: admin.String()}
 }
 

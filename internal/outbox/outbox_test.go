@@ -17,10 +17,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/gablooge/sluiceway/internal/outbox"
-	"github.com/gablooge/sluiceway/internal/store"
-	"github.com/gablooge/sluiceway/internal/tenancy"
-	"github.com/gablooge/sluiceway/internal/testdb"
+	"github.com/gablooge/lawang/internal/outbox"
+	"github.com/gablooge/lawang/internal/store"
+	"github.com/gablooge/lawang/internal/tenancy"
+	"github.com/gablooge/lawang/internal/testdb"
 )
 
 const (
@@ -216,7 +216,7 @@ func TestAcceptRefusesAnOrderingKeyItCannotStore(t *testing.T) {
 	}
 	// Nothing of the refused deliveries is there, and the queue is as usable as before.
 	var stored int
-	if err := e.adminConn().QueryRow(e.ctx, "SELECT count(*) FROM sluiceway.outbox").Scan(&stored); err != nil {
+	if err := e.adminConn().QueryRow(e.ctx, "SELECT count(*) FROM lawang.outbox").Scan(&stored); err != nil {
 		t.Fatal(err)
 	}
 	if stored != 1 {
@@ -238,7 +238,7 @@ func TestAcceptRefusesAnOrderingKeyItCannotStore(t *testing.T) {
 	}
 
 	// The table says the same, for a writer that does not come through Accept.
-	err := e.adminErr(fmt.Sprintf(`INSERT INTO sluiceway.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body)
+	err := e.adminErr(fmt.Sprintf(`INSERT INTO lawang.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body)
 	                               VALUES ('x', 'tenant_a', 'fake', 'x', repeat('k', %d), '')`, outbox.MaxOrderingKeyLen+1))
 	if sqlState(err) != "23514" {
 		t.Errorf("a raw INSERT of a key one byte too long: err = %v, want a check violation", err)
@@ -291,7 +291,7 @@ func TestBackoffHoldsTheWholeKey(t *testing.T) {
 	}
 	e.claimNone("v1 is waiting out its backoff, and v2 may not overtake it")
 
-	e.admin("UPDATE sluiceway.outbox SET next_attempt_at = now() - interval '1 second'")
+	e.admin("UPDATE lawang.outbox SET next_attempt_at = now() - interval '1 second'")
 	c1 = e.claimOne(v1)
 	if c1.Attempt() != 2 {
 		t.Errorf("Attempt = %d, want 2", c1.Attempt())
@@ -319,7 +319,7 @@ func TestRetryKeepsThePreparedState(t *testing.T) {
 	if row.State != outbox.StatePrepared {
 		t.Errorf("state after a delivery retry = %q, want prepared (it must not prepare twice)", row.State)
 	}
-	e.admin("UPDATE sluiceway.outbox SET next_attempt_at = now() - interval '1 second'")
+	e.admin("UPDATE lawang.outbox SET next_attempt_at = now() - interval '1 second'")
 	e.claimOne(v1)
 }
 
@@ -365,7 +365,7 @@ func TestAnExpiredLeaseIsTakenOverAndTheOldHolderIsShutOut(t *testing.T) {
 	crashed := e.claimOne(v1)
 	e.claimNone("the lease is still running")
 
-	e.admin("UPDATE sluiceway.outbox SET lease_until = now() - interval '1 second'")
+	e.admin("UPDATE lawang.outbox SET lease_until = now() - interval '1 second'")
 	takeover := e.claimOne(v1)
 	if takeover.Attempt() != 2 {
 		t.Errorf("Attempt = %d, want 2", takeover.Attempt())
@@ -559,7 +559,7 @@ func TestClaimNeverLeasesMoreThanMaxBatch(t *testing.T) {
 	e := setup(t)
 	const extra = 5
 	e.admin(fmt.Sprintf(`
-		INSERT INTO sluiceway.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body, is_head)
+		INSERT INTO lawang.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body, is_head)
 		SELECT 'r' || g, 'tenant_a', 'fake', 'r' || g, 'entity:' || g, '', true
 		  FROM generate_series(1, %d) g`, outbox.MaxBatch+extra))
 
@@ -653,8 +653,8 @@ func TestGetIsTenantScoped(t *testing.T) {
 const repairKey = `
 	BEGIN;
 	SELECT pg_advisory_xact_lock(hashtextextended('%[1]s' || chr(31) || '%[2]s', 0));
-	UPDATE sluiceway.outbox SET is_head = true
-	 WHERE id = (SELECT id FROM sluiceway.outbox
+	UPDATE lawang.outbox SET is_head = true
+	 WHERE id = (SELECT id FROM lawang.outbox
 	              WHERE tenant_id = '%[1]s' AND ordering_key = '%[2]s' AND state IN ('pending', 'prepared')
 	              ORDER BY seq LIMIT 1);
 	COMMIT;`
@@ -709,10 +709,10 @@ func TestStrandedKeysFindsAKeyWithWorkAndNoHead(t *testing.T) {
 	for _, key := range []string{"lost:b", "lost:a", "lost:c"} {
 		first[key] = e.accept(tenantA, key, 1)
 		second[key] = e.accept(tenantA, key, 2)
-		e.admin("UPDATE sluiceway.outbox SET is_head = false WHERE id = '" + first[key] + "'")
+		e.admin("UPDATE lawang.outbox SET is_head = false WHERE id = '" + first[key] + "'")
 	}
 	e.accept(tenantA, "theirs", 1) // healthy for A
-	e.admin("UPDATE sluiceway.outbox SET is_head = false WHERE id = '" + e.accept(tenantB, "theirs", 1) + "'")
+	e.admin("UPDATE lawang.outbox SET is_head = false WHERE id = '" + e.accept(tenantB, "theirs", 1) + "'")
 
 	if got, want := stranded(tenantA, 10), []string{"lost:a", "lost:b", "lost:c"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("StrandedKeys(tenant A) = %q, want %q: each key once, in key order", got, want)
@@ -732,7 +732,7 @@ func TestStrandedKeysFindsAKeyWithWorkAndNoHead(t *testing.T) {
 	// However many there are and whatever is asked for, one call returns at most MaxBatch.
 	const tenantC = tenancy.ID("tenant_c")
 	e.admin(fmt.Sprintf(`
-		INSERT INTO sluiceway.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body)
+		INSERT INTO lawang.outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body)
 		SELECT 's' || g, '%s', 'fake', 's' || g, 'stranded:' || g, ''
 		  FROM generate_series(1, %d) g`, tenantC, outbox.MaxBatch+5))
 	if got := stranded(tenantC, 5*outbox.MaxBatch); len(got) != outbox.MaxBatch {
@@ -848,7 +848,7 @@ func TestConcurrentClaimersNeverShareARow(t *testing.T) {
 			t.Errorf("round %d: %d rows claimed, want %d", round, len(seen), rows)
 		}
 		e.checkHeads(admin)
-		e.admin("UPDATE sluiceway.outbox SET state = 'delivered', is_head = false, lease_until = NULL, lease_token = NULL, finished_at = now() WHERE state <> 'delivered'")
+		e.admin("UPDATE lawang.outbox SET state = 'delivered', is_head = false, lease_until = NULL, lease_token = NULL, finished_at = now() WHERE state <> 'delivered'")
 	}
 }
 

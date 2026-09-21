@@ -14,7 +14,7 @@ import (
 )
 
 // connErrPrefix names the variable the operator has to look at, never its value.
-const connErrPrefix = "SLUICEWAY_DATABASE_URL: cannot use the database"
+const connErrPrefix = "LAWANG_DATABASE_URL: cannot use the database"
 
 // connError turns a failure to reach or to talk to the database into an error that is safe to
 // log.
@@ -23,7 +23,7 @@ const connErrPrefix = "SLUICEWAY_DATABASE_URL: cannot use the database"
 // database=prod`: ... lookup db.internal: no such host", "10.0.0.5:5432 (db.internal): failed SASL
 // auth"), and the server does the same in its own messages (`password authentication failed for
 // user "app"`, `database "prod" does not exist`, `no pg_hba.conf entry for host ...`). Every one
-// of those is a part of SLUICEWAY_DATABASE_URL. So the original error is never returned, wrapped
+// of those is a part of LAWANG_DATABASE_URL. So the original error is never returned, wrapped
 // or formatted: only a classification that cannot carry a value is kept, which is still enough to
 // tell "does not resolve" from "refused" from "wrong password" from "no such database".
 //

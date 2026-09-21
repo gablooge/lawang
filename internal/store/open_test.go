@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gablooge/sluiceway/internal/store"
-	"github.com/gablooge/sluiceway/internal/testdb"
+	"github.com/gablooge/lawang/internal/store"
+	"github.com/gablooge/lawang/internal/testdb"
 )
 
-// Markers that stand in for the parts of SLUICEWAY_DATABASE_URL. None may reach an error, because
+// Markers that stand in for the parts of LAWANG_DATABASE_URL. None may reach an error, because
 // the binary logs what Open returns.
 const (
 	leakUser = "leakuser"
@@ -56,7 +56,7 @@ func TestOpenNeverEchoesTheURL(t *testing.T) {
 	// database are what tell a wrapped parse error from a replaced one.
 	err := failOpen(t, "postgres://"+leakUser+":"+leakPass+"@"+leakHost+":5432/"+leakDB+"?pool_max_conns=banana", 5*time.Second)
 	assertNoLeak(t, err, leakUser, leakPass, leakHost, leakDB, "banana")
-	if !strings.Contains(err.Error(), "SLUICEWAY_DATABASE_URL") {
+	if !strings.Contains(err.Error(), "LAWANG_DATABASE_URL") {
 		t.Errorf("error does not name the variable: %v", err)
 	}
 }
@@ -69,7 +69,7 @@ func TestOpenConnectFailuresNeverEchoTheURL(t *testing.T) {
 		// ".invalid" is reserved and never resolves (RFC 6761), with or without a network.
 		err := failOpen(t, "postgres://"+leakUser+":"+leakPass+"@"+leakHost+".invalid:5432/"+leakDB+"?sslmode=disable&connect_timeout=5", 15*time.Second)
 		assertNoLeak(t, err, leakUser, leakPass, leakHost, leakDB, "5432")
-		if !strings.Contains(err.Error(), "SLUICEWAY_DATABASE_URL") || !strings.Contains(err.Error(), "host name") {
+		if !strings.Contains(err.Error(), "LAWANG_DATABASE_URL") || !strings.Contains(err.Error(), "host name") {
 			t.Errorf("error does not name the variable and the cause: %v", err)
 		}
 	})
@@ -88,7 +88,7 @@ func TestOpenConnectFailuresNeverEchoTheURL(t *testing.T) {
 		if !errors.Is(err, syscall.ECONNREFUSED) {
 			t.Errorf("err = %v, want ECONNREFUSED to survive the classification", err)
 		}
-		if !strings.Contains(err.Error(), "SLUICEWAY_DATABASE_URL") || !strings.Contains(err.Error(), "refused") {
+		if !strings.Contains(err.Error(), "LAWANG_DATABASE_URL") || !strings.Contains(err.Error(), "refused") {
 			t.Errorf("error does not name the variable and the cause: %v", err)
 		}
 	})
@@ -107,7 +107,7 @@ func TestOpenConnectFailuresNeverEchoTheURL(t *testing.T) {
 		u.User = url.UserPassword(leakUser, leakPass)
 		err := failOpen(t, u.String(), 15*time.Second)
 		assertNoLeak(t, err, leakUser, leakPass, realDB, target.Port(), target.Hostname())
-		if !strings.Contains(err.Error(), "SLUICEWAY_DATABASE_URL") || !strings.Contains(err.Error(), "authentication failed") ||
+		if !strings.Contains(err.Error(), "LAWANG_DATABASE_URL") || !strings.Contains(err.Error(), "authentication failed") ||
 			!strings.Contains(err.Error(), "28P01") {
 			t.Errorf("error does not name the variable, the cause and the SQLSTATE: %v", err)
 		}
@@ -117,10 +117,10 @@ func TestOpenConnectFailuresNeverEchoTheURL(t *testing.T) {
 		u := *target
 		u.Path = "/" + leakDB
 		err := failOpen(t, u.String(), 15*time.Second)
-		assertNoLeak(t, err, leakDB, "sluiceway_test", target.Port(), target.Hostname())
-		// The user here is "sluiceway", which is also the schema and the variable prefix, so it
+		assertNoLeak(t, err, leakDB, "lawang_test", target.Port(), target.Hostname())
+		// The user here is "lawang", which is also the schema and the variable prefix, so it
 		// cannot be searched for. The wrong password case covers the user.
-		if !strings.Contains(err.Error(), "SLUICEWAY_DATABASE_URL") || !strings.Contains(err.Error(), "database does not exist") ||
+		if !strings.Contains(err.Error(), "LAWANG_DATABASE_URL") || !strings.Contains(err.Error(), "database does not exist") ||
 			!strings.Contains(err.Error(), "3D000") {
 			t.Errorf("error does not name the variable, the cause and the SQLSTATE: %v", err)
 		}

@@ -5,7 +5,10 @@ Dates are deliberately absent, because a design document that carries dates star
 they slip. The design itself is in [architecture.md](architecture.md). The dated, item-by-item
 working plan is kept apart in [backlog.md](backlog.md), where slipping is cheap.
 
-The repository stays private until **M6**, so the first thing anyone sees is something that runs.
+The repository was private until 2026-09-20, on the reasoning that the first thing anyone sees
+should be something that runs. It is public earlier than that, from the record format onward,
+because the work itself is worth reading before it is worth running. The README says plainly what
+runs today, so nobody is misled.
 
 ---
 
@@ -17,7 +20,7 @@ Sizes are relative effort: **S** is a few days, **M** about a week, **L** more t
 
 The skeleton everything else hangs on.
 
-- `cmd/sluiceway` with the `serve`, `worker`, `migrate` and `version` subcommands
+- `cmd/lawang` with the `serve`, `worker`, `migrate` and `version` subcommands
 - environment config with fail-closed defaults (production unless development is explicit)
 - `internal/ids`: ULIDs and the three blake3 key recipes, with golden test vectors
 - Postgres via pgx, goose migrations embedded in the binary, the three roles
@@ -54,7 +57,7 @@ webhook for an unknown workspace is parked, never routed.
 
 - the `Vault` interface; `local` (AES-GCM, key from the environment, refuses to store plaintext);
   `nango` (self-hosted, HTTP only); `azureapp` (client credentials for Microsoft Graph)
-- `sluiceway connect <provider>`, reading secrets from the environment, never from arguments
+- `lawang connect <provider>`, reading secrets from the environment, never from arguments
 - `/v1` operator API: providers, the connection lifecycle, capabilities, health
 
 **Done when:** a connection can be created, completed and deleted through `/v1`; deleting it
@@ -109,7 +112,8 @@ locally with nothing but Docker installed.
 - setup guides per provider
 - a container image published to GHCR, a tagged release, a changelog
 - `CONTRIBUTING.md` and a provider-authoring guide
-- the repository flips to public
+- the community files a public repository needs: a code of conduct, issue and pull request
+  templates, and real first issues (the repository itself went public on 2026-09-20)
 
 **Done when:** someone who has never seen the project can follow the quickstart to a record at the
 stub sink.
@@ -150,9 +154,12 @@ What carries over, what changes, and what is intentionally left behind.
 Roughly in priority order.
 
 - **Deletions.** Providers that report deletes, and reconciliation that notices absences, emit
-  `op: "delete"` records. The format already reserves the field.
+  `op: "delete"` records. Format v1 already defines them, so shipping this does not change the
+  format ([ADR 4](adr/0004-record-format-v1.md)).
 - **Untrusted-origin marking** populated per provider (inbound mail, external guests). The format
-  already carries `origin.untrusted`.
+  already carries `origin.untrusted`, and defines `false` as "no signal", never as "safe", so
+  that every v0.1 record can say `false` and populating the marking later changes no meaning
+  ([ADR 4](adr/0004-record-format-v1.md), decision 10).
 - **An MCP-backed hydrator** and a tool-calling facade for acting on providers.
 - **More providers:** Gmail, Google Drive, Notion, Asana, Jira, GitHub.
 - **More sinks:** pgvector, webhook fan-out, S3.
@@ -169,8 +176,8 @@ Each becomes a short decision record under `docs/adr/` when it is settled.
 |---|---|---|---|
 | 1 | Typed queries with `sqlc`, or hand-written pgx | **settled:** `sqlc`, see [ADR 1](adr/0001-queries-sqlc.md) | Most bugs in the predecessor's data layer were query-shape mistakes a generator catches at build time |
 | 2 | Migration tool | **settled:** `goose`, embedded, see [ADR 2](adr/0002-migrations-goose.md) | Plain SQL files, runs inside the binary, no separate install |
-| 3 | Scope id format | `{source}:{container_kind}:{container_id}` | Readable and deterministic; the tenant travels separately |
-| 4 | Final field names in the record format | the proposal in architecture section 6 | This is a public contract once v0.1 ships, so it should settle before M1 finishes |
+| 3 | Scope id format | **settled:** `{provider}:{container_kind}:{container_id}` with the internal provider key, a percent-escaped container id and one canonical spelling, see [ADR 3](adr/0003-scope-id-format.md) | Readable and deterministic; the tenant travels separately. It is the join key between a record and the membership of its scope |
+| 4 | Final field names in the record format | **settled:** format v1, see [ADR 4](adr/0004-record-format-v1.md). The proposal's names are kept, a `format` version field is added, `meta.raw_ref` is dropped, and the scope is hashed into the record id | This is a public contract once v0.1 ships, so it should settle before M1 finishes |
 | 5 | Default hydration path | direct API clients | Three of five providers needed them anyway |
 | 6 | One binary with modes, or two binaries | one binary | Simpler releases; roles are just subcommands |
 | 7 | Vault encryption key source | environment master key for v0.1, a KMS interface later | Keeps the local setup dependency-free |

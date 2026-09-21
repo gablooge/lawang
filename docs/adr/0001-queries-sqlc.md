@@ -4,7 +4,7 @@ Status: accepted, 2026-09-19 (backlog item B03)
 
 ## Decision
 
-Queries against Sluiceway's own tables are written as SQL files and compiled to Go with
+Queries against Lawang's own tables are written as SQL files and compiled to Go with
 [`sqlc`](https://sqlc.dev), targeting `pgx/v5`. The generated code is checked in, and CI fails if
 it is stale (`sqlc diff`).
 
