@@ -46,6 +46,7 @@ func (n neverDegrades) DeliveryKeys(body []byte, h provider.Header) (provider.De
 }
 func (n neverDegrades) Verify(r provider.Request, secret []byte) bool { return n.p.Verify(r, secret) }
 func (n neverDegrades) Parse(body []byte) ([]provider.Change, error)  { return n.p.Parse(body) }
+func (n neverDegrades) VersionOrder() provider.VersionOrder           { return n.p.VersionOrder() }
 
 // apiOnly is a provider with no webhook at all: it hydrates and normalizes, and nothing can read a
 // stored delivery for it. A reconciliation-only provider will look like this.
@@ -59,3 +60,4 @@ func (a apiOnly) Hydrate(ctx context.Context, t tenancy.ID, c provider.Change) (
 func (a apiOnly) Normalize(h provider.Hydrated, c provider.Change) ([]record.Record, error) {
 	return a.p.Normalize(h, c)
 }
+func (a apiOnly) VersionOrder() provider.VersionOrder { return a.p.VersionOrder() }

@@ -1,8 +1,10 @@
 package pipeline
 
 import (
+	"bytes"
 	"cmp"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"slices"
@@ -12,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/gablooge/lawang/internal/pipeline/pipelinedb"
+	"github.com/gablooge/lawang/internal/provider"
 	"github.com/gablooge/lawang/internal/record"
 	"github.com/gablooge/lawang/internal/tenancy"
 )
@@ -47,6 +50,11 @@ type ledger struct {
 	q        *pipelinedb.Queries
 	tenant   tenancy.ID
 	provider string
+	// versions is the spelling this provider declared for its versions, as the registry
+	// validated it. It travels with the delivery rather than being asked of the provider again,
+	// so a provider that changes its answer after start-up cannot change how a stored delivery
+	// is ordered. The zero value orders nothing, which is what fails a delivery closed.
+	versions provider.VersionOrder
 }
 
 // lockEntities takes the advisory lock of every entity in the delivery, once each, in a sorted
@@ -138,21 +146,23 @@ func (l ledger) admit(ctx context.Context, r record.Record) (record.Record, admi
 	//
 	// The chain is ordered by the provider's version, which a normalizer promises never goes
 	// backwards for one external id (ADR 4). What that promise means for a string the format calls
-	// opaque is ADR 12 decision 1, and compareVersions is where it is read: two versions this
-	// stage cannot order are refused, not guessed at, because guessing is how an older record
-	// takes the head and the scope access is decided on with it.
+	// opaque is not something this stage can work out: it reads the spelling the provider declared
+	// (provider.VersionOrder, validated at registration) and compares under that, and two versions
+	// the declared order cannot read are refused rather than guessed at, because guessing is how
+	// an older record takes the head and the scope access is decided on with it. ADR 12 decision 1
+	// says which part of that is proved here and which part is the provider's promise.
 	//
 	// Two records of one entity that carry the SAME version are ordered by arrival instead: that
 	// is the move decision 7 is about, and the second of them supersedes the first. Arrival is a
 	// weak order (ADR 12 decision 1 says where it is not an order at all), which is why it decides
 	// only this one case.
 	if haveHead {
-		order, ok := compareVersions(r.Version, head.Version)
+		order, ok := compareVersions(l.versions, r.Version, head.Version)
 		if !ok {
 			return record.Record{}, admitVersionUnordered, fmt.Errorf(
-				"%w: %w: tenant %s, provider %s, entity %s, the incoming version is %q and the entity's newest is %q",
+				"%w: %w: tenant %s, provider %s, entity %s, the incoming version is %q and the entity's newest is %q, and the provider declares %s versions",
 				ErrDeadLetter, ErrVersionNotComparable,
-				l.tenant, l.provider, r.ExternalID, r.Version, head.Version)
+				l.tenant, l.provider, r.ExternalID, r.Version, head.Version, l.versions)
 		}
 		if order < 0 {
 			return record.Record{}, admitStale, nil
@@ -182,40 +192,81 @@ func (l ledger) admit(ctx context.Context, r record.Record) (record.Record, admi
 	return r, admitPrepare, nil
 }
 
-// compareVersions orders two versions of one entity, and says whether they can be ordered at all.
+// compareVersions orders two versions of one entity under the spelling their provider declared,
+// and says whether they can be ordered at all.
 //
 // A version is opaque to a sink, but not to this stage: ADR 4 makes "monotonic per external_id" a
 // promise the provider's normalizer makes to the pipeline, and this is the stage that uses it.
-// ADR 12 decision 1 says what a pipeline may read from that promise, and this is the whole of it:
+// What that promise means for a particular string is not something this function can work out, and
+// ADR 12 decision 1 is now explicit that it never could. It reads the order the provider declared
+// (provider.VersionOrder, validated at registration) and does exactly what that order says:
 //
-//  1. Two runs of decimal digits are ordered by the NUMBER they spell, whatever their length, with
-//     leading zeros counting for nothing. That is what an unpadded counter means, and it is the
-//     commonest spelling a real provider uses, so reading it as bytes ("9" after "10") would get
-//     the common case wrong in the one direction that must never be wrong.
-//  2. Two versions of EQUAL LENGTH are ordered by their bytes. Every encoding whose byte order is
-//     its value order is fixed width for as long as it is in use: a ULID, an epoch in
-//     milliseconds, an RFC 3339 timestamp, a zero-padded counter. For two equal-length runs of
-//     digits this is the same answer as rule 1, so the two rules never disagree.
-//  3. Anything else carries NO order this stage can read, and it says so (ok is false). The caller
-//     dead-letters the delivery with ErrVersionNotComparable.
+//   - VersionOrderDecimal: both versions must be one run of decimal digits, and they are ordered
+//     by the NUMBER they spell, whatever their length, with leading zeros counting for nothing.
+//     Proved, not promised: a version that is not a digit run is refused.
+//   - VersionOrderLexical: both versions must be the SAME NUMBER OF BYTES, and they are ordered by
+//     their bytes. The fixed width is proved here; that the byte order is the value order is the
+//     provider's promise and nothing in this program can check it. That is why it is declared once
+//     by a provider author reading provider.VersionOrder, and not inferred from two strings.
+//   - VersionOrderBase64: both versions must decode as base64, under the same alphabet, to the
+//     same number of bytes, and they are ordered by those bytes. Proved, not promised, which is
+//     the whole reason it is a separate order: base64's ASCII order is NOT its value order ('z' is
+//     value 51 and '0' is value 52, while ASCII puts 'z' above '0'), so a changeKey or an ETag
+//     compared as characters sorts backwards at every carry.
+//   - Anything else, VersionOrderUnset included, orders nothing (ok is false).
 //
-// Rule 3 is the point of the function. Guessing an order for two strings that have none is how an
-// older record takes the head, superseding a newer record at the sink and taking the scope that
-// access is decided on with it, which is the failure this whole item exists to prevent. The
-// refusal fails closed: the head does not move, nothing is delivered, and the operator is told
-// which two versions could not be ordered.
+// Every refusal is the point of the function. Guessing an order for two strings whose order this
+// program does not know is how an older record takes the head, superseding a newer record at the
+// sink and taking the scope that access is decided on with it, which is the failure this whole
+// item exists to prevent. The refusal fails closed: the head does not move, nothing is delivered,
+// and the operator is told which two versions could not be ordered and under which declared order.
 //
-// The order this returns is total on the strings it accepts, so it cannot disagree with itself
-// between two calls: a length comparison and a byte comparison are both total, and rule 1 falls
-// back to bytes when two trimmed digit runs are the same length.
-func compareVersions(v, head string) (order int, ok bool) {
-	if isDecimal(v) && isDecimal(head) {
-		return compareDecimal(v, head), true
-	}
-	if len(v) == len(head) {
-		return strings.Compare(v, head), true
+// The order this returns is total on the pairs it accepts, so it cannot disagree with itself
+// between two calls: a number, a byte comparison over equal lengths and a byte comparison over
+// equal-length decodings are all total.
+func compareVersions(order provider.VersionOrder, v, head string) (int, bool) {
+	switch order {
+	case provider.VersionOrderDecimal:
+		if isDecimal(v) && isDecimal(head) {
+			return compareDecimal(v, head), true
+		}
+	case provider.VersionOrderLexical:
+		// The width is the only half of this order that can be checked, so it is checked. A
+		// provider whose version changed width is not using the fixed-width encoding it declared,
+		// and its two versions have no order here.
+		if v != "" && len(v) == len(head) {
+			return strings.Compare(v, head), true
+		}
+	case provider.VersionOrderBase64:
+		a, alphabetA, okA := decodeBase64(v)
+		b, alphabetB, okB := decodeBase64(head)
+		if okA && okB && alphabetA == alphabetB && len(a) == len(b) {
+			return bytes.Compare(a, b), true
+		}
+	case provider.VersionOrderUnset:
 	}
 	return 0, false
+}
+
+// base64Alphabets are the four spellings of base64, in the order a version is tried against them.
+// A provider uses one of them, and compareVersions refuses two versions that did not decode under
+// the same one: two strings read through two different alphabets are not two values of one
+// encoding, and ordering them would be the guess this package exists to refuse.
+var base64Alphabets = [...]*base64.Encoding{
+	base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding,
+}
+
+// decodeBase64 decodes s under the first alphabet that accepts it, and reports which one.
+func decodeBase64(s string) (decoded []byte, alphabet int, ok bool) {
+	if s == "" {
+		return nil, 0, false
+	}
+	for i, enc := range base64Alphabets {
+		if b, err := enc.DecodeString(s); err == nil {
+			return b, i, true
+		}
+	}
+	return nil, 0, false
 }
 
 // compareDecimal orders two runs of decimal digits by the number they spell. Leading zeros are not
@@ -258,7 +309,7 @@ func (l ledger) head(ctx context.Context, externalID string) (pipelinedb.EntityH
 // known reports whether the ledger already holds this record id, and whether that row is still its
 // entity's newest.
 func (l ledger) known(ctx context.Context, recordID string) (known, isHead bool, err error) {
-	row, err := l.q.LedgerEntry(ctx, pipelinedb.LedgerEntryParams{
+	rowIsHead, err := l.q.LedgerEntry(ctx, pipelinedb.LedgerEntryParams{
 		TenantID: l.tenant.String(), RecordID: recordID,
 	})
 	switch {
@@ -267,5 +318,5 @@ func (l ledger) known(ctx context.Context, recordID string) (known, isHead bool,
 	case err != nil:
 		return false, false, fmt.Errorf("pipeline: read the ledger: %w", err)
 	}
-	return true, row.IsHead, nil
+	return true, rowIsHead, nil
 }

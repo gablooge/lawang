@@ -14,45 +14,72 @@ things to the stage that writes one; this record settles those five.
 4. How the A, B, back to A case of ADR 4 decision 7 is detected, and what it costs.
 5. What the masker recognizes, what a placeholder is, and where the map lives.
 
-### 1. A version is ordered by three rules, the third of which is a refusal
+### 1. A version is ordered under the spelling its provider declares, or not at all
 
 ADR 4 calls `version` opaque to a sink and, in the same paragraph, makes "monotonic per
 `external_id`" a promise the provider's normalizer makes to the pipeline, "which B08 uses to keep
 the supersede chain forward only". It never said what monotonic means for a string.
 
-This record first said it means **byte order**, on the grounds that it is the only order an opaque
-string has, and left the rest as a promise the normalizer had to keep. The round 1 review of the
-pull request showed that this fails in the direction the whole item exists to prevent, so the rule
-is now three rules and one of them is a refusal. `compareVersions` in `internal/pipeline` is the
-whole of it:
+This record has now been wrong about that twice, in the same shape both times, and the shape is
+worth naming before the decision: **it tried to read a property out of the strings themselves.**
 
-1. **Two runs of decimal digits are ordered by the number they spell**, whatever their length, with
-   leading zeros counting for nothing. An unpadded counter is the commonest spelling a real
-   provider uses, and reading it as bytes gets it wrong at the tenth change in both directions.
-2. **Two versions of equal length are ordered by their bytes.** Every encoding whose byte order is
-   its value order is fixed width for as long as it is in use: a ULID, an epoch in milliseconds, an
-   RFC 3339 timestamp in UTC, a zero-padded counter. For two equal-length runs of digits this is
-   the same answer as rule 1, so the two rules can never disagree.
-3. **Anything else carries no order, and the delivery is refused** (`ErrVersionNotComparable`,
-   wrapping `ErrDeadLetter`, counted on `Prepared.VersionUnordered`). The head does not move,
-   nothing is delivered, the error names the entity and both versions, and the fix is on the
-   normalizer.
+- The first version said a version is ordered by **byte order**, because that is the only order an
+  opaque string has. Round 1 showed the failure: with `"9"` and `"10"`, `"9" > "10"` byte-wise, so
+  an older record arriving after a newer one was **not** stale. It superseded the newer record,
+  became the head, and the sink's live version and the scope access is decided on both went
+  backwards, with `Stale` at zero and no error anywhere.
+- The second version added "two versions of **equal length** are ordered by their bytes, because
+  every encoding whose byte order is its value order is fixed width". Round 2 showed that the
+  converse does not hold and is what the rule actually needed: a fixed width encoding whose byte
+  order is **not** its value order is also always the same length, so the refusal below never saw
+  it. **Base64 is the concrete case.** Its alphabet is `A-Z a-z 0-9 + /`, so `z` is value 51 and
+  `0` is value 52, while ASCII puts `z` at 122 and `0` at 48: a counter ticking from `...z` to
+  `...0` sorts backwards. That is a Microsoft Graph `changeKey` and an Exchange ETag, which B13,
+  B16 and B17 all depend on. A hash and a UUID have the same property. The reviewer drained the
+  older `CQAAABYAAABz` after the newer `CQAAABYAAAB0` and watched the older one take the head and
+  the newer one's scope, with nothing counted and no error: the round 1 failure again, in another
+  encoding.
 
-Rule 3 is why the other two are safe. **What was wrong with byte order alone** is worth writing
-down, because it is the exact failure this item exists to prevent and the first version of this
-record claimed it could not happen: with versions `"9"` and `"10"`, `"9" > "10"` byte-wise, so an
-older record arriving after a newer one (a replayed dead letter, a backfill beside the live feed,
-both named below) was **not** stale. It superseded the newer record, became the head, and the sink's
-live version and the scope access is decided on both went backwards, with `Stale` at zero and no
-error anywhere.
+**So the pipeline stops inferring and the provider declares.** `provider.VersionOrder` is a
+required method of `provider.Provider`, validated once at registration (`ErrNoVersionOrder`), and
+its zero value is "no order", so a provider author who has not thought about this gets a start-up
+refusal and never a silent guess. `compareVersions` in `internal/pipeline` then does exactly what
+was declared and nothing else:
 
-A rule that inverts unpadded decimals is not viable, because unpadded decimals are what real
-providers send. Ordering by length and then by bytes was considered and rejected: it gets unpadded
-decimals right and gets a fixed-width base32 counter such as a ULID wrong, which is the encoding
-this record recommends. Letting the provider declare the comparison was considered and rejected for
-B08: an optional interface leaves the unsafe default in place for the provider that forgets, which
-is exactly the case that hurts. Rules 1 and 2 cover every encoding a normalizer should be using,
-and rule 3 refuses the rest instead of guessing.
+1. **`VersionOrderDecimal`**: both versions must be one run of decimal digits, ordered by the
+   number they spell, whatever their length, with leading zeros counting for nothing. An unpadded
+   counter and an epoch are this, and it is the commonest thing a real provider sends (ClickUp's
+   `date_updated`, which B11 uses). **Proved, not promised:** a version that is not a digit run is
+   refused.
+2. **`VersionOrderLexical`**: both versions must be the same number of bytes, ordered by their
+   bytes. A ULID, Crockford base32, uppercase hex, an epoch in milliseconds, an RFC 3339 timestamp
+   in UTC with a fixed number of fractional digits. **This one is the provider's promise.** The
+   fixed width is checked here and a change of width is refused; that the byte order is the value
+   order is not checkable and never was, which is the whole point of the round 2 finding. It must
+   not be declared for base64, for RFC 4648 base32 (whose alphabet runs `A-Z` then `2-7`, while
+   ASCII runs `2-7` then `A-Z`), for a UUID, or for anything mixing letter cases.
+3. **`VersionOrderBase64`**: both versions must decode as base64, under the same alphabet, to the
+   same number of bytes, ordered by those bytes. **Proved, not promised:** the pipeline decodes, so
+   the alphabet's ASCII order cannot mislead it, and this is how B13, B16 and B17 use a `changeKey`
+   or an ETag as it comes.
+4. **Anything the declaration cannot read is refused** (`ErrVersionNotComparable`, wrapping
+   `ErrDeadLetter`, counted on `Prepared.VersionUnordered`). The head does not move, nothing is
+   delivered, the error names the entity, both versions and the declared order, and the fix is on
+   the normalizer.
+
+**Where a provider author meets this** is `provider.Provider.Normalize` and `record.Record.Version`,
+not this record. Both now say what the allowed spellings are and name the ordinary shapes that are
+refused: a dotted version (`"1.9.3"` against `"1.10.2"`, a SharePoint file at `"9.0"` then
+`"10.0"`), an RFC 3339 timestamp that grows a fractional second, and a raw base64 token declared as
+lexical. Since a sink cannot see how a version is spelled (ADR 4 calls it opaque), a normalizer is
+free to re-spell the provider's own token into something orderable, and that is the fix in each of
+those cases.
+
+Rejected on the way: **length then bytes** (it orders unpadded decimals correctly and inverts a
+fixed-width base32 counter such as a ULID). **An optional declaration**, which is what round 1
+rejected and what this is not: an optional interface leaves an unsafe default in place for the
+provider that forgets, while a required method with a refusing zero value leaves nothing in place
+at all.
 
 **Two records of one entity that carry the same version are ordered by arrival.** That is the case
 decision 7 is about, an entity that moved while the provider's version stood still, and the second
@@ -109,20 +136,30 @@ queue on purpose and calls "a late arrival of an old version". The alternative, 
 head, would supersede a newer record at the sink and with it the scope that access is decided on,
 which is the failure this whole item exists to prevent.
 
-**The residual risk, stated plainly, in both directions.** The first version of this record stated
-it in one direction only, which is how the unsafe one went unnoticed for a round of review. Under
-the three rules of decision 1 the two directions are:
+**The residual risk, stated plainly, in both directions.** Two earlier versions of this record
+understated it, and each understatement cost a round of review: the first stated only the safe
+direction, and the second declared the unsafe one closed when it was closed only for encodings
+whose out-of-order pairs differ in length. Under decision 1 the three directions are:
 
-- **A newer record held back.** A normalizer whose versions are ordered by neither rule 1 nor rule
-  2, but which happen to be the same length, has the wrong record called stale. The symptom is a
+- **A delivery refused.** A version that does not fit the spelling its provider declared loses the
+  delivery to `ErrVersionNotComparable` rather than having it guessed at. This is where a dotted
+  version, a timestamp that grew a fraction, and a base64 token declared as lexical all land. It
+  is loud, it is per delivery, and it is the safe direction: the head does not move.
+- **A newer record held back.** A provider that declares `VersionOrderLexical` and whose
+  same-width versions are not in byte order has the wrong record called stale. The symptom is a
   `Stale` count that is not zero while the sink stays behind. Nothing wrong is delivered and no
-  access is widened, which is the safe direction.
-- **A delivery refused.** A normalizer whose versions cannot be ordered at all loses the delivery
-  to `ErrVersionNotComparable` rather than having it guessed at. That is loud, it is per delivery,
-  and it is also the safe direction: the head does not move.
-
-**The unsafe direction, an older record taking the head and its scope, is closed by rule 3** and
-not by a promise. That is the whole reason decision 1 has a refusal in it.
+  access is widened, which is also the safe direction.
+- **An older record taking the head and its scope**, which is the unsafe one. It requires a
+  provider that declares `VersionOrderLexical` while its versions are not in byte order, and then
+  only for the pairs where the byte order and the value order disagree, which for a misdeclared
+  encoding is about half of them. **Nothing in this program can close that**, because "these bytes
+  sort the way this encoding's values sort" is not a fact about two strings: it is a fact about the
+  encoding, which is why decision 1 makes a provider state it once instead of letting the pipeline
+  infer it every time. What is closed is the class that hurt twice here, since `VersionOrderUnset`
+  refuses, `VersionOrderDecimal` and `VersionOrderBase64` are both proved rather than trusted, and
+  `VersionOrderLexical` refuses a width that changed. What is left is a provider author declaring
+  something untrue about their own encoding, on a contract whose doc comment names, by name, every
+  encoding that would make it untrue.
 
 ### 4. A, B, and back to A: dead-lettered and counted, as ADR 4 requires
 
@@ -187,7 +224,12 @@ telephone number and an IBAN, in `Title` and `Text` only.
   number whose first group is 19xx or 20xx. The first implementation had only the digit count, and
   turned most IPv4 addresses (`192.168.100.200`, `172.217.169.110`) into telephone placeholders,
   which for a connector whose first providers are a task tracker and a chat tool is ordinary
-  content destroyed.
+  content destroyed. **The class the year rule gives up, named rather than left to be
+  rediscovered:** a national service number whose first group is 19xx or 20xx. Australian premium
+  rate numbers and Vietnamese hotlines are both spelled `1900 XXX XXX`, so `1900 654 321` is not
+  masked, while `1800 123 456` and `1300 655 506`, one range over, are. The leading trunk zero is
+  what saves nearly every other national plan (`0812-3456-7890`, `020 7946 0958`), which is why
+  the class is this narrow.
 - **One delivery may map at most `MaxSecretsPerDelivery` (1,024) distinct values.** Everything the
   masker finds becomes a permanent row, in one statement, and the text it scans comes from a
   sender: `ingress.DefaultMaxBody` and `record.MaxText` are both 1 MiB, which is tens of thousands
@@ -197,14 +239,34 @@ telephone number and an IBAN, in `Title` and `Text` only.
   (`ErrTooManySecrets`, wrapping `ErrDeadLetter`), the way an over-long external id is, and the fix
   is on the normalizer, which decides how much of a payload becomes one record. 1,024 is far above
   content and far below abuse; retention of what is under it stays B25's.
-- **The placeholder is a ULID, not a hash of the value.** A deterministic token would hand every
-  sink an oracle: anyone with a guess at an address could compute its token and confirm that the
-  address appears in that tenant's records, which is exactly the fact masking withholds. One value
-  keeps one token within one tenant, so the same person reads as the same placeholder everywhere,
-  and the same value in two tenants is two tokens.
+- **The placeholder is a random ULID, not a hash of the value.** A deterministic token would hand
+  every sink an oracle: anyone with a guess at an address could compute its token and confirm that
+  the address appears in that tenant's records, which is exactly the fact masking withholds.
+  Salting does not close it, because a sink holds every salt there is: the tenant is its own, the
+  kind is in the token's prefix, and the record id and `meta.delivery` are both on the record. So
+  the property is that the token is not a function of ANY of them, and
+  `TestMintingOneValueTwiceGivesTwoTokens` pins exactly that: it drains one delivery, deletes the
+  `redaction_map` and `record_ledger` rows as the superuser, and drains the same delivery again, so
+  the second minting differs from the first in nothing a sink can see. One value keeps one token
+  within one tenant, so the same person reads as the same placeholder everywhere, and the same
+  value in two tenants is two tokens.
+- **Its 80 random bits come from `crypto/rand`** (`ids.NewUnpredictable`), not from `ids.New`,
+  whose own doc comment forbids that use: `New` draws them from `math/rand` seeded once at process
+  start, through a MONOTONIC reader, so two ids minted in one millisecond differ by an increment of
+  at most 2^32 and one observed id narrows what follows it to a searchable window. A placeholder is
+  not a capability, so neither is a disclosure on its own. What they would cost is that a
+  placeholder planted in source text could be made to collide with a real mapping an operator later
+  resolves, and that the gap between two tokens would say how many values this deployment masked in
+  between, across tenants. Both are cheap to avoid, so they are avoided, and
+  `TestTwoTokensMintedTogetherAreNotOneStepApart` is what would notice the call going back.
 - **The map stays here.** `redaction_map` is row-level secured per tenant, no helper role is
   granted anything on it, and nothing sends it anywhere. It holds personal data by construction and
-  an operator prunes it by `last_seen_at` (B25).
+  an operator prunes it by `last_seen_at` (B25). Both of its policies, and every other policy in
+  the schema, are pinned by predicate in `TestEveryPolicySaysWhatTheDesignSaysItSays` and by
+  behaviour in `TestAnotherTenantsLedgerAndRedactionMapAreInvisible`: counting policies, which is
+  all the schema test used to do, is passed by a policy that isolates nothing. There is no
+  `first_seen_at` column, because nothing would read one and the token's own ULID prefix is
+  already the millisecond the mapping was minted.
 - **Masking is the last stage**, after the ledger has decided, so a record that is skipped or held
   back costs no work and leaves no trace in the map.
 - **A field that masking makes too long is a dead letter** (`ErrMaskedTooLong`). A placeholder is
@@ -238,13 +300,20 @@ telephone number and an IBAN, in `Title` and `Text` only.
 
 ## Cost
 
-- **The version order covers two spellings and refuses the rest.** A normalizer whose versions are
-  neither decimal counters nor fixed width loses every second delivery of an entity to
-  `ErrVersionNotComparable`, which is loud and costs a dead letter per change. That is the price of
-  not guessing, and it is deliberate: the alternative is the failure the round 1 review found. A
-  normalizer whose versions are the same length but not in byte order still loses records to the
-  `Stale` count, visibly in the sense that a counter moves and silently in the sense that nothing
-  errors. Every provider from B11 on has to know both, and the normalizer contract says so.
+- **The version order covers three spellings and refuses the rest.** A normalizer whose versions
+  fit none of them loses every second delivery of an entity to `ErrVersionNotComparable`, which is
+  loud and costs a dead letter per change. That is the price of not guessing, and it is deliberate:
+  the alternative is the failure round 1 found and the one round 2 found. A provider that declares
+  `VersionOrderLexical` for versions that are the same width but not in byte order gets the
+  residual of decision 3's third bullet, which this record does not claim to close. Every provider
+  from B11 on has to know all of this, and the normalizer contract now says so: it is written on
+  `provider.Provider.Normalize` and on `record.Record.Version`, which is what a provider author
+  reads, and `provider.VersionOrder` names the encodings that break the lexical promise.
+- **A required method on `provider.Provider` is a cost of its own.** Every provider must implement
+  `VersionOrder`, including one whose versions never need ordering, and the registry refuses it at
+  start-up if it does not. That is the point (an optional declaration leaves an unsafe default in
+  place for the provider that forgets), and the price is a method on an interface that already has
+  three.
 - **Two subscriptions of one tenant onto one entity have no order at all.** The ordering key is
   `{provider key}:{subscription id}` (ADR 11 decision 3), so the outbox's FIFO does not serialize
   one entity across two subscriptions, and a reconciliation pass beside the live feed is a third

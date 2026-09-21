@@ -102,15 +102,36 @@ var ErrBadDelivery = errors.New("fake: bad delivery")
 var ErrBadChange = errors.New("fake: bad change")
 
 // Provider is the double. Build one with New and register it like any other provider.
-type Provider struct{ key string }
+type Provider struct {
+	key      string
+	versions provider.VersionOrder
+}
 
-// New returns a fake provider whose Key is exactly key. The key is deliberately not validated or
-// defaulted here: the registry owns that rule, and a test that proves the registry refuses a bad
-// key needs a provider that offers one.
-func New(key string) *Provider { return &Provider{key: key} }
+// New returns a fake provider whose Key is exactly key and whose versions are decimal counters,
+// which is what every fixture in the repository spells them as. The key is deliberately not
+// validated or defaulted here: the registry owns that rule, and a test that proves the registry
+// refuses a bad key needs a provider that offers one.
+func New(key string) *Provider {
+	return &Provider{key: key, versions: provider.VersionOrderDecimal}
+}
+
+// NewOrdering returns a fake provider that declares order rather than the decimal default.
+//
+// It is here because the version order is a contract on the provider and not a setting of the
+// pipeline, so the only way to test what the pipeline does with a base64 counter, a fixed-width
+// token or a provider that declares nothing is to have a provider that says so. The order is not
+// validated here either, for the same reason the key is not: the registry is what refuses one,
+// and the test of that refusal needs a provider that offers it.
+func NewOrdering(key string, order provider.VersionOrder) *Provider {
+	return &Provider{key: key, versions: order}
+}
 
 // Key is the provider key.
 func (p *Provider) Key() string { return p.key }
+
+// VersionOrder is how this provider spells a version: decimal counters unless the test asked for
+// something else with NewOrdering. Every Event fixture in the repository uses a plain counter.
+func (p *Provider) VersionOrder() provider.VersionOrder { return p.versions }
 
 // Sign is the signature a delivery of body carries, as SignatureHeader. It is here and not in a
 // test so that every test signs the same way Verify checks.

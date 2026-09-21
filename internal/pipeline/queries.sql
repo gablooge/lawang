@@ -23,7 +23,14 @@
 -- defense, for the shapes the ordering key does not cover: one entity reached through two
 -- subscriptions of one tenant, and a reconciliation pass running beside the live feed.
 --
--- Two entities whose lock strings hash alike only wait for each other, which is harmless.
+-- Two entities whose lock strings hash alike do NOT merely wait for each other, which is worth
+-- writing down because the sorting above is what keeps it harmless. The sort is over the external
+-- id and the lock is over its 64 bit hash, so a collision breaks the order the sort exists to
+-- create: with external ids A < B < C and hash(A) = hash(C), a delivery carrying {A, B} takes the
+-- two locks in the opposite order to one carrying {B, C}, and that is a deadlock rather than a
+-- wait. At 64 bits it will not happen, and the retry ladder would carry the aborted transaction if
+-- it did. Sorting by the hash instead of by the external id is what would make it impossible, and
+-- that is B10's (issue #10), which owns the lock key.
 SELECT pg_advisory_xact_lock(
   hashtextextended(@tenant_id::text || chr(31) || @provider::text || chr(31) || @external_id::text, 0));
 
@@ -42,7 +49,12 @@ SELECT record_id, version, scope
 -- name: LedgerEntry :one
 -- Whether this record id has already been prepared, and whether it is still its entity's head.
 -- Those are conditions 1 and 2 of ADR 4 decision 7. A primary key lookup.
-SELECT record_id, is_head, scope
+--
+-- is_head is the whole of it, and this row's own scope is deliberately NOT selected. Condition 3
+-- compares the HEAD's scope, which EntityHead returns, and selecting this row's scope here invited
+-- a reader to believe otherwise. The row's existence answers condition 1 and is_head answers
+-- condition 2.
+SELECT is_head
   FROM record_ledger
  WHERE tenant_id = @tenant_id
    AND record_id = @record_id;

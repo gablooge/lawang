@@ -6,6 +6,7 @@
 package ids
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -45,6 +46,27 @@ var ErrSeparatorInPart = errors.New("ids: key part contains the 0x1F separator")
 // unpredictable. Those come from crypto/rand.
 func New() string {
 	return ulid.Make().String()
+}
+
+// NewUnpredictable returns a ULID whose 80 random bits come from crypto/rand: the same shape and
+// the same sortable millisecond prefix as New, and none of its guessability.
+//
+// It is what New's warning points at. Use it wherever the value must not be predictable from
+// another one: internal/pipeline mints a masking placeholder with it, because a placeholder whose
+// successor can be worked out from one observed token can be made to collide with a real mapping,
+// and because the gap between two of them would otherwise say how many values a deployment masked
+// in between.
+//
+// It returns an error rather than panicking, since the only ways it can fail are the entropy
+// source failing and the clock passing the year 10889, and a caller that is already inside a
+// transaction would rather roll it back than take the process down.
+func NewUnpredictable() (string, error) {
+	id, err := ulid.New(ulid.Now(), rand.Reader)
+	if err != nil {
+		// ulid.New's error quotes nothing but its own cause, and nothing here has seen a value.
+		return "", fmt.Errorf("ids: mint an unpredictable id: %w", err)
+	}
+	return id.String(), nil
 }
 
 // DeliveryID is the accept-path dedupe key: blake3(provider, raw_body), as 64 hex characters. An

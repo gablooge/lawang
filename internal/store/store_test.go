@@ -703,6 +703,111 @@ func TestEveryTableForcesRowLevelSecurity(t *testing.T) {
 	}
 }
 
+// policy is what one row-level security policy says, as the catalog spells it.
+type policy struct {
+	cmd, roles, using, check, why string
+}
+
+// TestEveryPolicySaysWhatTheDesignSaysItSays is the predicate half of the test above.
+//
+// TestEveryTableForcesRowLevelSecurity counts policies and never reads one, so a policy that
+// isolates nothing passes it: `USING (true)` on redaction_map, which holds by construction the
+// personal data the masker took out of records, was green across the whole repository in review
+// round 2. What isolation rested on then was every query in every package remembering
+// `tenant_id = @tenant_id`, and on nothing else, so the first query written without that predicate
+// would have been a cross-tenant read of personal data with every test still passing.
+//
+// So the predicates themselves are listed here, for EVERY table that has one and not only for the
+// two that were new at the time. A migration that adds, widens or drops a policy has to say so in
+// this table, where a reviewer sees it. The two `true` policies are the deliberate ones: they are
+// granted to a single helper role each, they are read as the design's own exception, and
+// TestHelperRolesHoldOnlyTheGrantsTheDesignNames is what keeps those roles' reach to one table.
+//
+// The behaviour behind the predicate is pinned separately, because a predicate that reads right
+// and does nothing would pass this: TestTenantCannotReadOrWriteAnotherTenant for tenants, and
+// TestAnotherTenantsLedgerAndRedactionMapAreInvisible in internal/pipeline for the two tables of
+// B08.
+func TestEveryPolicySaysWhatTheDesignSaysItSays(t *testing.T) {
+	// The catalog renders the predicate from the parse tree, so tenant_id's domain shows as a
+	// cast. Matching the rendered text is the point: it is what the database will actually apply.
+	const (
+		byTenantID = "((tenant_id)::text = current_tenant())"
+		byID       = "((id)::text = current_tenant())"
+	)
+	want := map[string]policy{
+		"tenants/tenant_isolation":       {"*", "public", byID, byID, "a tenant sees its own row (migration 00001)"},
+		"outbox/tenant_isolation":        {"*", "public", byTenantID, byTenantID, "migration 00002"},
+		"outbox/worker_claim_select":     {"r", "lawang_worker", "true", "", "the worker claims across tenants, which is its whole job (migration 00002)"},
+		"outbox/worker_claim_update":     {"w", "lawang_worker", "true", "true", "attempts, lease_until and lease_token (migration 00002)"},
+		"subscriptions/tenant_isolation": {"*", "public", byTenantID, byTenantID, "migration 00003"},
+		"subscriptions/resolver_read":    {"r", "lawang_resolver", "true", "", "deriving the tenant is the resolver's whole job (migration 00003)"},
+		"record_ledger/tenant_isolation": {"*", "public", byTenantID, byTenantID, "the supersede chain is per tenant (migration 00004)"},
+		"redaction_map/tenant_isolation": {"*", "public", byTenantID, byTenantID, "personal data by construction (migration 00004)"},
+	}
+
+	db := open(t, "")
+	ctx := testCtx(t)
+	err := db.Tx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT c.relname, p.polname, p.polcmd::text, p.polpermissive,
+			       coalesce((SELECT string_agg(r.rolname, ',' ORDER BY r.rolname)
+			                   FROM pg_roles r WHERE r.oid = ANY(p.polroles)), 'public'),
+			       coalesce(pg_get_expr(p.polqual, p.polrelid), ''),
+			       coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '')
+			  FROM pg_policy p
+			  JOIN pg_class c ON c.oid = p.polrelid
+			  JOIN pg_namespace n ON n.oid = c.relnamespace
+			 WHERE n.nspname = $1`, store.Schema)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		seen := map[string]bool{}
+		for rows.Next() {
+			var rel, name, cmd, roles, using, check string
+			var permissive bool
+			if err := rows.Scan(&rel, &name, &cmd, &permissive, &roles, &using, &check); err != nil {
+				return err
+			}
+			key := rel + "/" + name
+			seen[key] = true
+			// A restrictive policy narrows rather than grants, and reading one as though it
+			// granted would read the whole set wrongly. None exists today; if one is added, this
+			// test has to learn how to combine them before it can go on meaning anything.
+			if !permissive {
+				t.Errorf("policy %s is RESTRICTIVE, which this test does not know how to read: teach it before adding one", key)
+				continue
+			}
+			got := policy{cmd: cmd, roles: roles, using: using, check: check}
+			exp, ok := want[key]
+			if !ok {
+				t.Errorf("policy %s exists and nothing in the design names it: %+v", key, got)
+				continue
+			}
+			exp.why = ""
+			if got != exp {
+				t.Errorf("policy %s is %+v, want %+v (%s): a policy that does not say what the design "+
+					"says it says is a table whose isolation rests on every query remembering to filter",
+					key, got, exp, want[key].why)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// The other direction, so that a migration which quietly drops a policy fails here rather
+		// than at the first cross-tenant read, and so that a query returning nothing cannot pass.
+		for key, p := range want {
+			if !seen[key] {
+				t.Errorf("policy %s is gone: %s", key, p.why)
+			}
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestHelperRolesHoldOnlyTheGrantsTheDesignNames is the grant half of the test above, and it
 // guards every future migration the same way.
 //

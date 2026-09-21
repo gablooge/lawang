@@ -88,6 +88,52 @@ func (s *shifty) Normalize(_ provider.Hydrated, _ provider.Change) ([]record.Rec
 	return nil, errors.New("not used")
 }
 
+func (s *shifty) VersionOrder() provider.VersionOrder { return provider.VersionOrderDecimal }
+
+// TestNewRegistryRefusesAProviderWithNoVersionOrder is the start-up half of ADR 12 decision 1.
+//
+// How a version is spelled is the only thing that lets internal/pipeline decide which of two
+// versions of one entity is newer, and it cannot be worked out from the strings: two versions in
+// any fixed width encoding are the same length, and base64, a hash and a UUID are all fixed width
+// and none of them sorts by value in ASCII. So the provider declares it, and a provider that
+// declares nothing must not register. The alternative is a process that starts, accepts
+// deliveries, and dead-letters every entity that changes twice.
+//
+// The zero value is one of the cases below on purpose: forgetting the method body has to fail, not
+// merely returning something odd.
+func TestNewRegistryRefusesAProviderWithNoVersionOrder(t *testing.T) {
+	t.Parallel()
+	for _, order := range []provider.VersionOrder{
+		provider.VersionOrderUnset,
+		provider.VersionOrder(200), // a value from a later program, or a stray conversion
+	} {
+		_, err := provider.NewRegistry(fake.NewOrdering("ordered_by_nothing", order))
+		if !errors.Is(err, provider.ErrNoVersionOrder) {
+			t.Errorf("NewRegistry with %s gave %v, want ErrNoVersionOrder", order, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), "ordered_by_nothing") {
+			t.Errorf("the refusal should name the provider, which is a program constant: %v", err)
+		}
+	}
+	// And the three real orders register, so the refusal above is about the declaration and not
+	// about the check being stuck at "no".
+	for _, order := range []provider.VersionOrder{
+		provider.VersionOrderDecimal,
+		provider.VersionOrderLexical,
+		provider.VersionOrderBase64,
+	} {
+		reg, err := provider.NewRegistry(fake.NewOrdering("ordered", order))
+		if err != nil {
+			t.Fatalf("NewRegistry with %s: %v", order, err)
+		}
+		entry, ok := reg.Lookup("ordered")
+		if !ok || entry.VersionOrder() != order {
+			t.Errorf("the registry kept %s for a provider declaring %s", entry.VersionOrder(), order)
+		}
+	}
+}
+
 func TestTheRegistryAsksForAKeyOnceAndKeepsItsOwnCopy(t *testing.T) {
 	t.Parallel()
 

@@ -581,16 +581,19 @@ A **new version is a new record.** Edits never overwrite; the new record carries
 id of the version it replaces. Supersede links only point forward, so a late-arriving old version
 can never claim to replace a newer one.
 
-What "forward" is decided by is [ADR 12](adr/0012-ledger-supersede-masking.md), and it is three
-rules rather than one, because ADR 4 calls `version` opaque to a sink and "monotonic per
-`external_id`" has to mean something a pipeline can check. **Two runs of decimal digits are ordered
-by the number they spell** (an unpadded counter is what most providers send, and byte order puts
-`"9"` after `"10"`). **Two versions of equal length are ordered by their bytes** (a ULID, an epoch
-in milliseconds, an RFC 3339 timestamp, a padded counter: every encoding whose byte order is its
-value order is fixed width while it is in use). **Anything else carries no order and the delivery
-is refused by name**, because guessing one is how an older record supersedes a newer one at the
-sink and takes the scope access is decided on with it. For two records that carry the same version
-there is only arrival order, and that decides nothing else. A record older than its entity's newest
+What "forward" is decided by is [ADR 12](adr/0012-ledger-supersede-masking.md), and the short
+version is that the **provider declares how it spells a version and the pipeline does only what
+was declared**. ADR 4 calls `version` opaque to a sink, and the pipeline cannot read an order out
+of an opaque string: two versions in any fixed width encoding are the same length, and base64 (a
+Microsoft Graph `changeKey`, an Exchange ETag), a hash and a UUID are all fixed width and none of
+them sorts by value in ASCII. So `provider.VersionOrder` is a required method, validated at
+registration, and it is one of three: **decimal**, one run of digits ordered by the number it
+spells; **lexical**, a fixed width whose byte order is its value order (a ULID, Crockford base32,
+uppercase hex, an RFC 3339 timestamp in UTC); or **base64**, ordered by the bytes it decodes to.
+A version the declaration cannot read, and a provider that declares nothing, are **refused by
+name**, because guessing is how an older record supersedes a newer one at the sink and takes the
+scope access is decided on with it. For two records that carry the same version there is only
+arrival order, and that decides nothing else. A record older than its entity's newest
 is neither linked nor delivered: it is held back and counted, because the sink already has
 something newer and an unlinked older record would leave it holding two live versions of one
 entity.
@@ -733,6 +736,10 @@ type Provider interface {
 	Key() string                                                   // "slack"
 	Hydrate(ctx context.Context, t Tenant, c Change) (Hydrated, error)
 	Normalize(h Hydrated, c Change) ([]Record, error)
+	// How this provider spells Record.Version, so internal/pipeline can order two versions of
+	// one entity without inferring an order from the strings (ADR 12 decision 1). Decimal,
+	// lexical or base64; the registry refuses anything else, the zero value included.
+	VersionOrder() VersionOrder
 }
 
 // Optional capabilities.

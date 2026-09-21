@@ -73,7 +73,8 @@ CREATE POLICY tenant_isolation ON record_ledger
 -- The token is a ULID and not a hash of the value, deliberately. A deterministic token would hand
 -- every sink an oracle: anyone holding a guess at an address could compute its token and confirm
 -- that the address appears in a tenant's records, which is exactly the fact masking is there to
--- withhold. A random token stands for the value and says nothing about it.
+-- withhold. A random token stands for the value and says nothing about it, and its 80 random bits
+-- come from crypto/rand (ids.NewUnpredictable), so one observed token does not narrow the next.
 --
 -- This table holds personal data by construction, so it is row-level secured like everything else
 -- and an operator prunes it by last_seen_at (retention is B25).
@@ -84,10 +85,13 @@ CREATE TABLE redaction_map (
   -- What was masked, exactly as it stood in the text. Bounded because it is a column of a unique
   -- index and because the masker's own patterns are bounded well below this.
   value         text        NOT NULL CHECK (value <> '' AND octet_length(value) <= 512),
-  first_seen_at timestamptz NOT NULL DEFAULT now(),
   -- Written every time the value is seen again. The upsert has to write something on conflict in
   -- order to RETURN the token the value already has, and this is the column worth writing: it is
   -- what tells an operator that a mapping is still in use before they prune it.
+  --
+  -- There is deliberately no first_seen_at beside it. Nothing would read one: the token is a ULID,
+  -- so its own first 48 bits are the millisecond the mapping was minted, and a column that only a
+  -- migration comment knows about is a column an operator is told about and cannot check.
   last_seen_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, token),
   -- One token per value, so the same address reads as the same placeholder everywhere in a

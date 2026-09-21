@@ -113,6 +113,17 @@ type Record struct {
 	// changes, and that for one ExternalID it never goes backwards. Nothing in the format can
 	// check that promise. To a sink a version is opaque: equal or not equal, and the order of
 	// versions is what Supersedes says.
+	//
+	// Opaque to a sink is not opaque to the pipeline, which is the part a normalizer author has
+	// to know. internal/pipeline keeps the supersede chain pointing forward, so it has to order
+	// two versions of one entity, and it does that under the spelling the provider declares as
+	// provider.VersionOrder: one run of decimal digits ordered by its number, a fixed-width
+	// string whose byte order is its value order, or base64 of a fixed-width value ordered by the
+	// bytes it decodes to. A version the declared order cannot read is a dead letter
+	// (pipeline.ErrVersionNotComparable) and not a guess, so a dotted version ("1.9.3" against
+	// "1.10.2"), a timestamp that grows a fractional second, and a raw base64 change token
+	// declared as lexical are all refused. Since a sink cannot see what a version is spelled
+	// like, a normalizer is free to re-spell the provider's own token into something orderable.
 	Version string `json:"version"`
 	// Supersedes is the ID of the record this one replaces, or none (null on the wire). Links
 	// point forward only, and a record never supersedes itself.

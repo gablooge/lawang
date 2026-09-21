@@ -1,14 +1,20 @@
 package pipeline
 
-import "github.com/gablooge/lawang/internal/record"
+import (
+	"github.com/gablooge/lawang/internal/provider"
+	"github.com/gablooge/lawang/internal/record"
+)
 
-// NormalizedFor builds a Normalized out of records that were sealed somewhere else.
+// NormalizedFor builds a Normalized out of records that were sealed somewhere else, under a
+// version order the caller names.
 //
-// It is here for the one test that needs a record no provider in this repository can produce: an
-// entity whose external id is longer in bytes than a supersede chain can be keyed by. Nothing in
-// the program builds a Normalized any way but through Normalize.
-func NormalizedFor(providerKey string, recs []record.Record) Normalized {
-	return Normalized{provider: providerKey, records: recs}
+// It is here for the tests that need something no provider in this repository can produce: an
+// entity whose external id is longer in bytes than a supersede chain can be keyed by, and a
+// delivery whose provider declared no version order at all (which the registry refuses at
+// start-up, so Normalize cannot build one). Nothing in the program builds a Normalized any way
+// but through Normalize.
+func NormalizedFor(providerKey string, order provider.VersionOrder, recs []record.Record) Normalized {
+	return Normalized{provider: providerKey, versions: order, records: recs}
 }
 
 // RecordsOf is what Normalize produced, for the tests that look at the records before they are
@@ -26,7 +32,7 @@ var (
 
 // CompareVersions is the version order of ADR 12 decision 1, exported for the table test that
 // pins it. No caller in the program needs it: the ledger is the only thing that orders a version,
-// and it does so with the entity's head in hand.
+// and it does so with the entity's head and the provider's declared spelling in hand.
 var CompareVersions = compareVersions
 
 // The masker's pure half, reachable from the external test package and from nowhere else.

@@ -56,6 +56,71 @@ func TestPrepareRefusesWhatItCannotDoSafely(t *testing.T) {
 	}
 }
 
+// TestTheCountersSurviveARefusalTakenBeforeTheLedger is ADR 12 decision 4 on the four paths that
+// run before there is a ledger to count anything with.
+//
+// Prepared's doc comment promises that "a delivery that dies halfway still dropped automation
+// noise", ADR 12 says "Prepare returns the counters it had reached beside every error it returns",
+// and the backlog log line says the same. The guards at the top of Prepare (no transaction, an
+// unparseable tenant, no declared version order, a record not sealed for this tenant, an external
+// id too long for a chain key) used to answer a zero Prepared, so a delivery that dropped a bot
+// record and then hit one of them under-reported the gate by exactly that record. Until B25 the
+// caller's only account of the gate is this struct, so the number simply went missing.
+//
+// The delivery here carries a bot record, which the gate drops, and a record sealed for tenantA
+// which is then prepared under tenantB. What has to be true is that Automation is 1 beside the
+// refusal, not 0.
+func TestTheCountersSurviveARefusalTakenBeforeTheLedger(t *testing.T) {
+	t.Parallel()
+	e := setup(t, pipeline.Options{})
+	bot := ev("fake:task:bot", "1", listA)
+	bot.Automation = true
+	n, err := normalizeFor(e, bot, ev(entity, "1", listA))
+	if err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if n.Automation != 1 {
+		t.Fatalf("the delivery dropped %d automation records, want 1: the fixture is not testing anything", n.Automation)
+	}
+
+	// The seal guard, under the wrong tenant. Every other guard at the top of Prepare is checked
+	// the same way below.
+	out, err := e.prepare(tenantB, n)
+	if !errors.Is(err, pipeline.ErrNotSealedForTenant) {
+		t.Fatalf("preparing tenantA's records under tenantB gave %v, want ErrNotSealedForTenant", err)
+	}
+	if out.Automation != n.Automation {
+		t.Errorf("Prepare reported Automation %d beside the refusal, want %d: the counters the stage "+
+			"had already reached were thrown away", out.Automation, n.Automation)
+	}
+	if len(out.Records) != 0 {
+		t.Errorf("a refused Prepare returned %d records", len(out.Records))
+	}
+
+	// No transaction, an unparseable tenant, and no declared version order: the other three paths
+	// that run before the ledger exists.
+	if out, err := e.p.Prepare(e.ctx, nil, tenantA, n); err == nil || out.Automation != n.Automation {
+		t.Errorf("Prepare with no transaction gave (%d automation, %v), want (%d, an error)",
+			out.Automation, err, n.Automation)
+	}
+	err = e.db.TenantTx(e.ctx, tenantA, func(tx pgx.Tx) error {
+		out, err := e.p.Prepare(e.ctx, tx, "", n)
+		if out.Automation != n.Automation {
+			t.Errorf("Prepare with no tenant reported Automation %d, want %d", out.Automation, n.Automation)
+		}
+		return err
+	})
+	if err == nil {
+		t.Error("Prepare with no tenant returned no error")
+	}
+	unordered := pipeline.NormalizedFor(fake.DefaultKey, provider.VersionOrderUnset, pipeline.RecordsOf(n))
+	unordered.Automation = n.Automation
+	if out, err := e.prepare(tenantA, unordered); !errors.Is(err, pipeline.ErrVersionNotComparable) || out.Automation != n.Automation {
+		t.Errorf("Prepare with no version order gave (%d automation, %v), want (%d, ErrVersionNotComparable)",
+			out.Automation, err, n.Automation)
+	}
+}
+
 // TestADatabaseThatCannotBeReachedIsNotADeadLetter. Everything this stage refuses by name is
 // about the record; a database that is not answering is about this deployment, and the row must
 // go back on the ladder rather than die.
@@ -345,62 +410,95 @@ func TestThePhoneRuleIsEveryRuleThePatternCannotState(t *testing.T) {
 	}
 }
 
-// TestTheVersionOrderIsTheThreeRulesAndNothingElse is ADR 12 decision 1, on inputs an integration
-// test cannot reach in a useful number.
+// TestTheVersionOrderIsTheDeclaredOrderAndNothingElse is ADR 12 decision 1, on inputs an
+// integration test cannot reach in a useful number.
 //
-// The three rules have to be here together because each one is only safe while the other two hold:
-// a number for two decimal counters, bytes for two versions of equal length, and a refusal for
-// everything else. A table that only tested the first two would be passed by a function that
-// guessed, and guessing is what lets an older record take the head.
-func TestTheVersionOrderIsTheThreeRulesAndNothingElse(t *testing.T) {
+// The property, in one sentence: two versions are ordered under the spelling their provider
+// DECLARED, or not at all, and nothing about the two strings themselves may be allowed to stand in
+// for a declaration. That last clause is the one that failed review twice. A function that read an
+// order out of "these two strings are the same length" passed a table of decimal counters and
+// fixed-width tokens just as happily, and inverted a base64 counter, a hash and a UUID in silence.
+//
+// So every case below names the order it is compared under, the same pair appears under more than
+// one order where that is what says the declaration is doing the work, and a case under
+// VersionOrderUnset can never be ordered at all.
+func TestTheVersionOrderIsTheDeclaredOrderAndNothingElse(t *testing.T) {
 	t.Parallel()
+	const (
+		dec     = provider.VersionOrderDecimal
+		lex     = provider.VersionOrderLexical
+		b64     = provider.VersionOrderBase64
+		nothing = provider.VersionOrderUnset
+	)
 	for _, tc := range []struct {
-		a, b      string
-		want      int
-		wantOK    bool
-		why       string
-		symmetric bool
+		order  provider.VersionOrder
+		a, b   string
+		want   int
+		wantOK bool
+		why    string
 	}{
-		// Decimal counters, by their number and not by their bytes.
-		{"9", "10", -1, true, "an unpadded counter goes forward", true},
-		{"10", "9", 1, true, "and backward, which byte order got wrong", true},
-		{"2", "10", -1, true, "the same across the first decade", true},
-		{"100", "99", 1, true, "and the next", true},
-		{"9", "9", 0, true, "the same counter twice is the same version", true},
-		{"009", "9", 0, true, "leading zeros are not part of a number", true},
-		{"0", "00", 0, true, "nor is a run of them", true},
-		{"0", "1", -1, true, "zero is a version like any other", true},
+		// Decimal counters, by their number and not by their bytes. Proved, not promised: a
+		// version that is not a digit run is refused however the two strings look.
+		{dec, "9", "10", -1, true, "an unpadded counter goes forward"},
+		{dec, "10", "9", 1, true, "and backward, which byte order got wrong"},
+		{dec, "2", "10", -1, true, "the same across the first decade"},
+		{dec, "100", "99", 1, true, "and the next"},
+		{dec, "9", "9", 0, true, "the same counter twice is the same version"},
+		{dec, "009", "9", 0, true, "leading zeros are not part of a number"},
+		{dec, "0", "00", 0, true, "nor is a run of them"},
+		{dec, "0", "1", -1, true, "zero is a version like any other"},
 		// A counter far past anything an int would hold, because a version is a string.
-		{strings.Repeat("9", 40), strings.Repeat("9", 39) + "8", 1, true, "forty digits, one apart", true},
+		{dec, strings.Repeat("9", 40), strings.Repeat("9", 39) + "8", 1, true, "forty digits, one apart"},
+		{dec, "v9", "v10", 0, false, "a prefix is not a decimal counter, whoever declared one"},
+		{dec, "01K5XJ9Z7QA", "01K5XJ9Z7QB", 0, false, "a ULID declared as decimal is refused, not guessed at"},
+		{dec, "", "9", 0, false, "an empty version spells no number"},
 
-		// Equal length, by bytes. Every encoding whose byte order is its value order is fixed
-		// width while it is in use.
-		{"2026-09-21T10:00:00Z", "2026-09-21T11:00:00Z", -1, true, "RFC 3339, one hour apart", true},
-		{"1758448800000", "1758448800001", -1, true, "an epoch in milliseconds", true},
-		{"01K5XJ9Z7QA", "01K5XJ9Z7QB", -1, true, "a ULID-shaped counter", true},
-		{"v002", "v001", 1, true, "a prefixed padded counter", true},
-		{"abc", "abc", 0, true, "the same opaque version twice", true},
+		// Fixed width, by bytes. The width is checked here; that the byte order is the value
+		// order is the provider's promise, and this is the order a provider declares when it
+		// keeps it.
+		{lex, "2026-09-21T10:00:00Z", "2026-09-21T11:00:00Z", -1, true, "RFC 3339, one hour apart"},
+		{lex, "1758448800000", "1758448800001", -1, true, "an epoch in milliseconds"},
+		{lex, "01K5XJ9Z7QA", "01K5XJ9Z7QB", -1, true, "a ULID-shaped counter"},
+		{lex, "v002", "v001", 1, true, "a prefixed padded counter"},
+		{lex, "abc", "abc", 0, true, "the same opaque version twice"},
+		{lex, "2026-09-21T10:00:00Z", "2026-09-21T10:00:00.5Z", 0, false, "a timestamp that grew a fraction is not fixed width"},
+		{lex, "abc", "abcd", 0, false, "two strings of different lengths are not one fixed width"},
+		{lex, "", "", 0, false, "an empty version is no version"},
+		{lex, "9", "10", 0, false, "an unpadded counter is not fixed width, so lexical refuses it"},
 
-		// Neither: no order can be read, and the function says so instead of guessing.
-		{"v9", "v10", 0, false, "a prefixed unpadded counter", true},
-		{"9", "v9", 0, false, "a counter and something else", true},
-		{"2026-09-21T10:00:00Z", "2026-09-21T10:00:00.5Z", 0, false, "a timestamp that grew a fraction", true},
-		{"abc", "abcd", 0, false, "two opaque strings of different lengths", true},
+		// Base64, by the bytes it decodes to. Proved, not promised, and this is the pair the
+		// round 2 review reproduced the failure with: 'z' is value 51 and '0' is value 52, so the
+		// older version sorts ABOVE the newer one in ASCII and BELOW it in value.
+		{b64, "CQAAABYAAABz", "CQAAABYAAAB0", -1, true, "a Graph changeKey ticking from z to 0"},
+		{lex, "CQAAABYAAABz", "CQAAABYAAAB0", 1, true, "the same pair read as characters, which is why base64 is its own order"},
+		{b64, "AAAAAAAAAAB/", "AAAAAAAAAABA", 1, true, "'/' is value 63 and 'A' is value 0, which is the other way round from ASCII again"},
+		{b64, "AAAA", "AAAA", 0, true, "the same token twice"},
+		{b64, "AAAAAA==", "AAAAAQ==", -1, true, "padded standard base64"},
+		{b64, "AAAA", "AAAAAAAA", 0, false, "a decoded width that changed is not a fixed width value"},
+		{b64, "AA-_", "AA+/", 0, false, "two alphabets are not one encoding"},
+		{b64, "not base64!", "AAAA", 0, false, "a version that does not decode"},
+		{b64, "", "AAAA", 0, false, "an empty version decodes to nothing"},
+
+		// A provider that declared nothing orders nothing, whatever the strings look like. Each
+		// of these pairs is ordered under some other declaration above.
+		{nothing, "9", "10", 0, false, "two decimal counters, and still no order"},
+		{nothing, "01K5XJ9Z7QA", "01K5XJ9Z7QB", 0, false, "two ULIDs, and still no order"},
+		{nothing, "abc", "abc", 0, false, "not even two versions that are equal"},
 	} {
-		got, ok := pipeline.CompareVersions(tc.a, tc.b)
+		got, ok := pipeline.CompareVersions(tc.order, tc.a, tc.b)
 		if ok != tc.wantOK {
-			t.Errorf("CompareVersions(%q, %q) ok = %v, want %v: %s", tc.a, tc.b, ok, tc.wantOK, tc.why)
+			t.Errorf("CompareVersions(%s, %q, %q) ok = %v, want %v: %s", tc.order, tc.a, tc.b, ok, tc.wantOK, tc.why)
 			continue
 		}
 		if ok && sign(got) != tc.want {
-			t.Errorf("CompareVersions(%q, %q) = %d, want %d: %s", tc.a, tc.b, sign(got), tc.want, tc.why)
+			t.Errorf("CompareVersions(%s, %q, %q) = %d, want %d: %s", tc.order, tc.a, tc.b, sign(got), tc.want, tc.why)
 		}
 		// The order has to be total, or two calls in one delivery could disagree and the chain
 		// would depend on which record arrived first.
-		back, backOK := pipeline.CompareVersions(tc.b, tc.a)
+		back, backOK := pipeline.CompareVersions(tc.order, tc.b, tc.a)
 		if backOK != ok || sign(back) != -sign(got) {
-			t.Errorf("CompareVersions(%q, %q) = (%d, %v) but the other way round is (%d, %v): the order is not antisymmetric",
-				tc.a, tc.b, sign(got), ok, sign(back), backOK)
+			t.Errorf("CompareVersions(%s, %q, %q) = (%d, %v) but the other way round is (%d, %v): the order is not antisymmetric",
+				tc.order, tc.a, tc.b, sign(got), ok, sign(back), backOK)
 		}
 	}
 }

@@ -110,8 +110,19 @@ func body(t *testing.T, events ...fake.Event) []byte {
 // across the provider's API by accident.
 func (e *env) drain(tenant tenancy.ID, events ...fake.Event) (pipeline.Prepared, error) {
 	e.t.Helper()
+	return e.drainDelivery(tenant, ids.New(), events...)
+}
+
+// drainDelivery is drain with the outbox row's id named rather than minted.
+//
+// It exists for the tests that have to run the SAME delivery twice: the delivery id travels to
+// the sink as meta.delivery and is hashed into nothing, so it is the one input that a re-drain
+// would otherwise change, and a test of what does not depend on the inputs cannot leave one of
+// them varying.
+func (e *env) drainDelivery(tenant tenancy.ID, deliveryID string, events ...fake.Event) (pipeline.Prepared, error) {
+	e.t.Helper()
 	n, err := e.p.Normalize(e.ctx, pipeline.Delivery{
-		Tenant: tenant, Provider: fake.DefaultKey, ID: ids.New(), Body: body(e.t, events...),
+		Tenant: tenant, Provider: fake.DefaultKey, ID: deliveryID, Body: body(e.t, events...),
 	})
 	if err != nil {
 		return pipeline.Prepared{}, err

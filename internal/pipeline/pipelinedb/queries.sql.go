@@ -102,7 +102,7 @@ func (q *Queries) InsertLedgerEntry(ctx context.Context, arg InsertLedgerEntryPa
 }
 
 const ledgerEntry = `-- name: LedgerEntry :one
-SELECT record_id, is_head, scope
+SELECT is_head
   FROM record_ledger
  WHERE tenant_id = $1
    AND record_id = $2
@@ -113,19 +113,18 @@ type LedgerEntryParams struct {
 	RecordID string
 }
 
-type LedgerEntryRow struct {
-	RecordID string
-	IsHead   bool
-	Scope    string
-}
-
 // Whether this record id has already been prepared, and whether it is still its entity's head.
 // Those are conditions 1 and 2 of ADR 4 decision 7. A primary key lookup.
-func (q *Queries) LedgerEntry(ctx context.Context, arg LedgerEntryParams) (LedgerEntryRow, error) {
+//
+// is_head is the whole of it, and this row's own scope is deliberately NOT selected. Condition 3
+// compares the HEAD's scope, which EntityHead returns, and selecting this row's scope here invited
+// a reader to believe otherwise. The row's existence answers condition 1 and is_head answers
+// condition 2.
+func (q *Queries) LedgerEntry(ctx context.Context, arg LedgerEntryParams) (bool, error) {
 	row := q.db.QueryRow(ctx, ledgerEntry, arg.TenantID, arg.RecordID)
-	var i LedgerEntryRow
-	err := row.Scan(&i.RecordID, &i.IsHead, &i.Scope)
-	return i, err
+	var is_head bool
+	err := row.Scan(&is_head)
+	return is_head, err
 }
 
 const lockEntity = `-- name: LockEntity :exec
@@ -163,7 +162,14 @@ type LockEntityParams struct {
 // defense, for the shapes the ordering key does not cover: one entity reached through two
 // subscriptions of one tenant, and a reconciliation pass running beside the live feed.
 //
-// Two entities whose lock strings hash alike only wait for each other, which is harmless.
+// Two entities whose lock strings hash alike do NOT merely wait for each other, which is worth
+// writing down because the sorting above is what keeps it harmless. The sort is over the external
+// id and the lock is over its 64 bit hash, so a collision breaks the order the sort exists to
+// create: with external ids A < B < C and hash(A) = hash(C), a delivery carrying {A, B} takes the
+// two locks in the opposite order to one carrying {B, C}, and that is a deadlock rather than a
+// wait. At 64 bits it will not happen, and the retry ladder would carry the aborted transaction if
+// it did. Sorting by the hash instead of by the external id is what would make it impossible, and
+// that is B10's (issue #10), which owns the lock key.
 func (q *Queries) LockEntity(ctx context.Context, arg LockEntityParams) error {
 	_, err := q.db.Exec(ctx, lockEntity, arg.TenantID, arg.Provider, arg.ExternalID)
 	return err

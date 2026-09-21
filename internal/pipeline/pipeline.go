@@ -81,17 +81,21 @@ var ErrNotSealedForTenant = errors.New("pipeline: the record was not sealed for 
 // the entity at the source. ADR 4 says what they do then.
 var ErrScopeReturned = errors.New("pipeline: a prepared record id has come back in a different scope")
 
-// ErrVersionNotComparable reports two versions of one entity that this stage cannot order.
+// ErrVersionNotComparable reports two versions of one entity that this stage cannot order under
+// the spelling their provider declared, and a delivery whose provider declared no spelling at all.
 //
 // ADR 4 makes "monotonic per external_id" a promise the provider's normalizer makes to the
-// pipeline, and ADR 12 decision 1 says what a pipeline may read from that promise: a number from
-// two decimal counters, byte order from two versions of equal length, and nothing at all from two
-// strings that are neither. Nothing is what this reports.
+// pipeline. What that promise means for a particular string is not something this stage can work
+// out, so the provider declares it once (provider.VersionOrder, validated by the registry at
+// start-up) and this stage compares under the declaration: a number from two decimal runs, bytes
+// from two fixed-width strings of equal length, decoded bytes from two base64 values of equal
+// width. A version that does not fit what was declared is this error.
 //
 // It is a dead letter because guessing is the failure this whole item exists to prevent: the wrong
 // guess lets an older record supersede a newer one at the sink and take the scope that access is
-// decided on with it. The head does not move, nothing is delivered, the error names both versions,
-// and the fix is on the normalizer, which has to spell its versions so that an order can be read.
+// decided on with it. The head does not move, nothing is delivered, the error names both versions
+// and the declared order, and the fix is on the normalizer, which has to spell its versions the
+// way its provider says they are spelled.
 var ErrVersionNotComparable = errors.New("pipeline: the versions of this entity carry no order")
 
 // ErrExternalIDTooLong reports an entity whose external id does not fit the ledger's chain key.
@@ -163,6 +167,12 @@ type Delivery struct {
 // Build it with Normalize and hand it to Prepare.
 type Normalized struct {
 	provider string
+	// versions is how this provider spells a version, taken from the registry entry that
+	// Normalize looked the delivery up in. It travels with the delivery so that Prepare orders
+	// an entity's versions under the spelling that was declared and validated at start-up,
+	// rather than asking the provider again or inferring one from the strings. The zero value
+	// orders nothing, so a Normalized that did not come from Normalize refuses.
+	versions provider.VersionOrder
 	records  []record.Record
 
 	// Automation counts the records the noise gate dropped.
@@ -244,7 +254,7 @@ func (p *Pipeline) Normalize(ctx context.Context, d Delivery) (Normalized, error
 		// fails the same way.
 		return Normalized{}, fmt.Errorf("%w: parse: %w", ErrDeadLetter, err)
 	}
-	out := Normalized{provider: entry.Key()}
+	out := Normalized{provider: entry.Key(), versions: entry.VersionOrder()}
 	prov := entry.Provider()
 	for _, c := range changes {
 		recs, degraded, err := hydrateAndNormalize(ctx, prov, d.Tenant, c)
@@ -313,27 +323,41 @@ func hydrateAndNormalize(ctx context.Context, prov provider.Provider, t tenancy.
 // Nothing is delivered from inside this function: the caller commits the transaction first, so a
 // crash can only ever repeat a delivery and never lose one.
 func (p *Pipeline) Prepare(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, n Normalized) (Prepared, error) {
+	// The counters Normalize reached are what this call starts from, and they are built before
+	// anything can fail. Every error path below returns failed(out) rather than a zero Prepared,
+	// so a delivery that dies on its second record still reports the automation noise its first
+	// record was dropped for: that is what the doc comment on Prepared promises and what ADR 12
+	// decision 4 asks for, and building out at the first statement is what makes the promise hold
+	// on the paths that run before the ledger exists.
+	out := Prepared{Automation: n.Automation, Degraded: n.Degraded}
 	if tx == nil {
-		return Prepared{}, errors.New("pipeline: Prepare needs a transaction")
+		return failed(out), errors.New("pipeline: Prepare needs a transaction")
 	}
 	if _, err := tenancy.Parse(tenant.String()); err != nil {
-		return Prepared{}, fmt.Errorf("%w: %w", ErrDeadLetter, err)
+		return failed(out), fmt.Errorf("%w: %w", ErrDeadLetter, err)
+	}
+	// Fail closed on the version order. A Normalized built by Normalize carries the order the
+	// registry validated at start-up; one that did not come from Normalize carries the zero
+	// value, which orders nothing. Refusing here names the cause once for the whole delivery,
+	// instead of leaving every entity that already has a head to fail one at a time.
+	if len(n.records) > 0 && !n.versions.Valid() {
+		return failed(out), fmt.Errorf("%w: %w: provider %s declares %s",
+			ErrDeadLetter, ErrVersionNotComparable, n.provider, n.versions)
 	}
 	for _, r := range n.records {
 		// The tenant and the record meet again here for the first time since Seal, and this is
 		// the only check in the program that can notice a record going out under the wrong one.
 		if !r.SealedFor(tenant) {
-			return Prepared{}, fmt.Errorf("%w: %w: record %s", ErrDeadLetter, ErrNotSealedForTenant, r.ID)
+			return failed(out), fmt.Errorf("%w: %w: record %s", ErrDeadLetter, ErrNotSealedForTenant, r.ID)
 		}
 		if len(r.ExternalID) > MaxExternalIDBytes {
-			return Prepared{}, fmt.Errorf("%w: %w: %d bytes", ErrDeadLetter, ErrExternalIDTooLong, len(r.ExternalID))
+			return failed(out), fmt.Errorf("%w: %w: %d bytes", ErrDeadLetter, ErrExternalIDTooLong, len(r.ExternalID))
 		}
 	}
-	l := ledger{q: queriesOn(tx), tenant: tenant, provider: n.provider}
+	l := ledger{q: queriesOn(tx), tenant: tenant, provider: n.provider, versions: n.versions}
 	if err := l.lockEntities(ctx, n.records); err != nil {
-		return Prepared{}, err
+		return failed(out), err
 	}
-	out := Prepared{Automation: n.Automation, Degraded: n.Degraded}
 	for _, r := range n.records {
 		linked, what, err := l.admit(ctx, r)
 		// The decision is counted before the error is looked at, because a refusal IS a decision

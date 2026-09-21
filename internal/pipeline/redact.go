@@ -37,7 +37,7 @@ var ErrTooManySecrets = errors.New("pipeline: the delivery holds more distinct v
 const MaxSecretsPerDelivery = 1024
 
 // token is the placeholder a masked value is replaced by: the kind, so an operator reading a
-// record can see what was taken out, and a ULID, which says nothing about the value.
+// record can see what was taken out, and a random ULID, which says nothing about the value.
 //
 // It is deliberately not derived from the value. A token that were a hash of the address would
 // hand every sink an oracle: anyone with a guess at an address could compute its token and confirm
@@ -45,9 +45,23 @@ const MaxSecretsPerDelivery = 1024
 // to withhold. The mapping lives in the redaction_map table instead, which never leaves this
 // deployment.
 //
+// The entropy comes from ids.NewUnpredictable and not from ids.New, whose own doc comment forbids
+// this use: New draws its 80 non-clock bits from math/rand seeded once at process start, so one
+// observed id narrows the seed to a searchable set and two ids minted in the same millisecond
+// differ by a small increment. Neither is a disclosure of a value on its own, and both are
+// avoidable. What they would cost is that a placeholder planted in source text could be made to
+// collide with a real mapping an operator later resolves, and that the gap between two tokens
+// would say how many values this deployment masked in between, across tenants.
+//
 // Its characters are the ones the record format allows everywhere: ASCII letters, digits, a colon
 // and brackets. A ULID is 26 characters, so a token is 34 or 33 characters long.
-func token(k secretKind) string { return "[" + string(k) + ":" + ids.New() + "]" }
+func token(k secretKind) (string, error) {
+	id, err := ids.NewUnpredictable()
+	if err != nil {
+		return "", fmt.Errorf("pipeline: mint a %s placeholder: %w", k, err)
+	}
+	return "[" + string(k) + ":" + id + "]", nil
+}
 
 // maskRecords replaces every email address, telephone number and IBAN in the title and the text of
 // each record with a token, and records what each token stands for in the redaction map.
@@ -104,7 +118,13 @@ func mapSecrets(ctx context.Context, q *pipelinedb.Queries, tenant tenancy.ID, s
 	kinds := make([]string, len(secrets))
 	values := make([]string, len(secrets))
 	for i, s := range secrets {
-		tokens[i] = token(s.Kind)
+		tok, err := token(s.Kind)
+		if err != nil {
+			// The entropy source failed, which is this deployment and not this delivery, so it
+			// is not a dead letter and the next attempt may well work.
+			return nil, err
+		}
+		tokens[i] = tok
 		kinds[i] = string(s.Kind)
 		values[i] = s.Value
 	}

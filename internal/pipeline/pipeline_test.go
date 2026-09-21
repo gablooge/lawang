@@ -9,7 +9,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/gablooge/lawang/internal/pipeline"
+	"github.com/gablooge/lawang/internal/provider"
 	"github.com/gablooge/lawang/internal/provider/fake"
 	"github.com/gablooge/lawang/internal/record"
 )
@@ -202,12 +206,186 @@ func TestAReplayedDeadLetterNeverTakesTheHeadOrItsScope(t *testing.T) {
 	}
 }
 
+// TestAnotherTenantsLedgerAndRedactionMapAreInvisible is the behaviour behind the two policies
+// migration 00004 adds, which until review round 2 nothing pinned at all.
+//
+// TestEveryPolicySaysWhatTheDesignSaysItSays in internal/store reads the predicates out of the
+// catalog; this is the other half, because a predicate that reads right and does nothing would
+// pass that. redaction_map is the one that matters most: it holds by construction the personal
+// data the masker took out of records, so "one tenant cannot read another tenant's values" has to
+// be a property of the database and not of every query in every package remembering to filter.
+//
+// The rows of the other tenant are planted as the superuser, so this tests the policy and not the
+// pipeline's own habits: the pipeline would never write them under this transaction in the first
+// place.
+func TestAnotherTenantsLedgerAndRedactionMapAreInvisible(t *testing.T) {
+	t.Parallel()
+	e := setup(t, pipeline.Options{})
+	mine := ev(entity, "1", listA)
+	mine.Text = "write to jane.doe@example.test"
+	e.mustDrain(tenantA, mine)
+
+	e.exec(`INSERT INTO lawang.record_ledger
+	          (tenant_id, record_id, provider, external_id, version, scope, is_head)
+	        VALUES ($1, 'rec_000000000000000000000000000000ff', 'fake', 'fake:task:theirs', '1', 'fake:list:L9', true)`,
+		tenantB.String())
+	e.exec(`INSERT INTO lawang.redaction_map (tenant_id, token, kind, value)
+	        VALUES ($1, '[email:01KTHEIRS0000000000000000]', 'email', 'john.roe@example.test')`,
+		tenantB.String())
+
+	err := e.db.TenantTx(e.ctx, tenantA, func(tx pgx.Tx) error {
+		for _, q := range []struct{ what, sql string }{
+			{"record_ledger", "SELECT tenant_id FROM record_ledger"},
+			{"redaction_map", "SELECT tenant_id FROM redaction_map"},
+		} {
+			rows, err := tx.Query(e.ctx, q.sql)
+			if err != nil {
+				return err
+			}
+			seen, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			if err != nil {
+				return err
+			}
+			if len(seen) != 1 || seen[0] != tenantA.String() {
+				t.Errorf("tenant_a reads %v from %s, want only its own row: the policy is not isolating "+
+					"a table that holds another tenant's data", seen, q.what)
+			}
+		}
+		// A write aimed at the other tenant's rows touches nothing, silently, which is what a
+		// USING predicate does.
+		for _, stmt := range []string{
+			`UPDATE record_ledger SET is_head = false WHERE tenant_id = 'tenant_b'`,
+			`DELETE FROM record_ledger WHERE tenant_id = 'tenant_b'`,
+			`UPDATE redaction_map SET value = 'stolen' WHERE tenant_id = 'tenant_b'`,
+			`DELETE FROM redaction_map WHERE tenant_id = 'tenant_b'`,
+		} {
+			tag, err := tx.Exec(e.ctx, stmt)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() != 0 {
+				t.Errorf("%q touched %d rows of another tenant", stmt, tag.RowsAffected())
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("reading under tenant_a: %v", err)
+	}
+
+	// And planting a row FOR the other tenant is an error rather than a silent no-op, which is
+	// what the WITH CHECK half is for.
+	for _, stmt := range []struct{ what, sql string }{
+		{"a ledger row", `INSERT INTO record_ledger
+		    (tenant_id, record_id, provider, external_id, version, scope, is_head)
+		  VALUES ('tenant_b', 'rec_0000000000000000000000000000ee', 'fake', 'fake:task:planted', '1', 'fake:list:L9', true)`},
+		{"a redaction mapping", `INSERT INTO redaction_map (tenant_id, token, kind, value)
+		  VALUES ('tenant_b', '[email:01KPLANTED000000000000000]', 'email', 'planted@example.test')`},
+	} {
+		err := e.db.TenantTx(e.ctx, tenantA, func(tx pgx.Tx) error {
+			_, err := tx.Exec(e.ctx, stmt.sql)
+			return err
+		})
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+			t.Errorf("tenant_a writing %s for tenant_b gave %v, want a row-level security violation (42501)",
+				stmt.what, err)
+		}
+	}
+
+	// The other tenant's rows are exactly as they were planted.
+	if rows := e.redactionRows(); len(rows) != 2 {
+		t.Errorf("the map holds %d rows, want the two that were written: %+v", len(rows), rows)
+	}
+	if rows := e.ledgerRows(); len(rows) != 2 {
+		t.Errorf("the ledger holds %d rows, want the two that were written: %+v", len(rows), rows)
+	}
+}
+
+// TestABase64CounterIsOrderedByWhatItDecodesTo is the round 2 review's reproduction, which the
+// rule above did not cover and could not have covered.
+//
+// Two versions in a fixed width encoding are always the same length, so a rule that read an order
+// out of "the same length" answered every such pair with a guess, and for base64 the guess is
+// backwards: the alphabet puts 'z' at value 51 and '0' at value 52, while ASCII puts 'z' at 122
+// and '0' at 48. A Microsoft Graph changeKey and an Exchange ETag are exactly that, which B13,
+// B16 and B17 all depend on, and the reviewer drained the older "CQAAABYAAABz" after the newer
+// "CQAAABYAAAB0" and watched it supersede the newer record and take its scope, with no error and
+// nothing counted.
+//
+// The order is no longer read from the strings. The provider declares it (provider.VersionOrder,
+// refused at registration when it is absent), and for base64 the pipeline decodes both versions
+// and compares the bytes, so the alphabet cannot mislead it. Both directions are here, because a
+// stage that called everything stale would pass the first half on its own.
+func TestABase64CounterIsOrderedByWhatItDecodesTo(t *testing.T) {
+	t.Parallel()
+	e := setup(t, pipeline.Options{}, fake.NewOrdering(fake.DefaultKey, provider.VersionOrderBase64))
+	const (
+		older  = "CQAAABYAAABz" // decodes one below the next, and sorts ABOVE it in ASCII
+		newer  = "CQAAABYAAAB0"
+		newest = "CQAAABYAAAB1"
+	)
+	head := e.mustDrain(tenantA, ev(entity, newer, listA)).Records[0]
+
+	replay := e.mustDrain(tenantA, ev(entity, older, listB))
+	if len(replay.Records) != 0 || replay.Stale != 1 {
+		t.Fatalf("the older changeKey prepared %d records and counted %d stale, want 0 and 1", len(replay.Records), replay.Stale)
+	}
+	rows := e.ledgerRows()
+	if len(rows) != 1 {
+		t.Fatalf("the ledger holds %d rows, want only the newer version: %+v", len(rows), rows)
+	}
+	wantHead(t, rows, head.ID)
+	if rows[0].version != newer || rows[0].scope != head.Visibility.Scope {
+		t.Fatalf("the head is version %q in scope %q, want %q in %q: an older changeKey took the head "+
+			"and the scope access is decided on", rows[0].version, rows[0].scope, newer, head.Visibility.Scope)
+	}
+
+	// And forward. A stage that answered "stale" to everything would have passed the half above.
+	moved := e.mustDrain(tenantA, ev(entity, newest, listB))
+	if len(moved.Records) != 1 || moved.Stale != 0 {
+		t.Fatalf("the newest changeKey prepared %d records and counted %d stale, want 1 and 0", len(moved.Records), moved.Stale)
+	}
+	if moved.Records[0].Supersedes != record.Ref(head.ID) {
+		t.Errorf("the newest record supersedes %q, want the previous head %q", moved.Records[0].Supersedes, head.ID)
+	}
+}
+
+// TestADeliveryWhoseProviderDeclaresNoVersionOrderIsRefused is the other end of the same rule.
+//
+// A provider that declares nothing cannot register (TestNewRegistryRefusesAProviderWithNoVersionOrder
+// in internal/provider), so this is the case that gets past that: a Normalized that did not come
+// from Normalize, which is what a later item wiring its own worker could build. The zero value
+// orders nothing, and nothing is what it does here: no record is prepared and nothing is written.
+func TestADeliveryWhoseProviderDeclaresNoVersionOrderIsRefused(t *testing.T) {
+	t.Parallel()
+	e := setup(t, pipeline.Options{})
+	n, err := normalizeFor(e, ev(entity, "1", listA))
+	if err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	out, err := e.prepare(tenantA, pipeline.NormalizedFor(fake.DefaultKey, provider.VersionOrderUnset, pipeline.RecordsOf(n)))
+	if !errors.Is(err, pipeline.ErrVersionNotComparable) {
+		t.Fatalf("a delivery with no declared version order gave %v, want ErrVersionNotComparable", err)
+	}
+	if !errors.Is(err, pipeline.ErrDeadLetter) {
+		t.Errorf("err = %v, want a dead letter: the declaration will be just as absent next time", err)
+	}
+	if len(out.Records) != 0 {
+		t.Errorf("a refused delivery returned %d records", len(out.Records))
+	}
+	if rows := e.ledgerRows(); len(rows) != 0 {
+		t.Errorf("the ledger holds %d rows after a refusal: %+v", len(rows), rows)
+	}
+}
+
 // TestTwoVersionsThatCannotBeOrderedAreRefused is the other half of the new rule, and the reason
 // it can be safe at all.
 //
-// Two versions that are neither both decimal counters nor the same length carry no order anybody
-// can read. Guessing one is how the failure above happens, so the stage refuses instead: the head
-// does not move, nothing is delivered, the delivery is a dead letter naming both versions, and the
+// A version that does not fit the spelling its provider declared carries no order anybody can
+// read: here a provider that declares decimal counters sends "r9" and "r10". Guessing one is how
+// the failure above happens, so the stage refuses instead: the head does not move, nothing is
+// delivered, the delivery is a dead letter naming both versions and the declared order, and the
 // count says it happened.
 func TestTwoVersionsThatCannotBeOrderedAreRefused(t *testing.T) {
 	t.Parallel()
@@ -462,12 +640,19 @@ func TestAnExternalIDTooLongToKeyAChainIsRefusedByName(t *testing.T) {
 	if len(r.ExternalID) <= pipeline.MaxExternalIDBytes {
 		t.Fatalf("the fixture external id is %d bytes, which the ledger can hold", len(r.ExternalID))
 	}
-	_, err = e.prepare(tenantA, pipeline.NormalizedFor(fake.DefaultKey, []record.Record{r}))
+	n := pipeline.NormalizedFor(fake.DefaultKey, provider.VersionOrderDecimal, []record.Record{r})
+	// This guard runs before the ledger exists, so it is one of the paths ADR 12 decision 4 is
+	// about: the counters the stage had already reached come back beside the refusal.
+	n.Automation = 2
+	out, err := e.prepare(tenantA, n)
 	if !errors.Is(err, pipeline.ErrExternalIDTooLong) {
 		t.Fatalf("a %d byte external id gave %v, want ErrExternalIDTooLong", len(r.ExternalID), err)
 	}
 	if !errors.Is(err, pipeline.ErrDeadLetter) {
 		t.Errorf("an external id that can never be stored is not marked as a dead letter: %v", err)
+	}
+	if out.Automation != 2 {
+		t.Errorf("Prepare reported Automation %d beside the refusal, want 2", out.Automation)
 	}
 }
 
