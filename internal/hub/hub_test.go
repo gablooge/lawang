@@ -182,6 +182,48 @@ func TestTwoSubscriptionsOfOneTenantThatBothVerifyAreParked(t *testing.T) {
 	}
 }
 
+// TestAnAmbiguousParkAcrossTwoProbesNamesTheRowsInIdOrder holds the candidate sort to the job its
+// comment claims, which is ordering the union of two DIFFERENT probes.
+//
+// The two tests above are not enough for that, and a review proved it: their colliding rows both
+// carry the workspace, so both come back from the by-workspace query, which is already ORDER BY
+// id, and the union reads the same whether the sort runs or not. Deleting the sort outright passed
+// the whole package.
+//
+// Here each row is found by a different probe. The first row registered a registration id and no
+// workspace, the second a workspace and no registration id, and the delivery carries both keys.
+// The by-workspace probe runs first and returns the row minted second, so probe order and id order
+// are opposites and only the sort puts the lowest id first.
+func TestAnAmbiguousParkAcrossTwoProbesNamesTheRowsInIdOrder(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	shared := []byte("a secret two tenants both hold")
+	byRegistration := e.register(tenantA, "mailbox-1", "", "S1", shared)
+	byWorkspace := e.register(tenantB, "W1", "W1", "", shared)
+	// Subscription ids are ULIDs, so the row minted second holds the higher one. The assertion
+	// below says nothing about the sort unless the probe that runs FIRST returns that row, so the
+	// test refuses to pass quietly if ids ever stop being ordered by minting.
+	if byRegistration.ID >= byWorkspace.ID {
+		t.Fatalf("subscription ids %q then %q are not in minting order, so this test cannot observe the union's order",
+			byRegistration.ID, byWorkspace.ID)
+	}
+	var logged lockedBuffer
+	h, entry := e.hub(fake.New(fake.DefaultKey), hub.Options{Logger: jsonLogger(&logged)})
+
+	if got := e.accept(h, entry, signed(delivery("W1", "S1", "1"), shared)); got != ingress.Parked {
+		t.Fatalf("verdict = %s, want parked (200): both rows' secrets verify these exact bytes", got)
+	}
+	e.wantParked(reasonAmbiguous, "a delivery each probe found one claimant for is still ambiguous")
+
+	rec := ambiguityLine(t, logged.String())
+	if got, want := rec.Subscriptions, byRegistration.ID+","+byWorkspace.ID; got != want {
+		t.Errorf("the park names subscriptions %q, want %q (lowest id first, not the order the probes ran in)", got, want)
+	}
+	if got, want := rec.Tenants, tenantA.String()+","+tenantB.String(); got != want {
+		t.Errorf("the park names tenants %q, want %q: the tenants follow their own rows", got, want)
+	}
+}
+
 // TestTwoTenantsOnOneWorkspaceWithDifferentSecretsRouteToTheOwner is the other half of the pair:
 // sharing a workspace is legitimate and must still deliver, as long as exactly one secret verifies.
 func TestTwoTenantsOnOneWorkspaceWithDifferentSecretsRouteToTheOwner(t *testing.T) {

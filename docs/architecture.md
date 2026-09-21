@@ -905,9 +905,9 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 
 1. **Verify signatures over the exact raw bytes.** Re-serialized JSON never matches the provider's
    HMAC. Compare in constant time, and treat a missing secret or signature as a plain `false`.
-2. **The tenant comes from an owned row, never from the payload.** When more than one tenant's
-   secret verifies the same delivery, refuse it. Routing to the first match is how data crosses
-   tenants.
+2. **The tenant comes from an owned row, never from the payload.** When more than one
+   subscription's secret verifies the same delivery, refuse it, whether those rows belong to two
+   tenants or to one (ADR 11, decision 5). Routing to the first match is how data crosses tenants.
 3. **Salt the record id with the tenant.** Two tenants sharing one provider workspace otherwise
    collapse into one id and the second tenant silently loses records.
 4. **The wire name is not the internal key.** What a sink calls a source is sink configuration.

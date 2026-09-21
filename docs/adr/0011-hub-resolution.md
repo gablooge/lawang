@@ -143,8 +143,15 @@ queue on no evidence, and the queue is the ordering guarantee:
   flight together is exactly what the outbox exists to prevent.
 - The subscription row is also where a delivery's `resource` lives, which is what B11 hydrates
   against. A wrong row is a wrong resource, not just a wrong queue.
-- Routing to both is not an option either: the outbox dedupes on the delivery id per tenant, so
-  the second insert is a no-op and which queue won would be decided by a race.
+The two bullets above are what the decision rests on. The one below supports it and is not needed
+to reach it.
+
+- Routing to both is not a way out: the outbox dedupes on the delivery id per tenant, so for two
+  rows of ONE tenant the second insert is a no-op and the delivery joins whichever queue was
+  written first. In a single transaction that is the candidate order, which is the lowest-id pick
+  the first bullet has already ruled out; in two transactions it is a race. (Across two tenants,
+  routing to both is the cross-tenant leak principle 2 exists to prevent, and needs no argument
+  from queues at all.)
 
 So the rule is "exactly one subscription verified", not "exactly one tenant verified", and the two
 were only ever the same thing by accident. The log line says `more than one subscription's secret

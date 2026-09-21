@@ -44,7 +44,8 @@ is the part that matters once the data lands in something an AI agent reads.
   disabled, subscriptions expire, and some providers never redeliver.
 - **Tenant isolation by construction.** Postgres row-level security on every table, fail closed.
   An incoming webhook's tenant comes from a subscription row Lawang owns, never from the
-  payload, and a delivery that more than one tenant could claim is refused rather than routed.
+  payload, and a delivery that more than one subscription row could claim is refused rather than
+  routed.
 - **No broker.** One Postgres, an outbox table, and a worker. The hand-off between accepting a
   webhook and delivering a record is a database row, so there is nothing else to run or lose.
 - **Credentials held safely.** A local encrypted vault by default, or a self-hosted

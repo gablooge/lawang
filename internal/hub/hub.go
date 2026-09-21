@@ -467,20 +467,30 @@ const refusedTypeName = "(not a plain type name)"
 // prints the tag, so a Verify holding a tenant's secret can panic with a value whose type name is
 // that secret. Dynamic struct libraries do the same with a delivery's own field names.
 //
-// What is left after this check cannot carry those bytes. Every run-time construction that can
-// hold text of its own prints it inside braces and after a space (a struct tag or field name in
-// "struct { ... }", a method name in "interface { ... }"), and a func type prints a parenthesis;
-// space, brace and parenthesis are all refused here. The names that pass are built out of
-// identifiers, package paths, and the six punctuation bytes below, all of which are written in a
-// provider package's source.
+// What is left after this check cannot carry those bytes AS TEXT. Every run-time construction
+// that can hold text of its own prints it inside braces and after a space (a struct tag or field
+// name in "struct { ... }", a method name in "interface { ... }"), and a func type prints a
+// parenthesis; space, brace and parenthesis are all refused here. The names that pass are built
+// out of identifiers, package paths, and the six punctuation bytes below, all of which are written
+// in a provider package's source.
+//
+// "As text" is the whole of that promise, and the known residual is a number. An array length is
+// digits, and digits are allowed: reflect.PointerTo(reflect.ArrayOf(n, byteType)) prints
+// "*[n]uint8", and n can be a secret's bytes read as a base-256 integer, which reflect's
+// address-space check caps at roughly 47 bits, about six bytes per panicking delivery. Banning
+// digits would not close that, only narrow it again: the channel is the provider package's own
+// choice of what to panic with, not the character set of a type name.
 //
 // This narrows and does not close. A provider package that panics is already holding the secret
 // in its own process and could log it directly, so the type name is trusted exactly as far as the
 // provider package is, and no further; what this refuses is the trivial way to smuggle it into
 // OUR log line, at error level, in every backup of it.
+//
+// There is no empty-name case to guard: %T is "<nil>" for a nil value, which the character check
+// refuses, and a non-empty name for everything else.
 func typeNameForLog(v any) string {
 	name := fmt.Sprintf("%T", v)
-	if name == "" || len(name) > maxTypeNameInLog {
+	if len(name) > maxTypeNameInLog {
 		return refusedTypeName
 	}
 	for i := 0; i < len(name); i++ {

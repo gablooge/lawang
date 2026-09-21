@@ -201,9 +201,11 @@ const (
 	// is a workspace nobody has connected, or a connection that was deleted while the
 	// provider-side webhook stayed behind.
 	ParkNoOwner
-	// ParkAmbiguousOwner: more than one tenant could own the delivery, so routing it to either
-	// would be a guess (principle 2). Either two tenants' secrets both verified the exact bytes,
-	// or the delivery's keys selected more candidates than the hub will verify.
+	// ParkAmbiguousOwner: more than one subscription's secret verified the exact bytes, whether
+	// those rows belong to two tenants or to one (ADR 11, decision 5), or the delivery's keys
+	// selected more candidates than the hub will verify. Routing it to any of them would be a
+	// guess (principle 2): across two tenants the tenant is in doubt, and within one tenant the
+	// subscription is, and the subscription is half of the ordering key.
 	ParkAmbiguousOwner
 	// ParkUnreadable: the provider could not read its own delivery keys out of the body, or the
 	// keys it read cannot identify anything (they are empty, over-long, or not storable text).
