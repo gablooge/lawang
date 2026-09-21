@@ -2,6 +2,7 @@ package hub_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/gablooge/lawang/internal/hub"
 	"github.com/gablooge/lawang/internal/ingress"
@@ -127,6 +129,33 @@ func signed(body, secret []byte) provider.Request {
 		Method: http.MethodPost,
 		Header: provider.NewHeader(h),
 		Body:   body,
+	}
+}
+
+// analyze gives the planner statistics for one table, and retries the one failure it has in
+// practice.
+//
+// ANALYZE updates the table's pg_class row, and so does the autovacuum launcher's own analyze;
+// whichever loses the race is refused with "tuple concurrently updated" (SQLSTATE XX000), which
+// nothing else in the database can distinguish and which CI met once. The caller turns autovacuum
+// off for the table first, so this is the second lock on the door rather than the first, and a
+// failure that is not that one is reported at once.
+func (e *env) analyze(table string) {
+	e.t.Helper()
+	conn, err := pgx.Connect(e.ctx, e.tdb.AdminURL)
+	if err != nil {
+		e.t.Fatalf("connect as the superuser: %v", err)
+	}
+	defer func() { _ = conn.Close(e.ctx) }()
+	for attempt := 1; ; attempt++ {
+		_, err = conn.Exec(e.ctx, "ANALYZE "+table)
+		var pgErr *pgconn.PgError
+		switch {
+		case err == nil:
+			return
+		case attempt >= 3, !errors.As(err, &pgErr), pgErr != nil && pgErr.Code != "XX000":
+			e.t.Fatalf("ANALYZE %s: %v", table, err)
+		}
 	}
 }
 

@@ -246,11 +246,17 @@ func TestASubscriptionWithNoDeliveryKeyIsRefusedByTheTable(t *testing.T) {
 func TestTheCandidateLookupUsesAnIndex(t *testing.T) {
 	t.Parallel()
 	e := setup(t)
+	// Autovacuum is turned off for this table first, and only then are the rows written. A bulk
+	// insert of this size makes the autovacuum launcher analyze the table, and its own ANALYZE and
+	// the one below both update the table's pg_class row: whichever loses says "tuple concurrently
+	// updated" (XX000), which CI found before this line existed. The table belongs to one test's
+	// own database, so nothing else is affected.
 	testdb.Exec(t, e.tdb.AdminURL, `
+		ALTER TABLE lawang.subscriptions SET (autovacuum_enabled = false);
 		INSERT INTO lawang.subscriptions (id, tenant_id, provider, resource, workspace_id, external_id, secret)
 		SELECT 'sub' || i, 'tenant_' || (i % 500), 'fake', 'r' || i, 'W' || i, 'S' || i, 'x'
-		  FROM generate_series(1, 50000) AS i;
-		ANALYZE lawang.subscriptions;`)
+		  FROM generate_series(1, 50000) AS i;`)
+	e.analyze("lawang.subscriptions")
 
 	lookups := map[string]struct{ sql, index string }{
 		"by workspace": {`EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT id, tenant_id, secret FROM subscriptions
