@@ -1,0 +1,477 @@
+// Package hub decides whose data a delivery becomes.
+//
+// It is the half of the accept path that internal/ingress deliberately does not have
+// (architecture 3.1): the edge turns a path segment into a provider and captures the exact bytes,
+// and everything that touches a tenant happens here. In order:
+//
+//  1. Ask the provider for the delivery's own keys, which are unauthenticated text.
+//  2. Look up the candidate subscriptions those keys could belong to, across tenants, under the
+//     resolver role, in a transaction that does nothing else.
+//  3. Verify the exact bytes against each candidate's secret, in constant time, once per
+//     candidate.
+//  4. Resolve the owner: none verified is 401 and nothing stored; exactly one is the tenant; more
+//     than one is refused.
+//  5. Accept the delivery into the outbox, bound to that tenant, or park it under the sentinel
+//     tenant when nobody can be shown to own it.
+//
+// # Principle 2 is the whole package
+//
+// The tenant comes from a row Lawang owns, never from the payload. Nothing a sender writes selects
+// a tenant: the delivery's keys only narrow which rows are asked, and a row's tenant counts only
+// once that row's secret has verified the exact bytes the sender sent. When more than one tenant's
+// secret verifies one delivery, it is parked and not routed, because routing to the first match is
+// how data crossed tenants in the Python predecessor. That is why nothing here short-circuits on
+// the first candidate that verifies.
+//
+// # Where this package stops
+//
+// At a row in the outbox. Parsing the delivery into changes, hydrating, normalizing and delivering
+// are the worker's (B08, B09, B10), on the stored bytes, in another process. Nothing here calls a
+// provider's API, and nothing here holds a transaction open across anything but database work.
+package hub
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/gablooge/lawang/internal/hub/hubdb"
+	"github.com/gablooge/lawang/internal/ingress"
+	"github.com/gablooge/lawang/internal/outbox"
+	"github.com/gablooge/lawang/internal/provider"
+	"github.com/gablooge/lawang/internal/store"
+	"github.com/gablooge/lawang/internal/tenancy"
+)
+
+// DefaultMaxCandidates is how many candidate subscriptions one delivery may have before the hub
+// stops trying to tell them apart.
+//
+// It is a bound on work a sender can ask for: every candidate costs an HMAC over the whole body,
+// which at the 1 MiB body cap is about a millisecond, so without a bound one delivery could ask
+// for as much verification as there are subscriptions on one workspace. Thirty-two of them is
+// about 32 ms of the accept path's 200 ms target, and far more tenants than are expected to share
+// one provider workspace (two is the case the design is built for, architecture section 5).
+//
+// Reaching it is not a truncation. A candidate set that was silently cut short could hide the
+// second tenant whose secret verifies, and route a delivery that should have been parked, so one
+// more row than this is parked as an ambiguous owner.
+const DefaultMaxCandidates = 32
+
+// maxCandidatesCeiling is the most New will take for Options.MaxCandidates.
+//
+// Past about 200 candidates the verification alone is the whole 200 ms the accept path targets, so
+// a larger number does not configure a hub that answers more deliveries, it configures one that
+// answers 503 to them. (It also keeps the limit an int32 can carry, which is what the query takes.)
+const maxCandidatesCeiling = 1024
+
+// maxDeliveryKeyLen bounds a delivery key, in bytes, before it reaches a query. The key is text a
+// stranger sent and the subscriptions table refuses to store one longer than this, so a longer key
+// cannot match any row: refusing it here keeps a megabyte of a stranger's text out of a statement
+// and out of whatever quotes one in an error. The table's CHECK carries the same number, and
+// TestTheDeliveryKeyBoundMatchesTheColumn holds the two together.
+const maxDeliveryKeyLen = 256
+
+// Hub resolves the owner of a delivery and stores it. It is safe for concurrent use: everything it
+// holds is read-only after New, and every request's state lives on the stack.
+type Hub struct {
+	db            *store.DB
+	ob            *outbox.Outbox
+	log           *slog.Logger
+	maxCandidates int
+}
+
+// Options tunes the hub. The zero Options is the documented default of every field.
+type Options struct {
+	// PublicBaseURL is LAWANG_PUBLIC_BASE_URL as config.Load normalized it, or empty when the
+	// deployment configured none. The hub does not build a URL out of it (the edge does): it
+	// needs it to answer one question at start, which is whether a registered provider's
+	// signature scheme covers a URL that nothing will supply. See New.
+	PublicBaseURL string
+	// MaxCandidates is the most candidate subscriptions one delivery may have, and 0 means
+	// DefaultMaxCandidates. A value below 1 is refused.
+	MaxCandidates int
+	// Logger is where the hub logs, and nil means slog.Default.
+	Logger *slog.Logger
+}
+
+// The hub is what the edge hands a delivery to.
+var _ ingress.Hub = (*Hub)(nil)
+
+// New returns a hub on db, or says why this deployment cannot accept deliveries at all.
+//
+// # Why a registry is a parameter of a thing that never looks a provider up
+//
+// The hub never resolves a path segment: the edge does that and hands it the entry. The registry is
+// here for a start-up check the edge cannot make. A provider whose signature scheme covers the
+// request URL (provider.URLSigner, HubSpot v3) can verify nothing when the deployment configured
+// no public base URL: provider.Request.URL is empty, the scheme returns false rather than guess,
+// and every delivery is answered 401, the status the contract reserves for a forged signature.
+// The edge only warns, because it does not know which schemes sign the URL. The hub is handed the
+// registry, so it knows, and it refuses to start rather than let a whole provider's traffic fail
+// in the one place nobody reads, which is that provider's own dashboard (architecture 4).
+func New(db *store.DB, reg *provider.Registry, opts Options) (*Hub, error) {
+	if db == nil {
+		return nil, errors.New("hub: a database is required")
+	}
+	if reg == nil {
+		return nil, errors.New("hub: a provider registry is required")
+	}
+	maxCandidates := opts.MaxCandidates
+	switch {
+	case maxCandidates == 0:
+		maxCandidates = DefaultMaxCandidates
+	case maxCandidates < 1, maxCandidates > maxCandidatesCeiling:
+		return nil, fmt.Errorf("hub: MaxCandidates must be 1 to %d, or 0 for the default of %d",
+			maxCandidatesCeiling, DefaultMaxCandidates)
+	}
+	if opts.PublicBaseURL == "" {
+		for _, e := range reg.Entries() {
+			source, ok := e.WebhookSource()
+			if !ok {
+				continue
+			}
+			if _, signsURL := source.(provider.URLSigner); signsURL {
+				return nil, fmt.Errorf(
+					"hub: provider %q signs the public URL it was posted to, and LAWANG_PUBLIC_BASE_URL is not set, "+
+						"so every one of its deliveries would be answered 401 as if it were forged: set the variable to the "+
+						"URL the provider was given", e.Key())
+			}
+		}
+	}
+	log := opts.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Hub{db: db, ob: outbox.New(db), log: log, maxCandidates: maxCandidates}, nil
+}
+
+// candidate is one subscription that could own a delivery, as the resolver read it. It is not a
+// provider.Subscription: the resolver role reads three columns and this is those three.
+type candidate struct {
+	id     string
+	tenant tenancy.ID
+	secret []byte
+}
+
+// Accept resolves the delivery's owner and stores it, and returns what the provider is told.
+//
+// It returns an error only for a failure on our side. Everything a sender can cause is a verdict,
+// including a forged signature, a workspace nobody has connected, a body the provider cannot read
+// its own keys out of, and poison that can never be stored.
+func (h *Hub) Accept(ctx context.Context, e provider.Entry, req provider.Request) (ingress.Verdict, error) {
+	source, ok := e.WebhookSource()
+	if !ok {
+		// The edge answers 404 before it gets here, so this is only ever reachable by another
+		// caller. It is our own wiring either way, never a sender, so it is an error and not a
+		// verdict.
+		return 0, fmt.Errorf("hub: provider %q is not a webhook source", e.Key())
+	}
+
+	keys, err := h.deliveryKeys(source, req)
+	if err != nil {
+		// The provider does not recognize the body as one of its own, or the keys it read cannot
+		// identify anything. Nothing can be resolved from it, and it is not a signature failure,
+		// so it is parked and answered 2xx like any other delivery nobody owns.
+		h.log.Debug("hub: a delivery carried no usable keys", "provider", e.Key(), "error", err)
+		return h.park(ctx, e.Key(), req.Body, outbox.ParkUnreadable)
+	}
+
+	candidates, err := h.candidates(ctx, e.Key(), keys)
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case len(candidates) == 0:
+		// An unknown workspace: nobody has connected it, or the connection was deleted and the
+		// provider-side webhook stayed behind. Parked, never a 401: there is no signature claim to
+		// reject, and a provider must not be made to retry.
+		return h.park(ctx, e.Key(), req.Body, outbox.ParkNoOwner)
+	case len(candidates) > h.maxCandidates:
+		h.log.Warn("hub: a delivery had more candidate subscriptions than the hub will verify, so it is parked",
+			"provider", e.Key(), "max_candidates", h.maxCandidates)
+		return h.park(ctx, e.Key(), req.Body, outbox.ParkAmbiguousOwner)
+	}
+
+	owners, panicked, err := h.verifyAll(ctx, e.Key(), source, req, candidates)
+	switch {
+	case err != nil:
+		return 0, err
+	case panicked:
+		return h.park(ctx, e.Key(), req.Body, outbox.ParkUnverifiable)
+	case len(owners) == 0:
+		// The one thing that answers 401, and the one thing that stores nothing.
+		return ingress.Unverified, nil
+	case len(owners) > 1:
+		// Principle 2. Two tenants' secrets verified the same bytes, so either could be the owner
+		// and neither can be shown to be. Routing to the first is the defect this refuses.
+		h.log.Warn("hub: more than one tenant's secret verified one delivery, so it is parked and not routed",
+			"provider", e.Key(), "owners", len(owners))
+		return h.park(ctx, e.Key(), req.Body, outbox.ParkAmbiguousOwner)
+	}
+
+	owner := owners[0]
+	_, fresh, err := h.ob.Accept(ctx, owner.tenant, outbox.Delivery{
+		// The registry's own constant, never the path segment the sender wrote.
+		Provider:    e.Key(),
+		OrderingKey: orderingKey(e.Key(), owner.id),
+		RawBody:     req.Body,
+	})
+	switch {
+	case errors.Is(err, outbox.ErrBadOrderingKey):
+		// Poison: this delivery can never be stored for this tenant, however often it is sent
+		// again, so it must not be a status the provider retries. It is reachable only through a
+		// subscription row whose id the table would not have got from Lawang.
+		h.log.Error("hub: an accepted delivery could not be stored and was parked",
+			"provider", e.Key(), "subscription", owner.id, "error", err)
+		return h.park(ctx, e.Key(), req.Body, outbox.ParkUnstorable)
+	case err != nil:
+		return 0, retryable(ctx, err)
+	case !fresh:
+		// The provider re-sent something this tenant already has. An accept no-op, and a 200.
+		return ingress.Duplicate, nil
+	}
+	return ingress.Stored, nil
+}
+
+// errNoDeliveryKeys reports a delivery that carries nothing to look a subscription up by.
+var errNoDeliveryKeys = errors.New("the delivery carries no key to resolve an owner by")
+
+// deliveryKeys asks the provider for the delivery's own identifiers and holds them to what a
+// lookup can use. They arrive from the public internet, before anything is verified, so they are
+// bounded and checked here rather than trusted to be what the provider package promises.
+//
+// A delivery with no key at all is refused rather than looked up: without one the only way to find
+// an owner would be to verify every subscription of the provider, which is work a stranger could
+// ask for by sending an empty body.
+func (h *Hub) deliveryKeys(source provider.WebhookSource, req provider.Request) (provider.DeliveryKeys, error) {
+	keys, err := source.DeliveryKeys(req.Body, req.Header)
+	if err != nil {
+		return provider.DeliveryKeys{}, err
+	}
+	if keys.Workspace == "" && keys.Subscription == "" {
+		return provider.DeliveryKeys{}, errNoDeliveryKeys
+	}
+	for _, k := range []struct{ name, key string }{
+		{"workspace", keys.Workspace},
+		{"subscription", keys.Subscription},
+	} {
+		name, key := k.name, k.key
+		switch {
+		case len(key) > maxDeliveryKeyLen:
+			// The length, never the key: it is a stranger's text and this goes to a log line.
+			return provider.DeliveryKeys{}, fmt.Errorf("the %s key is %d bytes, over the %d the table stores", name, len(key), maxDeliveryKeyLen)
+		case !storable(key):
+			// Postgres stores neither in a text column and answers SQLSTATE 22021, which would
+			// reach the sender as a 500 for a delivery that is simply not ours.
+			return provider.DeliveryKeys{}, fmt.Errorf("the %s key is not storable text", name)
+		}
+	}
+	return keys, nil
+}
+
+// candidates returns the subscriptions the delivery's keys could belong to, and at most one more
+// than the hub will verify.
+//
+// It runs under the resolver role, which sees across tenants because deriving the tenant is the
+// one thing that cannot be done inside a tenant. That transaction is cross-tenant for its whole
+// life and does this and nothing else: it commits before anything is verified and long before
+// anything is written, and the tenant's own work happens in a second transaction under TenantTx
+// (architecture 4, and store.RoleTx, whose transaction refuses a bind for this reason).
+func (h *Hub) candidates(ctx context.Context, providerKey string, keys provider.DeliveryKeys) ([]candidate, error) {
+	// One more than the maximum, so that "too many" is visible rather than a set cut short.
+	limit := int32(h.maxCandidates) + 1 //nolint:gosec // bounded by New, which refuses less than 1
+
+	var found []candidate
+	err := h.db.RoleTx(ctx, store.RoleResolver, func(tx pgx.Tx) error {
+		q := hubdb.New(tx)
+		// A delivery with neither key never gets here: deliveryKeys refuses it.
+		if keys.Workspace == "" {
+			rows, err := q.CandidatesBySubscription(ctx, hubdb.CandidatesBySubscriptionParams{
+				Provider:      providerKey,
+				Subscription:  keys.Subscription,
+				MaxCandidates: limit,
+			})
+			if err != nil {
+				return err
+			}
+			found, err = candidatesFrom(rows, func(r hubdb.CandidatesBySubscriptionRow) (string, string, []byte) {
+				return r.ID, r.TenantID, r.Secret
+			})
+			return err
+		}
+		rows, err := q.CandidatesByWorkspace(ctx, hubdb.CandidatesByWorkspaceParams{
+			Provider:      providerKey,
+			Workspace:     keys.Workspace,
+			Subscription:  keys.Subscription,
+			MaxCandidates: limit,
+		})
+		if err != nil {
+			return err
+		}
+		found, err = candidatesFrom(rows, func(r hubdb.CandidatesByWorkspaceRow) (string, string, []byte) {
+			return r.ID, r.TenantID, r.Secret
+		})
+		return err
+	})
+	if err != nil {
+		return nil, retryable(ctx, fmt.Errorf("hub: candidate subscriptions: %w", err))
+	}
+	return found, nil
+}
+
+// candidatesFrom turns the rows of either candidate query into candidates. The two queries have
+// the same three columns and sqlc gives each its own row type, so cols names them once per query
+// rather than repeating the loop.
+func candidatesFrom[R any](rows []R, cols func(R) (id, tenantID string, secret []byte)) ([]candidate, error) {
+	out := make([]candidate, 0, len(rows))
+	for _, r := range rows {
+		c, err := newCandidate(cols(r))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// newCandidate turns a resolver row into a candidate, and refuses one that cannot be an owner. A
+// tenant id the domain would not have allowed, or a secret that verifies nothing, means a row that
+// did not come from this program: it is left out of the candidates rather than trusted, because
+// the whole of the isolation argument is that the tenant comes from a row Lawang owns.
+func newCandidate(id, tenantID string, secret []byte) (candidate, error) {
+	tenant, err := tenancy.Parse(tenantID)
+	if err != nil {
+		return candidate{}, fmt.Errorf("hub: a subscription row carries an unusable tenant id: %w", err)
+	}
+	if len(secret) == 0 {
+		return candidate{}, fmt.Errorf("hub: subscription %q has an empty secret", id)
+	}
+	return candidate{id: id, tenant: tenant, secret: secret}, nil
+}
+
+// verifyAll runs the provider's verification once per candidate and returns every candidate whose
+// secret verified the exact bytes.
+//
+// It does not stop at the first one that verifies, and that is the point: "exactly one" cannot be
+// told from "the first of two" without asking them all. It stops at the second, because by then
+// the delivery is already unattributable, and at the first panic, for the same reason.
+func (h *Hub) verifyAll(ctx context.Context, providerKey string, source provider.WebhookSource, req provider.Request, candidates []candidate) (owners []candidate, panicked bool, err error) {
+	for _, c := range candidates {
+		verified, crashed, verifyErr := verifyOne(ctx, source, req, c.secret)
+		switch {
+		case verifyErr != nil:
+			return nil, false, verifyErr
+		case crashed:
+			// Architecture 7: Verify never panics, and nothing can enforce it. One that does has
+			// answered nothing, so the candidates that did answer cannot settle the owner either.
+			// This is a bug in a provider package, hence the error level.
+			h.log.Error("hub: a provider's Verify panicked, so the delivery is parked instead of routed",
+				"provider", providerKey)
+			return nil, true, nil
+		case verified:
+			owners = append(owners, c)
+			if len(owners) > 1 {
+				return owners, false, nil
+			}
+		}
+	}
+	return owners, false, nil
+}
+
+// verifyOne is one call to a provider's Verify, defended against the two things the interface
+// promises and the type system cannot enforce (architecture 7).
+//
+// A panic is recovered. Left alone, net/http recovers it per connection and the provider sees a
+// dropped response rather than a status, which for a webhook means a retry storm against an
+// endpoint that will drop it again.
+//
+// A Verify that does not return is given up on when ctx runs out, so a provider bug cannot hold a
+// request past the accept path's bound: the caller then answers 503 with a Retry-After, which
+// every provider understands, instead of nothing at all. The goroutine that was left behind stays
+// until Verify returns, which for a genuinely stuck implementation is forever; that is the price
+// of not blocking, and it is why the body it holds is a copy and not the request's own buffer.
+//
+// The copy is the other half. provider.Request.Body is documented as a rule and not a guarantee:
+// the slice aliases the edge's own capture buffer and the same Request goes to every candidate, so
+// an implementation that normalized the bytes in place (trimming a byte order mark, lower casing,
+// blanking a field before hashing) would change what every later candidate verifies AND what is
+// then stored in the outbox. Copying per candidate makes it a guarantee for 0.9 microseconds at
+// 8 KiB and 57 at the 1 MiB cap, against a 200 ms target, and it is also what keeps a Verify that
+// was given up on from racing with the INSERT of the same bytes.
+func verifyOne(ctx context.Context, source provider.WebhookSource, req provider.Request, secret []byte) (ok, panicked bool, err error) {
+	req.Body = bytes.Clone(req.Body)
+
+	type answer struct{ ok, panicked bool }
+	// Buffered, so the goroutine finishes even when nobody is listening any more.
+	done := make(chan answer, 1)
+	go func() {
+		var a answer
+		defer func() {
+			if r := recover(); r != nil {
+				a = answer{panicked: true}
+			}
+			done <- a
+		}()
+		a.ok = source.Verify(req, secret)
+	}()
+
+	select {
+	case a := <-done:
+		return a.ok, a.panicked, nil
+	case <-ctx.Done():
+		return false, false, fmt.Errorf("hub: verification did not finish: %w", ctx.Err())
+	}
+}
+
+// park stores a delivery nobody can be shown to own under the sentinel tenant, and answers 2xx.
+//
+// Parking cannot reach a real tenant: outbox.Park takes no tenant at all, so there is no argument
+// here for a crafted delivery to influence. What a sender contributes is the raw body, stored as
+// it arrived and read by nothing until a sweep re-resolves it (B25).
+func (h *Hub) park(ctx context.Context, providerKey string, body []byte, reason outbox.ParkReason) (ingress.Verdict, error) {
+	_, fresh, err := h.ob.Park(ctx, providerKey, body, reason)
+	if err != nil {
+		return 0, retryable(ctx, err)
+	}
+	h.log.Debug("hub: parked a delivery under the sentinel tenant",
+		"provider", providerKey, "reason", reason.String(), "fresh", fresh)
+	// A re-send of a parked delivery is a Parked verdict too, not a Duplicate: both answer 200,
+	// and "this was parked" is the true thing to log and to count (B25).
+	return ingress.Parked, nil
+}
+
+// orderingKey is the queue an accepted delivery joins: the provider key and the id of the
+// subscription that owns it, which are both this program's own strings.
+//
+// It is the subscription and not the entity because the hub does not parse a delivery, and must
+// not: Parse runs in the worker, on verified bytes. So the finest grouping the accept path can
+// name is the registration a delivery arrived on, which is coarser than one entity and therefore
+// safe (the guarantee is that two versions of one entity are never in flight together, and a
+// coarser queue keeps it). The cost is that one subscription's deliveries drain one at a time.
+// A provider that can name its entity cheaply, from bytes it has already looked at, could narrow
+// this later; that belongs with the pipeline (B08) and the first real provider (B11).
+func orderingKey(providerKey, subscriptionID string) string {
+	return providerKey + ":" + subscriptionID
+}
+
+// retryable makes an error the edge can answer honestly when the accept path ran out of time.
+//
+// The edge answers 503 with a Retry-After for errors.Is(err, context.DeadlineExceeded), which
+// covers both shapes pgx produces for a saturated connection pool. It does not cover a statement
+// the server cancelled, which comes back as a *pgconn.PgError with SQLSTATE 57014 and no context
+// error anywhere in its chain: that would be answered 500, where "try again in a moment" is the
+// truth. So whenever the context is already done, the context's error is put in front of whatever
+// came back, and the wrapped error is kept for the log.
+func retryable(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+		return fmt.Errorf("%w: %w", ctxErr, err)
+	}
+	return err
+}

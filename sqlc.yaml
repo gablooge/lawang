@@ -23,3 +23,17 @@ sql:
             go_type:
               type: time.Time
               pointer: true
+  - engine: postgresql
+    schema: migrations
+    queries: internal/hub/queries.sql
+    gen:
+      go:
+        package: hubdb
+        out: internal/hub/hubdb
+        sql_package: pgx/v5
+        omit_unused_structs: true
+        overrides:
+          - db_type: tenant_id
+            go_type: string
+          - db_type: timestamptz
+            go_type: time.Time

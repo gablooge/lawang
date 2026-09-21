@@ -187,6 +187,110 @@ func acceptIn(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, d Delivery) (id
 	return id, true, nil
 }
 
+// ParkReason says why a delivery could not be attributed to a tenant. Like a Cause, it is a class
+// and not a text: dead_reason is a plain column that operators read and every backup carries, so
+// nothing from outside this package is ever written into it.
+type ParkReason uint8
+
+// The reasons a delivery is parked. The hub (internal/hub) is the caller, and B25 re-resolves the
+// first two: they are the ones a subscription registered later can settle.
+const (
+	// ParkUnreasoned is the zero value: a Park that was given no reason. It is refused.
+	ParkUnreasoned ParkReason = iota
+	// ParkNoOwner: no subscription of any tenant matched the delivery's own keys. The usual cause
+	// is a workspace nobody has connected, or a connection that was deleted while the
+	// provider-side webhook stayed behind.
+	ParkNoOwner
+	// ParkAmbiguousOwner: more than one tenant could own the delivery, so routing it to either
+	// would be a guess (principle 2). Either two tenants' secrets both verified the exact bytes,
+	// or the delivery's keys selected more candidates than the hub will verify.
+	ParkAmbiguousOwner
+	// ParkUnreadable: the provider could not read its own delivery keys out of the body, or the
+	// keys it read cannot identify anything (they are empty, over-long, or not storable text).
+	// Nothing can be resolved from such a delivery, and it is not a signature failure.
+	ParkUnreadable
+	// ParkUnverifiable: the provider's verification did not answer, because it panicked.
+	// Architecture section 7 says Verify never panics and nothing can enforce it, so the delivery
+	// is parked rather than routed on the word of the candidates that did answer.
+	ParkUnverifiable
+	// ParkUnstorable: the delivery is poison. It has an owner, but it cannot be stored for that
+	// tenant however often it is sent again (an ordering key the table refuses), so it must not be
+	// a failure the provider retries.
+	ParkUnstorable
+)
+
+// parkReasonText is what each reason writes into dead_reason.
+var parkReasonText = map[ParkReason]string{
+	ParkNoOwner:        "unattributable: no owner",
+	ParkAmbiguousOwner: "unattributable: ambiguous owner",
+	ParkUnreadable:     "unattributable: unreadable delivery",
+	ParkUnverifiable:   "unattributable: the provider's verification panicked",
+	ParkUnstorable:     "poison: the delivery cannot be stored",
+}
+
+// String names the reason as it is stored.
+func (r ParkReason) String() string {
+	if text, ok := parkReasonText[r]; ok {
+		return text
+	}
+	return "unattributable: no reason given"
+}
+
+// ErrNoParkReason reports a Park with no reason. A parked row whose dead_reason says nothing is a
+// row no sweep can re-resolve and no operator can act on, so it is refused rather than stored.
+var ErrNoParkReason = errors.New("outbox: a parked delivery needs a reason")
+
+// Park stores a delivery that no tenant can be shown to own, under the sentinel tenant
+// (tenancy.Sentinel), already dead so that nothing ever drains it. fresh is false for a delivery
+// that is already parked, which makes a re-send of an unowned delivery a no-op like any other.
+//
+// It takes NO tenant. That is the point of it: the accept path reaches this function exactly when
+// it could not establish an owner, and a function that took a tenant here would be one crafted
+// delivery away from writing into a real one. Everything a sender influences is the raw body,
+// which is stored as it arrived, and nothing else: the provider is the registry's own constant,
+// the tenant is this program's constant, and the ordering key is the delivery id this function
+// derives.
+//
+// A parked row is auditable, re-resolvable once the missing subscription exists (B25) and deleted
+// by retention. It is never claimable: it is inserted dead and not the head of its key, and the
+// two states that would make it claimable are refused by the table itself.
+func (o *Outbox) Park(ctx context.Context, providerKey string, rawBody []byte, reason ParkReason) (id string, fresh bool, err error) {
+	text, ok := parkReasonText[reason]
+	if !ok {
+		return "", false, ErrNoParkReason
+	}
+	deliveryID, err := ids.DeliveryID(providerKey, rawBody) // refuses an empty provider
+	if err != nil {
+		return "", false, err
+	}
+	if !storable(providerKey) {
+		return "", false, errBadProvider
+	}
+	id = ids.New()
+	err = o.db.TenantTx(ctx, tenancy.Sentinel, func(tx pgx.Tx) error {
+		row, err := outboxdb.New(tx).Park(ctx, outboxdb.ParkParams{
+			ID:         id,
+			TenantID:   tenancy.Sentinel.String(),
+			Provider:   providerKey,
+			DeliveryID: deliveryID,
+			RawBody:    rawBody,
+			DeadReason: text,
+		})
+		if err != nil {
+			return err
+		}
+		id = row
+		return nil
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows): // ON CONFLICT DO NOTHING returned nothing
+		return "", false, nil
+	case err != nil:
+		return "", false, fmt.Errorf("outbox: park: %w", err)
+	}
+	return id, true, nil
+}
+
 // Claim leases up to batch rows for the given duration, across tenants, as the worker role. Rows
 // locked by a concurrent claimer are skipped, never waited for.
 //

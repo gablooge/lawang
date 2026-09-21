@@ -12,21 +12,79 @@ import (
 
 	"github.com/gablooge/lawang/internal/appversion"
 	"github.com/gablooge/lawang/internal/config"
+	"github.com/gablooge/lawang/internal/hub"
+	"github.com/gablooge/lawang/internal/ingress"
+	"github.com/gablooge/lawang/internal/provider"
+	"github.com/gablooge/lawang/internal/store"
 )
 
 const shutdownGrace = 15 * time.Second
 
-// serve runs the HTTP role until ctx is cancelled. For now it carries only /healthz. When the
-// webhook edge lands (B07 wires it, because it needs a hub), this mux goes away: ingress.New
-// builds the routing table, takes /healthz as an ingress.Route and returns the handler to serve,
-// so that no route is behind a mux that answers redirects.
+// serve runs the HTTP role until ctx is cancelled: the webhook edge under /ingress/{provider} and
+// /healthz, on one handler that internal/ingress builds.
+//
+// The order is deliberate. Everything that can refuse to start does so before the socket is bound:
+// the database and its preflight, the provider registry, and the hub, which is the one that knows
+// whether a registered provider's signature scheme needs a public base URL that nothing has
+// configured. A deployment that is going to answer 401 to every delivery should never reach the
+// point of answering at all.
 func serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	db, err := store.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// Every provider this binary serves, known at compile time and never changed afterwards.
+	// There is none yet: ClickUp is B11. Until then the edge answers 404 to every segment, which
+	// is the same answer a scanner gets, and /healthz is what serve is for.
+	reg, err := provider.NewRegistry()
+	if err != nil {
+		return err
+	}
+	h, err := hub.New(db, reg, hub.Options{PublicBaseURL: cfg.PublicBaseURL, Logger: logger})
+	if err != nil {
+		return err
+	}
+	handler, err := newHandler(reg, h, cfg.PublicBaseURL, logger)
+	if err != nil {
+		return err
+	}
+
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)
 	if err != nil {
 		return listenError(ctx, err)
 	}
-	return serveOn(ctx, ln, logger)
+	return serveOn(ctx, ln, handler, logger)
+}
+
+// newHandler is the whole routing table of the serve role.
+//
+// Every route goes to ingress.New, and what it returns is what the server serves. There is no mux
+// here, and no route is registered anywhere else, because net/http.ServeMux answers two kinds of
+// 307 redirect before any handler runs and a 307 preserves the method and the body: a provider
+// follows it and re-POSTs to a path it did not sign, so every delivery becomes a 401 that reads as
+// a forgery. One of the two depends on the routing table rather than on the request, so only the
+// package that builds the table can take it away (architecture 3.1). For the same reason a route
+// is never a sub-mux: ingress.New cannot see inside a handler, and a nested mux brings the
+// trailing-slash redirect straight back. The /v1 operator API (B14) is therefore one Route per
+// endpoint.
+func newHandler(reg *provider.Registry, h ingress.Hub, publicBaseURL string, logger *slog.Logger) (http.Handler, error) {
+	return ingress.New(reg, h, ingress.Options{
+		PublicBaseURL: publicBaseURL,
+		Logger:        logger,
+		Routes: []ingress.Route{
+			{Method: http.MethodGet, Path: "/healthz", Handler: http.HandlerFunc(healthz)},
+		},
+	})
+}
+
+// healthz is liveness only: the process is up. Readiness (/readyz, which checks Postgres) is
+// separate, and is B25's.
+func healthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("ok\n"))
 }
 
 // listenError turns a listen failure into an error that is safe to log.
@@ -92,8 +150,8 @@ func newServer(handler http.Handler) *http.Server {
 	}
 }
 
-func serveOn(ctx context.Context, ln net.Listener, logger *slog.Logger) error {
-	srv := newServer(newMux())
+func serveOn(ctx context.Context, ln net.Listener, handler http.Handler, logger *slog.Logger) error {
+	srv := newServer(handler)
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
@@ -117,14 +175,4 @@ func serveOn(ctx context.Context, ln net.Listener, logger *slog.Logger) error {
 		return err
 	}
 	return nil
-}
-
-func newMux() *http.ServeMux {
-	mux := http.NewServeMux()
-	// Liveness only: the process is up. Readiness (/readyz, which checks Postgres) is separate.
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	return mux
 }
