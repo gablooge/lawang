@@ -384,20 +384,18 @@ telephone number and an IBAN, in `Title` and `Text` only.
   `record.Record.Version`, which is what a provider author reads, and `provider.VersionOrder`
   names the encodings that break the lexical promise and the layout that breaks the base64 one.
 - **The masking tripwire narrows the derived-placeholder family, it does not close it.** The two
-  rules of decision 5 refuse every spelling in which the four schemes were actually written, and
-  every bypass the reviews have written is reported by name. They do not make a derived
-  placeholder unwritable. The second rule reports a `.Value` selector, which is a name and not the
-  value: a `foundSecret` handed whole to another function takes the value with it, and
-  `fmt.Sprint` renders it without naming the field, as does `reflect`. The allow-list keys on
-  rendered statement text as well, so an allowed entry can be spoofed by a different statement
-  that renders identically to it. An author inside `internal/pipeline` can therefore still write a
-  derived placeholder in several ways. **This record does not enumerate them, deliberately.** Two
-  enumerations were written here and both went stale within a round, and a list of escape routes
-  invites the next reader to believe it is complete. What the tripwire buys is that writing a
-  derived placeholder has to be deliberate, and that it is visible in review as a new function
-  being handed the value. Closing it properly means following the value rather than naming its
-  readers, which is a dataflow pass over the package and a larger thing than this record decided
-  to buy. B11 onward should read the caveat at the top of
+  rules of decision 5 refuse every spelling in which the four schemes were actually written. They
+  do not make a derived placeholder unwritable. The second rule reports a `.Value` selector, which
+  is a name and not the value: a `foundSecret` handed whole to another function takes the value
+  with it, and `fmt.Sprint` renders it without naming the field, as does `reflect`. The allow-list
+  keys on rendered statement text as well, so an allowed entry can be spoofed by a different
+  statement that renders identically to it. An author inside `internal/pipeline` can therefore
+  still write a derived placeholder in several ways. **This record does not enumerate them,
+  deliberately.** Two enumerations were written here and both went stale within a round, and a
+  list of escape routes invites the next reader to believe it is complete. What the tripwire buys
+  is that writing a derived placeholder has to be deliberate. Closing it properly means following
+  the value rather than naming its readers, which is a dataflow pass over the package and a larger
+  thing than this record decided to buy. B11 onward should read the caveat at the top of
   `internal/pipeline/mint_tripwire_test.go`, which says the same thing beside the rules.
 - **A required method on `provider.Provider` is a cost of its own.** Every provider must implement
   `VersionOrder`, including one whose versions never need ordering, and the registry refuses it at

@@ -41,21 +41,19 @@ import (
 //
 // What this buys, and what it does not.
 //
-// The two rules refuse every spelling in which the four schemes were actually written, and every
-// bypass a review has written against this package is reported by name. They do not make a
-// derived placeholder unwritable. Rule 2 reports a .Value selector, which is a name and not the
-// value: a foundSecret handed whole to another function takes the value with it, and fmt.Sprint
-// renders it without naming the field, as does reflect. valueReadsAllowed keys on rendered
-// statement text as well, so an allowed entry can be spoofed by a different statement that
-// renders identically to it. An author inside this package can therefore still write a derived
-// placeholder in several ways, and this file no longer lists them: the list was written twice and
-// went stale twice, and a list of escape routes invites the next reader to believe it is
-// complete.
+// The two rules refuse every spelling in which the four schemes were actually written. They do
+// not make a derived placeholder unwritable. Rule 2 reports a .Value selector, which is a name
+// and not the value: a foundSecret handed whole to another function takes the value with it, and
+// fmt.Sprint renders it without naming the field, as does reflect. valueReadsAllowed keys on
+// rendered statement text as well, so an allowed entry can be spoofed by a different statement
+// that renders identically to it. An author inside this package can therefore still write a
+// derived placeholder in several ways, and this file no longer lists them: the list was written
+// twice and went stale twice, and a list of escape routes invites the next reader to believe it
+// is complete.
 //
-// What the tripwire buys is that writing a derived placeholder has to be deliberate, and that it
-// is visible in review as a new function being handed the value. Closing it properly means
-// following the value rather than naming its readers, which is a dataflow pass over the package
-// and is not part of B08.
+// What the tripwire buys is that writing a derived placeholder has to be deliberate. Closing it
+// properly means following the value rather than naming its readers, which is a dataflow pass
+// over the package and is not part of B08.
 //
 // Three properties of the scan itself, measured rather than assumed, because each is easy to get
 // backwards. Build tags and generated-code markers buy nothing: the walk reads every non-test .go
@@ -377,8 +375,7 @@ func valueReadFindings(fset *token.FileSet, rel string, file *ast.File) []string
 		if !slices.Contains(valueReadsAllowed, site) {
 			findings = append(findings, rel+": "+site+" reads a ."+valueField+
 				", and the masked value may be read only at the statements listed in "+
-				"valueReadsAllowed. A placeholder derived from the value is written as a function "+
-				"that is handed the value, and this is where it would be handed over")
+				"valueReadsAllowed")
 		}
 		return true
 	})

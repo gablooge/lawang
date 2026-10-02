@@ -67,9 +67,9 @@ const MaxSecretsPerDelivery = 1024
 // name and not the value, so a foundSecret handed whole to another function carries the value
 // past it. An author in this package can still write a derived placeholder in several ways, and
 // the caveat does not list them, because the list was written twice and went stale twice. What
-// the tripwire buys is that writing one has to be deliberate, and that it is visible in review as
-// a new function being handed the value. Closing it properly means following the value rather
-// than naming its readers, a dataflow pass over the package that B08 did not buy.
+// the tripwire buys is that writing one has to be deliberate. Closing it properly means following
+// the value rather than naming its readers, a dataflow pass over the package that B08 did not
+// buy.
 //
 // Its characters are the ones the record format allows everywhere: ASCII letters, digits, a colon
 // and brackets. A ULID is 26 characters, so a token is 34 or 33 characters long.
