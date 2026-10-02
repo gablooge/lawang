@@ -11,13 +11,13 @@ delivered exactly once to your memory, search, or RAG system.
 
 > **Status: pre-alpha.** The foundations are built (M0: configuration, id recipes, Postgres with
 > row-level security, the outbox), the record format is settled
-> ([schema](internal/record/record.v1.schema.json)), and the webhook edge now exists: the provider
-> interfaces, the registry and `/ingress/{provider}` with raw-body capture, a size cap and the
-> handshake hook. What is still missing is the half that makes a delivery belong to somebody:
-> signature verification against owned subscriptions, and the outbox insert. So no webhook is
-> stored yet, **and `lawang serve` does not mount the route at all**: an edge with no hub would
-> answer a provider without storing anything, so B07 is the item that wires it and until then a
-> POST to `/ingress/{provider}` is a 404 from the mux. The design
+> ([schema](internal/record/record.v1.schema.json)), and the accept path is now whole: the webhook
+> edge, and the hub behind it that resolves which tenant a delivery belongs to, verifies the exact
+> bytes against that tenant's own subscription, and writes the outbox row. `lawang serve` wires
+> both, so a signed delivery for a registered subscription is stored, a forged one is a 401 that
+> stores nothing, and one nobody can be shown to own is parked rather than routed. **No provider is
+> registered yet**, so every `/ingress/{provider}` segment is a 404 until ClickUp lands, and
+> nothing drains the outbox: the worker, the pipeline and the sinks are the next items. The design
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in
 > [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the
@@ -44,7 +44,8 @@ is the part that matters once the data lands in something an AI agent reads.
   disabled, subscriptions expire, and some providers never redeliver.
 - **Tenant isolation by construction.** Postgres row-level security on every table, fail closed.
   An incoming webhook's tenant comes from a subscription row Lawang owns, never from the
-  payload, and a delivery that more than one tenant could claim is refused rather than routed.
+  payload, and a delivery that more than one subscription row could claim is refused rather than
+  routed.
 - **No broker.** One Postgres, an outbox table, and a worker. The hand-off between accepting a
   webhook and delivering a record is a database row, so there is nothing else to run or lose.
 - **Credentials held safely.** A local encrypted vault by default, or a self-hosted

@@ -11,3 +11,4 @@ reversed, add a new record that supersedes the old one instead of editing histor
 | [3](0003-scope-id-format.md) | The scope id is `{provider}:{container_kind}:{container_id}`: internal provider key, percent-escaped container id, one canonical spelling, no tenant | accepted |
 | [4](0004-record-format-v1.md) | Record format v1: a `format` version field, what is required, where unknown fields are allowed, `delete` defined, and the scope hashed into the record id | accepted |
 | [10](0010-outbox-head-marker.md) | The head of an ordering key is a stored marker, so a claim costs its batch and not the backlog | accepted |
+| [11](0011-hub-resolution.md) | The webhook verification secret is a subscription column (the vault cannot serve a path that has no tenant yet), an unattributable delivery is parked under the sentinel tenant `_parked`, and an accepted delivery is ordered by its subscription | accepted |

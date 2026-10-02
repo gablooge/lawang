@@ -10,6 +10,8 @@ package provider
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 
@@ -106,6 +108,111 @@ type WebhookSource interface {
 	Parse(body []byte) ([]Change, error)
 }
 
+// URLSigner is the optional capability of a WebhookSource whose signature scheme covers
+// Request.URL: HubSpot v3 signs the method, the full public request URI, the body and a timestamp.
+// It is a marker and not a method that returns a bool, so that a scheme cannot say "no" by
+// accident in a refactor.
+//
+// A deployment that registers such a provider and configures no LAWANG_PUBLIC_BASE_URL cannot
+// accept one single delivery of it: Request.URL is empty, Verify returns false rather than guess,
+// and every delivery is answered 401, which is the status the contract reserves for a forged
+// signature and which is only visible on the provider's own dashboard. The edge cannot see that
+// coming, because it does not know which schemes sign the URL. The hub does, because it is handed
+// the registry, so hub.New refuses to start (architecture 4).
+type URLSigner interface {
+	WebhookSource
+	// SignsPublicURL says that this scheme's signature covers Request.URL. It does nothing.
+	SignsPublicURL()
+}
+
+// Registrar is the optional capability of a provider that creates its own webhook registrations,
+// renews them before they lapse and removes them again. The operator API and "lawang connect"
+// (B14) call Register and Deregister, and the renewal sweep (B19) calls Renew.
+//
+// Everything it returns ends up in the subscriptions table, which is what the accept path resolves
+// a delivery's owner in, so a Subscription's delivery keys have to be the ones the provider will
+// actually put on a delivery. A registration whose workspace id is spelled differently from the
+// one the webhooks carry is a subscription that never matches a candidate, and every delivery it
+// was made for is parked as unowned.
+type Registrar interface {
+	// Register creates the provider-side webhooks for one tenant and returns what it created, one
+	// Subscription per resource. It talks to the provider's API, so it never runs on the accept
+	// path and never inside a transaction.
+	Register(ctx context.Context, t tenancy.ID, cred Credential) ([]Subscription, error)
+	// Renew extends a registration that expires (a Microsoft Graph subscription lasts hours) and
+	// returns it as it now stands. A provider whose registrations do not expire returns s.
+	Renew(ctx context.Context, s Subscription) (Subscription, error)
+	// Deregister removes the provider-side webhook. It is called before the row is deleted, so a
+	// deployment that is taken down stops being sent deliveries it would only park.
+	Deregister(ctx context.Context, s Subscription) error
+}
+
+// Credential is one tenant's credential for one provider, as the vault hands it out: the API token
+// or client secret a Registrar authenticates with, and that hydration uses later.
+//
+// It is deliberately opaque, for the same reason Hydrated is: what a credential holds is the
+// vault's business (B13) and the connect command's (B14), and no two providers' credentials have a
+// field in common. Writing a struct for it here, before the items that decide it, would be a shape
+// every one of them has to rewrite. What is already settled is where it may go: a Credential is
+// secret material, so it never reaches a log line, an error, a plain table or a record.
+type Credential any
+
+// Subscription is one webhook registration Lawang owns, as a row of the subscriptions table and as
+// a Registrar returns it. It is what makes a delivery somebody's: the accept path looks rows up by
+// the delivery's own keys and takes the tenant of the one whose Secret verifies the exact bytes.
+//
+// The zero Subscription is not a subscription: every field but Workspace and External is required,
+// and at least one of those two has to be set, or nothing could ever select the row.
+type Subscription struct {
+	// ID is Lawang's own id for the registration, a ULID. It is not the provider's id (that is
+	// External), and it is what the outbox orders an accepted delivery by.
+	ID string
+	// Tenant owns the registration. It comes from an operator credential (B14), never from a
+	// delivery.
+	Tenant tenancy.ID
+	// Provider is the registry's own key, a constant of this program.
+	Provider string
+	// Resource is what the registration covers, in the provider's own words: a ClickUp workspace,
+	// a mailbox, a channel. It identifies the registration for Lawang, so registering the same
+	// resource again updates this row rather than adding a second one.
+	Resource string
+	// Workspace is the provider's id of the workspace, team, portal or account, as it will appear
+	// on a delivery (DeliveryKeys.Workspace), or empty for a provider that sends none.
+	Workspace string
+	// External is the provider's id of the registration itself, as it will appear on a delivery
+	// (DeliveryKeys.Subscription), or empty for a provider that sends none.
+	External string
+	// Secret is what deliveries of this registration are signed with, and the only credential the
+	// accept path needs. It is secret material: it is never logged, never returned to a caller
+	// outside Lawang, and LogValue and String keep it out of a log line and out of an error.
+	//
+	//nolint:gosec // G117: it is a secret on purpose. This struct is never marshalled to JSON (the
+	// operator API of B14 has its own shape), the column it is stored in is granted to the
+	// resolver role alone, and the two printing methods below redact it, which
+	// TestASubscriptionNeverPrintsItsSecret holds them to.
+	Secret []byte
+}
+
+// LogValue is what a structured log line gets: everything but the secret.
+func (s Subscription) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", s.ID),
+		slog.String("tenant", s.Tenant.String()),
+		slog.String("provider", s.Provider),
+		slog.String("resource", s.Resource),
+		slog.Bool("has_secret", len(s.Secret) > 0),
+	)
+}
+
+// String covers %v, %+v and %s, so printing a Subscription cannot spill the secret either.
+func (s Subscription) String() string {
+	return fmt.Sprintf("{ID:%s Tenant:%s Provider:%s Resource:%s Workspace:%s External:%s Secret:[redacted %d bytes]}",
+		s.ID, s.Tenant, s.Provider, s.Resource, s.Workspace, s.External, len(s.Secret))
+}
+
+// GoString covers %#v.
+func (s Subscription) GoString() string { return "provider.Subscription" + s.String() }
+
 // Request is one delivery as a signature scheme sees it: the parts of the HTTP request a
 // provider's signing scheme can cover. It is a struct rather than a longer parameter list because
 // the schemes disagree about what a signature is over, and the next one to need a field it does
@@ -150,11 +257,11 @@ type Request struct {
 	// in the outbox. Nothing in the type system stops that, and a review of a provider package
 	// has to look for it.
 	//
-	// Making it a guarantee is cheap and belongs where the per-candidate loop is, which is the
-	// hub (#7): copying the slice per candidate costs 0.9 microseconds for an 8 KiB delivery and
-	// 57 microseconds at the 1 MiB cap on this machine, against an accept path that targets 200
-	// ms. It is not done here, because the edge builds one Request and has no candidate loop to
-	// copy in.
+	// The hub makes it a guarantee where the per-candidate loop is: it hands each candidate its
+	// own copy of the slice, which costs 0.9 microseconds for an 8 KiB delivery and 57
+	// microseconds at the 1 MiB cap, against an accept path that targets 200 ms. It is not done
+	// here, because the edge builds one Request and has no candidate loop to copy in, and any
+	// other caller of Verify has to copy for itself.
 	Body []byte
 }
 

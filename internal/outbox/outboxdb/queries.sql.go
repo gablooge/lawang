@@ -300,6 +300,50 @@ func (q *Queries) MarkPrepared(ctx context.Context, arg MarkPreparedParams) (int
 	return result.RowsAffected(), nil
 }
 
+const park = `-- name: Park :one
+INSERT INTO outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body,
+                    state, is_head, dead_reason, finished_at)
+VALUES ($1, $2::text, $3, $4::text, $4::text, $5,
+        'dead', false, $6, now())
+ON CONFLICT (tenant_id, delivery_id) DO NOTHING
+RETURNING id
+`
+
+type ParkParams struct {
+	ID         string
+	TenantID   string
+	Provider   string
+	DeliveryID string
+	RawBody    []byte
+	DeadReason string
+}
+
+// Stores a delivery nobody can be shown to own, under the sentinel tenant, already finished.
+//
+// It takes no advisory lock, and that is not an omission. The lock exists to keep queue order and
+// the head marker within one ordering key, and a parked row has neither: it is inserted 'dead' and
+// is_head false, so nothing ever claims it, nothing waits behind it, and the "is the key
+// unfinished?" test that Accept and Replay make (which counts only pending and prepared rows)
+// cannot see it. Its ordering key is its own delivery id, so no two parked rows share a key and a
+// flood of unattributable deliveries queues on nothing at all.
+//
+// A repeated delivery returns no row, exactly as Accept does: the unique key is
+// (tenant_id, delivery_id), and the sentinel is one tenant, so re-sending an unowned delivery
+// parks it once.
+func (q *Queries) Park(ctx context.Context, arg ParkParams) (string, error) {
+	row := q.db.QueryRow(ctx, park,
+		arg.ID,
+		arg.TenantID,
+		arg.Provider,
+		arg.DeliveryID,
+		arg.RawBody,
+		arg.DeadReason,
+	)
+	var id string
+	err := row.Scan(&id)
+	return id, err
+}
+
 const promoteNextHead = `-- name: PromoteNextHead :exec
 UPDATE outbox
    SET is_head = true

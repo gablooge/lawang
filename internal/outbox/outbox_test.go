@@ -922,15 +922,26 @@ func TestConcurrentWorkersDeliverEachEntityInOrder(t *testing.T) {
 				for i, c := range got {
 					key := batch[i].TenantID + "/" + batch[i].OrderingKey
 					time.Sleep(time.Millisecond) // the work
-					if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
-						t.Errorf("MarkDelivered: %v", err)
-						return
-					}
+					// The bookkeeping is cleared BEFORE the commit that finishes the row, and
+					// that order matters. MarkDelivered hands the head marker to the next version
+					// in the same transaction, so the moment it commits another worker may
+					// legitimately claim that version; clearing afterwards leaves a window in
+					// which this goroutine has not been scheduled yet and the other worker's
+					// perfectly correct claim reads as a violation. CI failed that way on a loaded
+					// runner. Nothing is weakened by the swap: the next version cannot be claimed
+					// until this one finishes, so no real overlap can hide in the new window,
+					// while the defect this test exists to catch (a claim that ignores the
+					// head-of-key rule) still trips the check, because a batch is marked in flight
+					// at claim time and no row of a key is ever delivered before it is claimed.
 					mu.Lock()
 					lastSeq[key] = batch[i].Seq
 					delete(inFlight, key)
 					delivered++
 					mu.Unlock()
+					if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
+						t.Errorf("MarkDelivered: %v", err)
+						return
+					}
 				}
 			}
 		})

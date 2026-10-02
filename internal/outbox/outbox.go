@@ -187,6 +187,167 @@ func acceptIn(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, d Delivery) (id
 	return id, true, nil
 }
 
+// ParkReason says why a delivery could not be attributed to a tenant. Like a Cause, it is a class
+// and not a text: dead_reason is a plain column that operators read and every backup carries, so
+// nothing from outside this package is ever written into it.
+type ParkReason uint8
+
+// The reasons a delivery is parked. The hub (internal/hub) is the caller, and B25 re-resolves the
+// first two: they are the ones a subscription registered later can settle.
+const (
+	// ParkUnreasoned is the zero value: a Park that was given no reason. It is refused.
+	ParkUnreasoned ParkReason = iota
+	// ParkNoOwner: no subscription of any tenant matched the delivery's own keys. The usual cause
+	// is a workspace nobody has connected, or a connection that was deleted while the
+	// provider-side webhook stayed behind.
+	ParkNoOwner
+	// ParkAmbiguousOwner: more than one subscription's secret verified the exact bytes, whether
+	// those rows belong to two tenants or to one (ADR 11, decision 5), or the delivery's keys
+	// selected more candidates than the hub will verify. Routing it to any of them would be a
+	// guess (principle 2): across two tenants the tenant is in doubt, and within one tenant the
+	// subscription is, and the subscription is half of the ordering key.
+	ParkAmbiguousOwner
+	// ParkUnreadable: the provider could not read its own delivery keys out of the body, or the
+	// keys it read cannot identify anything (they are empty, over-long, or not storable text).
+	// Nothing can be resolved from such a delivery, and it is not a signature failure.
+	ParkUnreadable
+	// ParkUnverifiable: the provider's verification did not answer, because it panicked.
+	// Architecture section 7 says Verify never panics and nothing can enforce it, so the delivery
+	// is parked rather than routed on the word of the candidates that did answer.
+	ParkUnverifiable
+	// ParkUnstorable: the delivery is poison. It has an owner, but it cannot be stored for that
+	// tenant however often it is sent again (an ordering key the table refuses), so it must not be
+	// a failure the provider retries.
+	ParkUnstorable
+)
+
+// keepsBody reports whether a parked delivery's own bytes are stored, or a short note in their
+// place. See Park.
+//
+// Only ParkUnreadable answers false, and it takes both halves of the reason together. It can never
+// be re-resolved: the provider could not read its own keys out of those bytes, so no subscription
+// registered later makes them resolvable, and nothing will ever read them again. And a stranger
+// produces it at will: the ingress path takes any body up to the edge's 1 MiB cap with no
+// credential of any kind, the delivery id is a hash of the body, so every distinct body is a
+// distinct row, and twenty POSTs of garbage are twenty rows of garbage. Bytes nothing will read,
+// in a row anyone can write, are pure cost.
+//
+// It is not the only park a stranger produces at will. ParkNoOwner is just as cheap, needing only
+// a body the provider package can parse and a workspace id nobody registered, and it keeps every
+// byte: twenty 4 KiB posts of that shape are 84 KB of a stranger's payload. That is deliberate,
+// because B25 re-resolves those rows from exactly those bytes, which is the half ParkUnreadable
+// does not have. Whether the re-resolvable reasons need a quota or an age cap is #25's question,
+// and it is written there.
+//
+// The other two reasons no sweep re-resolves keep their bytes. ParkUnstorable has a verified owner
+// already, so the bytes are that tenant's own data and nobody without its secret can produce one.
+// ParkUnverifiable needs a candidate subscription to exist AND a provider package to panic, and
+// the body is then the evidence for a bug of ours. Neither is a stranger's to fill a disk with.
+func (r ParkReason) keepsBody() bool { return r != ParkUnreadable }
+
+// bodyNotKept is what Park stores in place of a delivery nothing will ever read again.
+//
+// It keeps the two things an operator can act on: how long the delivery was, and the delivery id
+// the bytes themselves had, which is what correlates this row with the provider's own record of
+// what it sent. Both are a function of the body alone, so two different bodies still make two
+// different rows and a re-send of one still dedupes onto its own row, exactly as a stored body
+// would. It is JSON because raw_body is JSON for every other row.
+func bodyNotKept(bodyDeliveryID string, n int) []byte {
+	return fmt.Appendf(nil, `{"lawang":"body not kept","body_delivery_id":%q,"body_bytes":%d}`,
+		bodyDeliveryID, n)
+}
+
+// parkReasonText is what each reason writes into dead_reason.
+var parkReasonText = map[ParkReason]string{
+	ParkNoOwner:        "unattributable: no owner",
+	ParkAmbiguousOwner: "unattributable: ambiguous owner",
+	ParkUnreadable:     "unattributable: unreadable delivery",
+	ParkUnverifiable:   "unattributable: the provider's verification panicked",
+	ParkUnstorable:     "poison: the delivery cannot be stored",
+}
+
+// String names the reason as it is stored.
+func (r ParkReason) String() string {
+	if text, ok := parkReasonText[r]; ok {
+		return text
+	}
+	return "unattributable: no reason given"
+}
+
+// ErrNoParkReason reports a Park with no reason. A parked row whose dead_reason says nothing is a
+// row no sweep can re-resolve and no operator can act on, so it is refused rather than stored.
+var ErrNoParkReason = errors.New("outbox: a parked delivery needs a reason")
+
+// Park stores a delivery that no tenant can be shown to own, under the sentinel tenant
+// (tenancy.Sentinel), already dead so that nothing ever drains it. fresh is false for a delivery
+// that is already parked, which makes a re-send of an unowned delivery a no-op like any other.
+//
+// It takes NO tenant. That is the point of it: the accept path reaches this function exactly when
+// it could not establish an owner, and a function that took a tenant here would be one crafted
+// delivery away from writing into a real one. Everything a sender influences is the raw body,
+// which is stored as it arrived, and nothing else: the provider is the registry's own constant,
+// the tenant is this program's constant, and the ordering key is the delivery id this function
+// derives.
+//
+// A parked row is auditable, re-resolvable once the missing subscription exists (B25) and deleted
+// by retention. It is never claimable: it is inserted dead and not the head of its key, and the
+// two states that would make it claimable are refused by the table itself.
+//
+// # What is stored, and what is not
+//
+// The bytes are stored as they arrived for every reason a sweep can settle later, because those
+// are the delivery: B25 routes them once the subscription that owns them exists. For a delivery
+// whose keys the provider could not read there is nothing to come back to, and storing a
+// stranger's megabyte forever for a row nothing will read is how a public endpoint fills a disk.
+// Those rows keep a short note instead (bodyNotKept), and keepsBody says which reasons are which.
+// The choice is made here rather than by the caller, so that a later caller cannot forget it.
+//
+// The row's delivery_id is blake3(provider, whatever this stores), which is the invariant the
+// table's own comment states, for a parked row as for an accepted one.
+func (o *Outbox) Park(ctx context.Context, providerKey string, rawBody []byte, reason ParkReason) (id string, fresh bool, err error) {
+	text, ok := parkReasonText[reason]
+	if !ok {
+		return "", false, ErrNoParkReason
+	}
+	bodyID, err := ids.DeliveryID(providerKey, rawBody) // refuses an empty provider
+	if err != nil {
+		return "", false, err
+	}
+	if !storable(providerKey) {
+		return "", false, errBadProvider
+	}
+	body, deliveryID := rawBody, bodyID
+	if !reason.keepsBody() {
+		body = bodyNotKept(bodyID, len(rawBody))
+		if deliveryID, err = ids.DeliveryID(providerKey, body); err != nil {
+			return "", false, err
+		}
+	}
+	id = ids.New()
+	err = o.db.TenantTx(ctx, tenancy.Sentinel, func(tx pgx.Tx) error {
+		row, err := outboxdb.New(tx).Park(ctx, outboxdb.ParkParams{
+			ID:         id,
+			TenantID:   tenancy.Sentinel.String(),
+			Provider:   providerKey,
+			DeliveryID: deliveryID,
+			RawBody:    body,
+			DeadReason: text,
+		})
+		if err != nil {
+			return err
+		}
+		id = row
+		return nil
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows): // ON CONFLICT DO NOTHING returned nothing
+		return "", false, nil
+	case err != nil:
+		return "", false, fmt.Errorf("outbox: park: %w", err)
+	}
+	return id, true, nil
+}
+
 // Claim leases up to batch rows for the given duration, across tenants, as the worker role. Rows
 // locked by a concurrent claimer are skipped, never waited for.
 //

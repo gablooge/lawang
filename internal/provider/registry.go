@@ -3,6 +3,8 @@ package provider
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/gablooge/lawang/internal/record"
 )
@@ -84,6 +86,20 @@ func NewRegistry(providers ...Provider) (*Registry, error) {
 		r.byKey[key] = Entry{key: key, p: p}
 	}
 	return r, nil
+}
+
+// Entries returns every registered provider, ordered by key. The order is fixed so that a start-up
+// refusal that names a provider (hub.New refuses a URL-signing provider with no public base URL
+// configured) names the same one on every start, whatever the map iteration does that day.
+//
+// The slice is the caller's, and an Entry carries only the validated key and the provider itself,
+// so nothing a caller does to it can change the registry.
+func (r *Registry) Entries() []Entry {
+	out := make([]Entry, 0, len(r.byKey))
+	for _, key := range slices.Sorted(maps.Keys(r.byKey)) {
+		out = append(out, r.byKey[key])
+	}
+	return out
 }
 
 // Lookup finds the provider registered under key. key may be anything at all, path segment

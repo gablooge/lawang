@@ -39,7 +39,13 @@ var (
 	adminURL *url.URL
 	startErr error
 
-	// Roles are cluster-wide, so two databases bootstrapping at once would race on CREATE ROLE.
+	// Every write to a catalogue the whole cluster shares goes under this: creating the roles,
+	// setting the application role's password, and creating a database. Roles live in pg_authid
+	// and databases in pg_database, and both are one table for the cluster however many databases
+	// the tests take, so two tests doing any of it at once update the same tuple and the loser is
+	// refused with "tuple concurrently updated" (SQLSTATE XX000). It is a real failure with a
+	// misleading message, it only appears once enough packages run their integration tests in
+	// parallel, and CI met it twice in one afternoon before this covered more than CREATE ROLE.
 	bootstrapMu sync.Mutex
 )
 
@@ -66,6 +72,10 @@ func Bootstrap(t testing.TB, connURL string) {
 	if err := TryBootstrap(t, connURL); err != nil {
 		t.Fatalf("testdb: bootstrap: %v", err)
 	}
+	// pg_authid is the cluster's, and this statement updates the one row every test's application
+	// role shares. TryBootstrap takes the same lock and has already given it back.
+	bootstrapMu.Lock()
+	defer bootstrapMu.Unlock()
 	Exec(t, connURL, fmt.Sprintf("ALTER ROLE lawang PASSWORD '%s'", appPassword))
 }
 
@@ -136,7 +146,12 @@ func NewRawCluster(t testing.TB) Database {
 func newDatabase(t testing.TB, cluster *url.URL) Database {
 	t.Helper()
 	name := "t_" + strings.ToLower(ids.New())
-	Exec(t, cluster.String(), "CREATE DATABASE "+name)
+	// pg_database is the cluster's too, so this is serialized with the role writes above.
+	func() {
+		bootstrapMu.Lock()
+		defer bootstrapMu.Unlock()
+		Exec(t, cluster.String(), "CREATE DATABASE "+name)
+	}()
 
 	admin := *cluster
 	admin.Path = "/" + name

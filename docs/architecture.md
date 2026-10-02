@@ -197,6 +197,57 @@ already understands. Four to eight concurrent accepts of a few milliseconds each
 deliveries a second, which is far past what v0.1 needs; an operator who needs more raises
 `pool_max_conns` in `LAWANG_DATABASE_URL` (see [section 4](#4-trust-model)).
 
+**Resolving the owner is `internal/hub`, and it is two transactions.** The edge hands it the
+registry entry and the delivery, and it does five things in order.
+
+1. **Delivery keys.** `WebhookSource.DeliveryKeys` reads the provider's own identifiers out of the
+   body: a workspace, team, portal or account id, and the id of the registration itself. They are
+   parsed from unauthenticated bytes, before any tenant exists, so they are held to what a lookup
+   can use (at most 256 bytes each, storable text) and used for nothing but narrowing. A delivery
+   with no key at all is **not** looked up: finding its owner would mean verifying every
+   subscription there is, which is work a stranger could ask for with an empty body, so it is
+   parked.
+2. **Candidates, under `lawang_resolver`, in a transaction that does nothing else.** One equality
+   probe per key the delivery carries, each on its own index of the subscriptions table, for at
+   most `hub.DefaultMaxCandidates` (32) rows plus one; the candidate set is the union of what they
+   return. It is a union and not a choice between them because a subscription may be registered
+   with a workspace id, with the registration's own id, or with both, and which of those a delivery
+   carries is the provider's business: asking only the rows one key selects would leave a tenant
+   with a claim on the delivery out of the set, and "exactly one verified" cannot be told from "the
+   one we asked verified". Each probe also filters on the other key, so a key that both the
+   delivery and the row carry must agree. That transaction commits before anything is verified: it
+   is cross-tenant for its whole life, and a bind inside it would narrow nothing (see
+   [section 4](#4-trust-model)).
+3. **Verification, once per candidate.** Constant time, over the exact raw bytes, with the same
+   `provider.Request` each time except that `Body` is copied per candidate, which turns that
+   field's rule into a guarantee for 0.9 microseconds at 8 KiB. `Verify` is called inside a
+   recover and under the accept path's own deadline: a provider that panics parks the delivery
+   instead of dropping the connection, and one that does not return is given up on, so the sender
+   gets the 503 the table above promises rather than nothing at all
+   ([section 7](#7-extension-points)).
+4. **The owner.** None verified is 401 and nothing stored. Exactly one is the tenant. **More than
+   one is refused** (principle 2), and so is a candidate set larger than the hub will verify,
+   because a set cut short could hide the second tenant that verifies.
+5. **The accept**, in a second transaction, under `TenantTx` bound to that tenant:
+   `outbox.Accept`, then 202, or 200 when the delivery id says this tenant already has it.
+
+**A delivery nobody can be shown to own is parked under the sentinel tenant** `_parked`
+(`tenancy.Sentinel`), which no tenant may have: the `tenants` table refuses that id, so no operator
+credential is ever issued for it. `outbox.Park` takes no tenant from its caller at all, which is
+what keeps a crafted delivery from reaching a real one. A parked row is stored `dead`, finished and
+not the head of its key, so no worker ever claims it, and `dead_reason` says why it was parked, in
+one of five fixed texts that B25 re-resolves by. A parked row keeps the delivery's own bytes for
+the reasons a sweep can settle later, and a short note (its length and the delivery id the bytes
+had) for the one it can never settle: a delivery whose keys the provider could not read is the
+park a stranger produces at will, with no credential, and nothing will ever read those bytes
+again. The details, and why the verification secret is a column of the subscription row rather
+than a vault entry, are in [ADR 11](adr/0011-hub-resolution.md).
+
+**An accepted delivery is ordered by the subscription it arrived on**, `{provider key}:{subscription
+id}`, because the hub does not parse a delivery and so cannot name an entity. That is coarser than
+one entity, which keeps the guarantee that two versions of one entity are never in flight together,
+and it costs parallelism: one subscription's deliveries drain one at a time (ADR 11).
+
 ### 3.2 Drain path (inside `worker`)
 
 1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so the
@@ -356,8 +407,10 @@ signs the URL must return `false`. That answers 401 for every delivery of that p
 loud and correct: the alternative is a signature checked against a URL Lawang made up, which
 passes or fails for reasons nobody can reason about. The operator's fix is one variable, and
 `ingress.New` names it in a warning at start so the fix is findable from the logs rather than only
-from the provider's dashboard. Refusing to start belongs to the hub (B07), which is the layer that
-knows which providers are registered and which of their schemes cover the URL.
+from the provider's dashboard. **The hub refuses to start** when a registered provider's scheme
+covers the URL and none is configured: it is handed the registry, so it knows which providers are
+registered, and a scheme says so by implementing `provider.URLSigner`. A deployment that could not
+accept one single delivery should not get as far as binding a socket.
 
 **Row-level security.** Every tenant-scoped table has RLS enabled and forced, with the policy keyed
 on a transaction-local setting. If the setting is missing, a query returns zero rows. Three roles:
@@ -370,6 +423,14 @@ on a transaction-local setting. If the setting is missing, a query returns zero 
 
 The resolver and worker roles are granted with `INHERIT FALSE` and entered explicitly with
 `SET LOCAL ROLE`, so the application role does not silently pick up their wider policies.
+
+The resolver's reach is written out, because it is the widest read in the program: `SELECT` on six
+columns of one table (`id`, `tenant_id`, `provider`, `workspace_id`, `external_id`, `secret`), no
+write of any kind, and nothing at all on any other table. It cannot read a subscription's
+`resource` or when it was created, it cannot see the outbox, and it cannot see the tenants table.
+The `secret` is the webhook verification secret, which is the one credential the accept path needs
+and is deliberately not a vault entry: the vault is keyed by tenant, and this is the path that does
+not know the tenant yet ([ADR 11](adr/0011-hub-resolution.md)).
 
 **A helper-role transaction is cross-tenant until it ends.** Permissive policies are ORed together,
 so once a helper role's policy applies (`TO lawang_worker USING (true)`, for example), binding a
@@ -459,7 +520,7 @@ Three deterministic keys, minted in exactly one package (`internal/ids`) so the 
 |---|---|---|
 | accept | `delivery_id = blake3(provider, raw_body)`, unique per tenant | an identical re-send is an accept no-op |
 | record | `id = "rec_" + blake3(provider, external_id, version, scope, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
-| subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates |
+| subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates, and the row keeps its id |
 
 Parts are joined with a `0x1F` separator so `("ab","c")` never collides with `("a","bc")`. A part
 that is empty or itself contains `0x1F` is refused with an error rather than hashed: an empty tenant
@@ -470,6 +531,14 @@ a delivery is exempt because it is the last part. Test vectors for both recipes 
 The delivery id is unique **per tenant**, not globally, for the same reason the record id is salted
 (below): two tenants may connect one provider workspace, and reconciliation then synthesizes
 byte-identical deliveries for both. A global constraint would drop the second tenant's.
+
+The sentinel tenant that holds unattributable deliveries is a tenant for this key like any other,
+so a provider that re-sends a delivery nobody owns parks it once and gets 200 for every repeat.
+
+A subscription's id is what an accepted delivery's **ordering key** is built from, so it has to
+outlive a re-registration: an updated row keeps its id, or the next delivery of that subscription
+would join a new queue beside the one still in flight in the old one
+([ADR 11](adr/0011-hub-resolution.md)).
 
 The **tenant** is part of the record id on purpose: two tenants can legitimately connect the same
 provider workspace, and without the salt the second tenant's records would dedupe away as
@@ -654,10 +723,29 @@ type Request struct {
 // Set or Del change what the candidates after it see: an intermittent signature failure on the
 // second candidate only. Get and Values read; Values returns a copy; nothing writes.
 type Header struct{ /* wraps the request's own map, copies nothing */ }
+// URLSigner marks a scheme whose signature covers Request.URL (HubSpot v3). A deployment that
+// registers one and configures no public base URL can accept none of its deliveries, so the hub
+// refuses to start rather than answer 401 to every one of them.
+type URLSigner interface {
+	WebhookSource
+	SignsPublicURL()
+}
+
 type Registrar interface {
 	Register(ctx context.Context, t Tenant, cred Credential) ([]Subscription, error)
 	Renew(ctx context.Context, s Subscription) (Subscription, error)
 	Deregister(ctx context.Context, s Subscription) error
+}
+
+// Subscription is one webhook registration Lawang owns, and the row a delivery's owner is
+// resolved from. Workspace and External are the delivery keys a delivery is looked up by; Secret
+// is what its deliveries are signed with, and it is the only credential the accept path needs
+// (ADR 11). It redacts the secret when it is printed or logged.
+type Subscription struct {
+	ID, Provider, Resource string
+	Tenant                 Tenant
+	Workspace, External    string // the provider's own ids, as they appear on a delivery
+	Secret                 []byte
 }
 type Reconciler interface {
 	ChangesSince(ctx context.Context, s Subscription, cursor Cursor, limit int) ([]Change, error)
@@ -691,7 +779,7 @@ whose every record fails in `Seal`. It calls `Key()` exactly once, at registrati
 its own copy of the string from then on, which is what makes `outbox.Delivery.Provider` a constant
 of the program rather than a decoded path segment.
 
-**Three things a provider author has to know, which the hub (B07) is where they bite.**
+**Three things a provider author has to know, and what the hub does about each.**
 
 - `Handshake` runs on **unauthenticated bytes, on every delivery**, not only on a challenge,
   because a challenge arrives before any subscription exists and nothing else can tell the two
@@ -700,33 +788,43 @@ of the program rather than a decoded path segment.
   only then parses. Slack and Microsoft Graph both allow this.
 - `Verify` **never errors and never panics**, and nothing in the type system can enforce it. A
   panic there is recovered per connection by `net/http` and the provider sees a dropped response
-  rather than a status. `Verify` runs once per candidate subscription, so B07's per-candidate loop
-  recovers around it: one provider's panic parks a delivery, it does not drop the connection.
+  rather than a status. `Verify` runs once per candidate subscription, so the hub's per-candidate
+  loop recovers around it and gives up on one that does not return: a provider that panics parks
+  the delivery rather than dropping the connection, and a provider that hangs is answered 503 with
+  a `Retry-After` rather than nothing at all. Neither is routed, because a candidate that did not
+  answer cannot be ruled out as the owner.
 - `Request` is handed to `Verify` **once per candidate**, and the same value each time. That is why
   `Request.Header` is this package's `Header` and not an `http.Header`: a provider that normalized
   a header in place would change what the candidates after it read, and the symptom would be a
   signature that fails for the second candidate only, in a tenant that happens to have two
   subscriptions on one workspace. The header is a guarantee, because the type has no mutating
   method and nothing is copied to get it. **`Request.Body` is a rule and not a guarantee**: it is a
-  `[]byte` that aliases the edge's own buffer, an implementation that normalizes it in place
-  changes what every later candidate verifies and what B07 stores in the outbox, and only a review
-  of the provider package catches that. Making it a guarantee belongs in B07's per-candidate loop,
-  where a copy per candidate costs 0.9 us for an 8 KiB delivery and 57 us at the 1 MiB cap against
-  a 200 ms target, and it is on [#7](https://github.com/gablooge/lawang/issues/7) with those
-  numbers.
+  `[]byte` that aliases the edge's own buffer, and an implementation that normalizes it in place
+  would change what every later candidate verifies and what is then stored in the outbox. The hub
+  makes it a guarantee where the candidate loop is: it hands each candidate its own copy, which
+  costs 0.9 us for an 8 KiB delivery and 57 us at the 1 MiB cap against a 200 ms target. The copy
+  also keeps a `Verify` that was given up on from writing to the same bytes the accept is storing.
 - The 503 the edge answers on a slow accept rests on `errors.Is(err, context.DeadlineExceeded)`.
-  Both error shapes pgx produces for a saturated pool match it today, but a statement cancelled
-  server side comes back as a `*pgconn.PgError` with SQLSTATE 57014 and no context error in its
-  chain, which would land on 500 where 503 with a `Retry-After` is the honest answer. B07 treats
-  `ctx.Err() != nil` after the call as the deadline case too.
+  Both error shapes pgx produces for a saturated pool match it, but a statement cancelled server
+  side comes back as a `*pgconn.PgError` with SQLSTATE 57014 and no context error in its chain,
+  which would land on 500 where 503 with a `Retry-After` is the honest answer. So the hub puts the
+  context's own error in front of anything that failed while the context was already done, and
+  keeps the original wrapped for the log.
 
 **What lands when.** `Provider` and `WebhookSource` are in `internal/provider` from B06, because
-the ingress edge is built on them. `Registrar`, `Reconciler` and `MemberSource` arrive with the
-items that decide the types they take, and not before: `Subscription` is B07's (the hub and the
-subscription table), `Credential` is B13's and B14's (the vault and `connect`), `Cursor` is B19's
-(reconciliation) and `ScopeMembers` is B23's (access sync). An interface written before its types
-are settled is a shape every later item has to rewrite, and the rewrite is not free once a
-provider package implements it.
+the ingress edge is built on them. `Subscription`, `Registrar` and `URLSigner` land with B07, which
+is the item that decides what a subscription is: the hub resolves deliveries against those rows and
+the subscriptions table stores them. `Reconciler` and `MemberSource` still wait for the items that
+decide the types they take: `Cursor` is B19's (reconciliation) and `ScopeMembers` is B23's (access
+sync). An interface written before its types are settled is a shape every later item has to
+rewrite, and the rewrite is not free once a provider package implements it.
+
+`Credential` is the one exception, and it is deliberately not a shape yet. `Registrar` cannot be
+written without naming it, and what a credential holds is B13's decision (the vault) and B14's
+(`connect`), so it is declared the way `Hydrated` is, as an opaque type. Every signature that names
+it is stable from now on, and B13 gives it contents without touching one of them. What is already
+settled about it is where it may go: it is secret material, so it never reaches a log line, an
+error, a plain table or a record.
 
 Built-in implementations planned for v0.1:
 
@@ -754,7 +852,7 @@ internal/
   testdb/             a real Postgres for integration tests, as the application role
   outbox/             accept insert, FIFO-head claim, retry ladder, dead letters
   ingress/            the /ingress/{provider} HTTP edge: raw body, size cap, handshake
-  hub/                verify, resolve owner, accept
+  hub/                the subscription table, verify, resolve owner, accept, park
   pipeline/           normalize, gate, ledger, supersede, mask, deliver
   worker/             drain and sweeps as independent goroutines
   reconcile/          cursors and chunked replay
@@ -807,9 +905,9 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 
 1. **Verify signatures over the exact raw bytes.** Re-serialized JSON never matches the provider's
    HMAC. Compare in constant time, and treat a missing secret or signature as a plain `false`.
-2. **The tenant comes from an owned row, never from the payload.** When more than one tenant's
-   secret verifies the same delivery, refuse it. Routing to the first match is how data crosses
-   tenants.
+2. **The tenant comes from an owned row, never from the payload.** When more than one
+   subscription's secret verifies the same delivery, refuse it, whether those rows belong to two
+   tenants or to one (ADR 11, decision 5). Routing to the first match is how data crosses tenants.
 3. **Salt the record id with the tenant.** Two tenants sharing one provider workspace otherwise
    collapse into one id and the second tenant silently loses records.
 4. **The wire name is not the internal key.** What a sink calls a source is sink configuration.
@@ -845,7 +943,10 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Body over the size cap | unstorable | 413, the body is never accumulated |
 | Body could not be read (a `Content-Length` that lies) | unstorable | 400, nothing stored |
 | Signature invalid | untrusted | 401, nothing stored |
-| Unknown workspace or ambiguous owner | unattributable | parked under a sentinel tenant, re-resolved periodically, deleted after retention |
+| Unknown workspace or ambiguous owner | unattributable | parked under the sentinel tenant `_parked` as `unattributable: no owner` or `unattributable: ambiguous owner`, **keeping the body as it arrived**, answered 2xx, re-resolved periodically (B25), deleted after retention |
+| A delivery the provider cannot read its own keys out of, or whose keys are ones no lookup can use (longer than the column, or unstorable text) | unattributable | parked as `unattributable: unreadable delivery`, answered 2xx: there is no signature claim to reject, so it is never a 401. This reason alone keeps a note of the delivery's length and id in place of the body, because no sweep can ever re-resolve it and anyone can send one |
+| A provider's `Verify` panics | unattributable | parked, answered 2xx: no candidate's answer can settle the owner, and the connection is not dropped |
+| A resolved delivery that can never be stored (an ordering key the table refuses) | unstorable | parked as poison, answered 2xx, so the provider does not retry what cannot work |
 | Hydration fails | degradable | deliver a minimal record, the change is still tracked |
 | Normalizer fails | non-retryable | dead-letter with the reason; fix and replay |
 | Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands |
