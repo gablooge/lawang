@@ -183,8 +183,9 @@ type srcFile struct {
 	src any
 }
 
-// TestTheMaskingMintCannotSeeTheValue is the tripwire. It fails when the minting path grows a way
-// to see a masked value, or stops going through ids.NewUnpredictable for its bits.
+// TestTheMaskingMintCannotSeeTheValue is the tripwire. It scans the non-test files of this
+// package against the two rules above, and fails when the mint stops going through
+// ids.NewUnpredictable for its bits.
 func TestTheMaskingMintCannotSeeTheValue(t *testing.T) {
 	t.Parallel()
 	files := packageFiles(t)
@@ -587,8 +588,8 @@ func bodyFindings(rel string, fn *ast.FuncDecl) []string {
 // same conversion a line above, through a package-level variable, through a helper returning a
 // kind, or through a struct field, because an *ast.Ident or an *ast.SelectorExpr argument is taken
 // without asking how it was built. Following that would be a dataflow pass over the package. What
-// closes the general case instead is valueReadsAllowed: every one of those four spellings has to
-// read the .Value somewhere, and that read is the finding. This rule stays because it names the
+// reports those instead is valueReadsAllowed: every one of those four spellings has to read the
+// .Value somewhere, and that read is the finding. This rule stays because it names the
 // mistake at the place it is made.
 //
 // It also fires only on a call of a plain identifier, so m.token(...) is not one of its calls.

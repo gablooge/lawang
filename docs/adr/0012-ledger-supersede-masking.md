@@ -316,12 +316,12 @@ telephone number and an IBAN, in `Title` and `Text` only.
   kind, on a call site that converts a value into one, on a package-level or helper name reaching
   into the body, on an import that can digest a value or mint a ULID (`crypto/*`, `hash/*`,
   `math/rand`, `oklog/ulid`, `blake3`), on a `go:linkname`, on a mint that stops calling
-  `ids.NewUnpredictable`, and on any read of a `.Value` outside those two statements. It is
-  modelled on `TestRecordIDHasNoCallerOutsideRecord` and carries the same caveat: a scan reads
-  source text, so it is a tripwire that tells an honest change at once, by name, and not a guard
-  against text arranged to hide from it. **It narrows the family, it does not close it**, and the
-  Cost section says what that means. The behavioural tests stay, because they cover what a scan
-  cannot see, that the bits a real run produces differ.
+  `ids.NewUnpredictable`, and on a read of a `.Value` at a statement that is not on the
+  allow-list. It is modelled on `TestRecordIDHasNoCallerOutsideRecord` and carries the same
+  caveat: a scan reads source text, so it is a tripwire that tells an honest change at once, by
+  name, and not a guard against text arranged to hide from it. **It narrows the family, it does
+  not close it**, and the Cost section says what that means. The behavioural tests stay, because
+  they cover what a scan cannot see, that the bits a real run produces differ.
 - **Its 80 random bits come from `crypto/rand`** (`ids.NewUnpredictable`), not from `ids.New`,
   whose own doc comment forbids that use: `New` draws them from `math/rand` seeded once at process
   start, through a MONOTONIC reader, so two ids minted in one millisecond differ by an increment of

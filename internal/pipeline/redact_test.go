@@ -121,7 +121,7 @@ func TestTheRedactionMapStaysHereAndTheTokenGoesOut(t *testing.T) {
 // same record id, the same external id, the same version, the same scope, the same kind and the
 // same value. Every function of those therefore gives ONE answer here. The clock is the single
 // visible input left that differs between the two drains, which is exactly the gap this test
-// cannot close and the tripwire does.
+// cannot close.
 //
 // So the assertion is over ulidIn(...).Entropy(), which is exactly the 80 bits the sentence above
 // names and nothing else. The whole-token and whole-text comparisons stay beside it, because a

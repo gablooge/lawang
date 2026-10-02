@@ -57,9 +57,8 @@ const MaxSecretsPerDelivery = 1024
 // schemes in a row satisfied the behavioural tests. This function takes a kind and nothing else,
 // its body names nothing outside itself but fmt.Errorf and ids.NewUnpredictable, this package may
 // name internal/ids exactly once, here, and a foundSecret's Value may be named only at the two
-// statements of mapSecrets that have to name it. TestTheMaskingMintCannotSeeTheValue fails on
-// every way of changing that. Read it before widening this signature: a second parameter is how
-// all four were written.
+// statements of mapSecrets that have to name it. Read TestTheMaskingMintCannotSeeTheValue before
+// widening this signature: a second parameter is how all four were written.
 //
 // Read its caveat too, because the guarantee is narrower than it sounds and this comment has
 // twice overstated it. The two rules refuse every spelling in which the four schemes were
