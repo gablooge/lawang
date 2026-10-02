@@ -53,6 +53,13 @@ const MaxSecretsPerDelivery = 1024
 // collide with a real mapping an operator later resolves, and that the gap between two tokens
 // would say how many values this deployment masked in between, across tenants.
 //
+// That it is not derived is pinned structurally and not only by a test, because four derived
+// schemes in a row satisfied the behavioural tests. This function takes a kind and nothing else,
+// its body names nothing outside itself but fmt.Errorf and ids.NewUnpredictable, and this package
+// may name internal/ids exactly once, here. TestTheMaskingMintCannotSeeTheValue fails on every
+// way of changing that, so no scheme in the family is expressible rather than merely untested.
+// Read it before widening this signature: a second parameter is how all four were written.
+//
 // Its characters are the ones the record format allows everywhere: ASCII letters, digits, a colon
 // and brackets. A ULID is 26 characters, so a token is 34 or 33 characters long.
 func token(k secretKind) (string, error) {

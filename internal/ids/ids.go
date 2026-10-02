@@ -60,6 +60,10 @@ func New() string {
 // It returns an error rather than panicking, since the only ways it can fail are the entropy
 // source failing and the clock passing the year 10889, and a caller that is already inside a
 // transaction would rather roll it back than take the process down.
+//
+// internal/pipeline ties its masking placeholder to this function and to no other source of bits,
+// in TestTheMaskingMintCannotSeeTheValue. A change here that weakened the entropy would weaken
+// that placeholder, which is the one caller whose value must not be guessable.
 func NewUnpredictable() (string, error) {
 	id, err := ulid.New(ulid.Now(), rand.Reader)
 	if err != nil {

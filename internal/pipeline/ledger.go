@@ -269,13 +269,20 @@ var base64URLToStd = strings.NewReplacer("-", "+", "_", "/")
 // availability lost to a question that was never a real one.
 //
 // It was never a real one because the alphabet is not a fact about a string. Every byte a provider
-// could mean is reachable in both spellings, the two differ in exactly two characters, and a
-// string that contains neither is the same value under either, so there is nothing for a reader to
-// disambiguate and nothing to guess. That is also why this is normalised here instead of being
-// declared: a fourth constant beside VersionOrderBase64 would make every provider author answer a
-// question whose two answers decode identically, and a wrong answer would still decode identically,
-// so the declaration would cost a public contract and buy nothing. Contrast VersionOrderLexical,
-// where the declaration buys the one fact this program genuinely cannot see.
+// could mean is reachable in both spellings, and the two spellings differ in exactly two
+// characters whose sets are DISJOINT: "-" and "_" against "+" and "/". So a string holding
+// neither stands for one value under either reading, a string holding one set has exactly one
+// reading, and a string holding both has none and is refused below. That is what makes the
+// normalisation total on everything it accepts and injective on the value: it never guesses, and
+// two different values can never be read as one.
+//
+// That is also why this is normalised here instead of being declared. A fourth constant beside
+// VersionOrderBase64 would make every provider author answer a question the disjointness above
+// has already answered, and getting it wrong would not be unsafe, only brittle: a URL-safe string
+// declared standard does not decode to something else, it does not decode at all, and the
+// delivery becomes a dead letter. The declaration would cost a public contract and buy an
+// availability risk. Contrast VersionOrderLexical, where the declaration buys the one fact this
+// program genuinely cannot see.
 //
 // What stays refused is what is genuinely unreadable: a string holding characters from both
 // alphabets at once, which no encoder emits and which therefore stands for no value, and anything
@@ -295,6 +302,11 @@ func decodeBase64(s string) (decoded []byte, ok bool) {
 	if urlSafe {
 		s = base64URLToStd.Replace(s)
 	}
+	// The padding sniff and the decoder disagree about whitespace, which is worth knowing when a
+	// provider wraps a version in it: Go's decoders skip "\r" and "\n", HasSuffix does not, so
+	// "AAAA\n" decodes as unpadded while "AA==\n" picks RawStdEncoding and is then refused for
+	// its "=". No encoder emits either, and the disagreement only ever refuses, never reorders,
+	// so it is left as it is. The failure it produces looks alphabet-shaped and is padding-shaped.
 	enc := base64.RawStdEncoding
 	if strings.HasSuffix(s, "=") {
 		enc = base64.StdEncoding

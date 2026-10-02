@@ -69,12 +69,23 @@ func TestTheRedactionMapStaysHereAndTheTokenGoesOut(t *testing.T) {
 	}
 }
 
-// TestMintingOneValueTwiceGivesTwoTokens is ADR 12 decision 5's first bullet, pinned as the
-// property it actually is.
+// TestMintingOneValueTwiceGivesTwoTokens is part of ADR 12 decision 5's first bullet, and the
+// doc comment says which part, because it is not the whole of it.
 //
-// THE PROPERTY, in one sentence, so that nobody weakens it by accident: two mintings of one value
-// that agree in EVERY input a sink can see must still differ in the 80 bits of the token that are
-// supposed to be random.
+// WHAT THIS TEST PINS, in one sentence: two mintings of one value that agree in every input a
+// sink can see EXCEPT the clock must still differ in the 80 bits of the token that are supposed
+// to be random.
+//
+// The exception is an admission and not a weakening. The clock is published to the sink as the
+// first 10 characters of the token, so it is an input a sink can see, and two drains are two
+// round trips apart, so it differs between them for free. That makes this assertion strictly
+// narrower than the decision, which says the 80 bits are a function of NO visible input: a
+// placeholder drawn from sha256(kind, value, that same millisecond) differs between two drains,
+// passes here, and still lets whoever holds one token confirm a guessed address offline. No
+// comparison of two mintings can see that, because the two really are different. The rest of the
+// decision is pinned structurally instead, by TestTheMaskingMintCannotSeeTheValue, which makes
+// the mint unable to see a value at all. Both are needed: a scan reads source text, and only a
+// run can say that the bits a real mint produces differ.
 //
 // The sentence names the entropy and not the token on purpose, because the token is wider than the
 // guarantee. A placeholder is "[" + kind + ":" + a ULID + "]", and a ULID is 10 characters of
@@ -98,14 +109,17 @@ func TestTheRedactionMapStaysHereAndTheTokenGoesOut(t *testing.T) {
 // Fixing that but still comparing whole token strings let the digest back in a third time, inside
 // the ULID: keep the real clock, draw only the 80 entropy bits from sha256(tenant, kind, value),
 // and the last 16 characters of every token are the complete oracle while the two drains still
-// produce two different strings.
+// produce two different strings. A fourth scheme then survived this version, which is the one
+// above: salting that same digest with the millisecond the token publishes. That is where the
+// tripwire came from, and why this comment now says what it pins rather than what it hopes.
 //
 // So this drains one delivery, takes away the redaction_map row AND the record_ledger row as the
 // superuser (the ledger row is what would otherwise make the second drain a skip), and drains the
 // very same delivery again. The second minting sees the same tenant, the same delivery id, the
 // same record id, the same external id, the same version, the same scope, the same kind and the
-// same value. Every function of every input a sink can see therefore gives ONE answer here, and
-// only entropy drawn from crypto/rand gives two.
+// same value. Every function of those therefore gives ONE answer here. The clock is the single
+// visible input left that differs between the two drains, which is exactly the gap this test
+// cannot close and the tripwire does.
 //
 // So the assertion is over ulidIn(...).Entropy(), which is exactly the 80 bits the sentence above
 // names and nothing else. The whole-token and whole-text comparisons stay beside it, because a

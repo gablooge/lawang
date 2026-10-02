@@ -285,8 +285,11 @@ func TestBadPartsAreRefused(t *testing.T) {
 //
 //   - The SHAPE: 26 characters that parse back as a canonical ULID. A caller embeds the result in
 //     a masking placeholder that goes out on a record, so it has to be 26 characters of the
-//     alphabet the record format allows. ParseStrict and not Parse, because Parse does not check
-//     every character or the timestamp overflow.
+//     alphabet the record format allows. ParseStrict and not Parse, because the character set is
+//     the half Parse leaves unchecked: in oklog/ulid v2.1.2 the overflow test sits outside the
+//     strict guard, so Parse returns ErrOverflow too, and only ParseStrict refuses a character
+//     that is not in the Crockford alphabet. That half is the one this assertion needs, because
+//     a placeholder goes out as record text.
 //   - The CLOCK. The first 48 bits are a real millisecond timestamp, which is what makes the id
 //     sortable by creation time the way New is. A derived or constant timestamp would still
 //     parse.

@@ -176,14 +176,18 @@ whose out-of-order pairs differ in length. Under decision 1 the three directions
   - A provider that declares `VersionOrderBase64` for a payload whose varying field is **not most
     significant first**. Decoding proves the alphabet and the width, and neither of those is the
     layout. A little-endian counter decodes perfectly and compares backwards at every carry, so
-    the same half of its pairs invert. This one is worth naming for B16 and B17 in particular: a
-    real Graph `changeKey` decodes to `0f000000 16000000 <16 byte GUID> 0000 1d1a6140`, whose two
-    leading DWORDs are plainly little-endian, so the format is **not uniformly big-endian**. The
-    trailing change number looks big-endian and the GUID looks constant per item, which would make
-    a byte comparison right, but nothing in this branch evidences that. **B16 and B17 verify it
-    against two real `changeKey` values of one item before declaring `VersionOrderBase64`**, and
-    re-spell the version in the normalizer if it does not hold. Inheriting the claim from this
-    record is not verification.
+    the same half of its pairs invert. This one is worth naming for B16 and B17 in particular. A
+    Graph `changeKey` is widely reported to decode to a structure of the shape
+    `0f000000 16000000 <16 byte GUID> 0000 1d1a6140`, whose two leading DWORDs would then be
+    little-endian, making the format **not uniformly big-endian**; the trailing change number
+    would be the big-endian part and the GUID would be constant per item, which together would
+    make a byte comparison right. **Nothing in this branch evidences any of that, the layout
+    included.** No real `changeKey` has been examined here, because this branch holds no
+    credential, and the only instance of that shape in it is a fixture this branch wrote, which
+    cannot be the evidence for the layout it was written from. **B16 and B17 verify it against
+    two real `changeKey` values of one item before declaring `VersionOrderBase64`**, and re-spell
+    the version in the normalizer if it does not hold. Inheriting the claim from this record is
+    not verification.
 
   **Nothing in this program can close either**, because "these bytes sort the way this value
   sorts" is not a fact about two strings: it is a fact about the encoding and the layout behind
@@ -291,6 +295,24 @@ telephone number and an IBAN, in `Title` and `Text` only.
   therefore on `Entropy()`, which is exactly the bits the sentence names. One value keeps one token
   within one tenant, so the same person reads as the same placeholder everywhere, and the same
   value in two tenants is two tokens.
+
+  **The behavioural test cannot close this family on its own, so the mint is closed structurally
+  as well.** A fourth scheme survived the corrected assertion: keep the real clock and draw the 80
+  bits from `sha256(kind, value, that same millisecond)`. Two mintings of one value then really do
+  differ, because the millisecond does, and the sink can still compute the token from a guess,
+  because the millisecond is the first 10 characters of the token it was handed. No comparison of
+  two mintings can tell that apart from `crypto/rand`. What every one of the four schemes needs is
+  the value, so the fix is that the value cannot get there: `token` takes a `secretKind` and
+  nothing else, its body names nothing it did not declare beyond `fmt.Errorf` and
+  `ids.NewUnpredictable`, and `internal/pipeline` may name `internal/ids` exactly once, in that
+  call. `TestTheMaskingMintCannotSeeTheValue` fails on a wider signature, on a parameter that is
+  not the kind, on a call site that converts a value into one, on a package-level or helper name
+  reaching into the body, on an import that can digest a value or mint a ULID (`crypto/*`,
+  `hash/*`, `math/rand`, `oklog/ulid`, `blake3`), on a `go:linkname`, and on a mint that stops
+  calling `ids.NewUnpredictable`. It is modelled on `TestRecordIDHasNoCallerOutsideRecord` and
+  carries the same caveat: a scan reads source text, so it is a tripwire that tells an honest
+  change at once, by name, and not a guard against text arranged to hide from it. The behavioural
+  tests stay, because they cover what a scan cannot see, that the bits a real run produces differ.
 - **Its 80 random bits come from `crypto/rand`** (`ids.NewUnpredictable`), not from `ids.New`,
   whose own doc comment forbids that use: `New` draws them from `math/rand` seeded once at process
   start, through a MONOTONIC reader, so two ids minted in one millisecond differ by an increment of
