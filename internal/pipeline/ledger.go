@@ -303,10 +303,15 @@ func decodeBase64(s string) (decoded []byte, ok bool) {
 		s = base64URLToStd.Replace(s)
 	}
 	// The padding sniff and the decoder disagree about whitespace, which is worth knowing when a
-	// provider wraps a version in it: Go's decoders skip "\r" and "\n", HasSuffix does not, so
-	// "AAAA\n" decodes as unpadded while "AA==\n" picks RawStdEncoding and is then refused for
-	// its "=". No encoder emits either, and the disagreement only ever refuses, never reorders,
-	// so it is left as it is. The failure it produces looks alphabet-shaped and is padding-shaped.
+	// provider wraps a version in it: Go's decoders skip "\r" and "\n", HasSuffix does not. The
+	// measured shapes, which go both ways rather than only refusing: "AAAA\n" has no trailing
+	// "=", so it decodes as unpadded and is accepted; "AA==\n" picks RawStdEncoding and is then
+	// refused for its "="; "AA=\n=" DOES end in "=", so it picks StdEncoding, which skips the
+	// newline and accepts it; " AAAA" and "AAAA " are refused, because a space is skipped by
+	// neither. No encoder emits any of them. The disagreement costs nothing either way, because
+	// every whitespace shape that is accepted decodes to the same bytes as its clean spelling, so
+	// two spellings of one value stay one value and nothing reorders. It is left as it is. The
+	// failure the refused shapes produce looks alphabet-shaped and is padding-shaped.
 	enc := base64.RawStdEncoding
 	if strings.HasSuffix(s, "=") {
 		enc = base64.StdEncoding

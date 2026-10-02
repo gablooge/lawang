@@ -491,6 +491,13 @@ func TestTheVersionOrderIsTheDeclaredOrderAndNothingElse(t *testing.T) {
 		{b64, "-___", "AAAA", 1, true, "URL-safe against standard, ordered by the bytes and not by the characters"},
 		{b64, "AAAAAA==", "AAAAAQ", -1, true, "padding is a spelling too: a padded pair against an unpadded one"},
 		{b64, "AAA=", "AAA", 0, true, "the same two bytes, written both ways"},
+		// Whitespace goes both ways, which the comment on decodeBase64 used to say it did not.
+		// Go's decoders skip "\n" and the padding sniff does not, so which encoding is picked
+		// decides, and every shape that is accepted decodes to its clean spelling's bytes.
+		{b64, "AAAA\n", "AAAA", 0, true, "a trailing newline on an unpadded spelling, which the decoder skips"},
+		{b64, "AA=\n=", "AA==", 0, true, "a newline inside the padding: it still ends in '=', so StdEncoding is picked and skips it"},
+		{b64, "AA==\n", "AA==", 0, false, "the same newline after the padding hides the '=' from the sniff, and RawStdEncoding refuses it"},
+		{b64, "AAAA ", "AAAA", 0, false, "a space is not whitespace to Go's decoder"},
 		// What stays refused is what genuinely spells nothing. No encoder emits both alphabets in
 		// one string, so translating one into the other would invent a value rather than read it.
 		{b64, "AA+_", "AAAA", 0, false, "one string, both alphabets, so neither one spells it"},

@@ -83,9 +83,11 @@ func TestTheRedactionMapStaysHereAndTheTokenGoesOut(t *testing.T) {
 // placeholder drawn from sha256(kind, value, that same millisecond) differs between two drains,
 // passes here, and still lets whoever holds one token confirm a guessed address offline. No
 // comparison of two mintings can see that, because the two really are different. The rest of the
-// decision is pinned structurally instead, by TestTheMaskingMintCannotSeeTheValue, which makes
-// the mint unable to see a value at all. Both are needed: a scan reads source text, and only a
-// run can say that the bits a real mint produces differ.
+// decision is pinned structurally instead, by TestTheMaskingMintCannotSeeTheValue, which keeps
+// the value away from the mint and away from any function beside it. Both are needed: a scan
+// reads source text, and only a run can say that the bits a real mint produces differ. Neither
+// closes the family on its own and nor do the two together: the caveat at the top of
+// mint_tripwire_test.go lists what is left, measured rather than assumed.
 //
 // The sentence names the entropy and not the token on purpose, because the token is wider than the
 // guarantee. A placeholder is "[" + kind + ":" + a ULID + "]", and a ULID is 10 characters of

@@ -1,8 +1,10 @@
 package pipeline_test
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
 	"path/filepath"
@@ -25,15 +27,38 @@ import (
 // between two mintings and is still computable by whoever holds the token. No assertion over two
 // mintings can tell that apart from crypto/rand, because the two really do differ.
 //
-// What all four schemes need is the value. pipeline.token takes a kind and nothing else, so none
-// of them is expressible without changing the program's shape: the reviewer's mutation had to
-// widen the signature. This scan fails on every way of changing that shape, by name, so a scheme
-// in this family is refused at the source rather than caught by a test that happens to notice it.
+// What all four schemes need is the value, so there are two rules here and not one, because the
+// first alone was a rule about a function name while the property is about the package.
 //
-// Like the RecordID scan, this is a tripwire and not a guard. It reads source text, and source
-// text can always be arranged so that a scan does not see it (a build tag this run does not set,
-// generated code, an assembly stub). What it buys is that an honest change is told at once, by
-// name, why the mint is shaped the way it is.
+//  1. The mint is closed. pipeline.token takes a kind and nothing else, and its body reaches
+//     outside itself for nothing but fmt.Errorf and ids.NewUnpredictable.
+//  2. The value stays where it is. A .Value field may be named only at the two statements of
+//     mapSecrets that have to name it. With rule 1 alone the reviewer put the fourth scheme back
+//     one function over, as a second mint beside token taking (kind, value, the token's own clock
+//     prefix), with no forbidden import, no rule broken and the whole repository green. A function
+//     that cannot be handed the value cannot derive a placeholder from it, wherever it is written.
+//
+// What this does NOT cover, measured rather than assumed:
+//
+//   - The value after it leaves a foundSecret. mapSecrets copies it into the values slice the
+//     upsert takes, and maskRecords holds the record text it was found in. A placeholder derived
+//     from values[i], or from the text that the offsets point into, is outside every rule here.
+//     Rule 2 stops the value being taken out of a foundSecret; it does not follow it afterwards.
+//   - A subpackage. The walk is os.ReadDir("."), so a new internal/pipeline/mask package would be
+//     invisible to it, as pipelinedb already is.
+//   - Whether the mint uses what it calls. The body must call ids.NewUnpredictable, but it may
+//     throw the result away and return a constant, which collides and is caught one layer down by
+//     TestTwoTokensMintedTogetherAreNotOneStepApart rather than here.
+//   - A method named token beside the free one. The declaration scan takes free functions, so what
+//     stands between that method and a value is rule 2 at its call site, not a rule about its name.
+//
+// What it does cover, which is easy to assume it does not: build tags and generated-code markers
+// buy nothing. The walk reads every non-test .go file of this directory whatever its //go:build
+// line says and whatever marker it carries, and both were tried against it.
+//
+// Like the RecordID scan, this is a tripwire and not a guard. It reads source text, and the list
+// above is what that costs. What it buys is that an honest change is told at once, by name, why
+// the mint is shaped the way it is.
 
 const (
 	// idsPackage holds the one entropy source a placeholder may use.
@@ -46,7 +71,33 @@ const (
 	mintFunc = "token"
 	// kindType is the only thing the mint is allowed to see.
 	kindType = "secretKind"
+	// valueField is the field of a foundSecret that holds the masked value itself.
+	valueField = "Value"
 )
+
+// valueReadsAllowed is every place in a non-test file of this package that may name a .Value, as
+// "<enclosing function>: <the whole statement it sits in>".
+//
+// This is what makes the rules above about the package rather than about one function name. The
+// mint cannot see a value, so a scheme that needs one is written beside the mint instead, which is
+// where the reviewer put it: a second function taking (kind, value, the token's clock prefix)
+// satisfies every rule about token and hands a sink the offline oracle in full. A value that is
+// never read outside these two statements cannot reach such a function, wherever it is declared.
+//
+// The scan has no type information, so this is a rule about the name and not about the type: any
+// .Value in a non-test file of this package is a finding unless it is one of these. The second one
+// is the sqlc row's field rather than a foundSecret's, and that is the point, since nothing in
+// source text tells the two apart.
+//
+// The whole statement is part of the site, not just the function, because mapSecrets is exactly
+// where a second mint would be called from: tokens[i] = reshape(tok, s.Kind, s.Value) is one line
+// below the first of these. Moving a read into another statement, renaming the variable it reads
+// from, or splitting it across two is reported, and the edit to this list is the conversation this
+// tripwire exists to force.
+var valueReadsAllowed = []string{
+	"mapSecrets: values[i] = s.Value",
+	"mapSecrets: out[foundSecret{Kind: secretKind(row.Kind), Value: row.Value}] = row.Token",
+}
 
 // idsImportPath is derived from go.mod rather than written out, because a literal is how the
 // RecordID scan went blind once: the module was renamed, the literal kept the old path, and every
@@ -189,6 +240,7 @@ func mintFindings(files []srcFile) []string {
 			continue
 		}
 		findings = append(findings, directiveFindings(f.rel, parsed)...)
+		findings = append(findings, valueReadFindings(fset, f.rel, parsed)...)
 
 		// Which local name, if any, this file reaches internal/ids by.
 		idsName := ""
@@ -284,6 +336,67 @@ func mintFindings(files []srcFile) []string {
 			"from. It names it at: "+where)
 	}
 	return findings
+}
+
+// valueReadFindings reports every place in one file that names a .Value outside the statements on
+// valueReadsAllowed. It is the rule that keeps the value from reaching a second mint.
+func valueReadFindings(fset *token.FileSet, rel string, file *ast.File) []string {
+	var findings []string
+	var stack []ast.Node
+	ast.Inspect(file, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		stack = append(stack, n)
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != valueField {
+			return true
+		}
+		site := valueReadSite(fset, stack)
+		if !slices.Contains(valueReadsAllowed, site) {
+			findings = append(findings, rel+": "+site+" reads a ."+valueField+
+				", and the masked value may be read only at the statements listed in "+
+				"valueReadsAllowed. A placeholder derived from the value is written as a function "+
+				"that is handed the value, and this is where it would be handed over")
+		}
+		return true
+	})
+	return findings
+}
+
+// valueReadSite names where a .Value was read: the enclosing function, and the statement it sits
+// in, rendered back from the syntax tree. A statement running over more than one line is cut at
+// the first, which keeps a site one line long without losing which statement it is.
+func valueReadSite(fset *token.FileSet, stack []ast.Node) string {
+	render := func(n ast.Node) string {
+		var buf bytes.Buffer
+		if err := printer.Fprint(&buf, fset, n); err != nil {
+			return "?"
+		}
+		text := buf.String()
+		if first, _, cut := strings.Cut(text, "\n"); cut {
+			return strings.TrimSpace(first) + " ..."
+		}
+		return strings.TrimSpace(text)
+	}
+	where, what := "(no enclosing function)", stack[len(stack)-1]
+	stmtFound := false
+	for i := len(stack) - 1; i >= 0; i-- {
+		if stmt, ok := stack[i].(ast.Stmt); ok && !stmtFound {
+			what, stmtFound = stmt, true
+		}
+		fn, ok := stack[i].(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		where = fn.Name.Name
+		if fn.Recv != nil && len(fn.Recv.List) == 1 {
+			where = "(" + render(fn.Recv.List[0].Type) + ")." + where
+		}
+		break
+	}
+	return where + ": " + render(what)
 }
 
 // directiveFindings reports a go:linkname in either direction. From outside it pulls a function
@@ -414,16 +527,54 @@ func bodyFindings(rel string, fn *ast.FuncDecl) []string {
 				", and it may name only "+strings.Join(qualifiedCallsAllowedInMint, " and "))
 		}
 	}
-	// That the body DOES call ids.NewUnpredictable is not checked here. The package-wide rule at
-	// the end of mintFindings requires exactly one reference to internal/ids, inside this body,
-	// and the allow-list above admits no other function of that package, so the two together say
-	// it. A second check here would be a rule no case can fail on its own.
+	// That the body DOES call ids.NewUnpredictable. The package-wide rule at the end of
+	// mintFindings only requires that the body NAMES it, which is not the same thing: a body that
+	// writes mk := ids.NewUnpredictable, tests it against nil and returns a constant placeholder
+	// satisfies every other rule in this file and compiles. That reasoning was written out here
+	// once as grounds for leaving the check out, and it was wrong, so the check is back and the
+	// case is in the table.
+	//
+	// What it still does not say is that the call's result is what the placeholder is made of. A
+	// body may call the source and throw the result away. A constant placeholder then collides
+	// with itself, which TestTwoTokensMintedTogetherAreNotOneStepApart catches, so the gap is
+	// covered one layer down rather than here.
+	called := false
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != mintEntropy {
+			return true
+		}
+		if id, ok := sel.X.(*ast.Ident); ok && id.Name == "ids" {
+			called = true
+		}
+		return true
+	})
+	if !called {
+		findings = append(findings, rel+": "+mintFunc+" never calls ids."+mintEntropy+
+			", so whatever its 80 bits are, they do not come from the one reviewed recipe. Naming "+
+			"the source without calling it satisfies every other rule here")
+	}
 	return findings
 }
 
 // mintCallFindings reports a call of the mint whose argument is computed rather than carried. The
 // parameter is a kind, but secretKind is a string, so a conversion at the call site would hand
 // the mint the value under the kind's type.
+//
+// It is one statement deep, and deliberately so. It reports token(secretKind(s.Value)) and not the
+// same conversion a line above, through a package-level variable, through a helper returning a
+// kind, or through a struct field, because an *ast.Ident or an *ast.SelectorExpr argument is taken
+// without asking how it was built. Following that would be a dataflow pass over the package. What
+// closes the general case instead is valueReadsAllowed: every one of those four spellings has to
+// read the .Value somewhere, and that read is the finding. This rule stays because it names the
+// mistake at the place it is made.
+//
+// It also fires only on a call of a plain identifier, so m.token(...) is not one of its calls.
+// Again the .Value rule is what covers that, at the arguments rather than at the name.
 func mintCallFindings(rel string, call *ast.CallExpr) []string {
 	if len(call.Args) != 1 {
 		return []string{rel + ": a call of " + mintFunc + " passes " + strconv.Itoa(len(call.Args)) +
@@ -480,6 +631,12 @@ func token(k secretKind) (string, error) {
 		also  string
 		kinds string
 		want  bool
+		// says pins WHICH rule reported the case, by a phrase out of its sentence. Two rules can
+		// overlap on one program: the two halves of the kindFound pair both report a secretKind
+		// the scan cannot find, one of them with the wrong sentence, so a case that only counts
+		// findings survives the deletion of the half it was written for. That is how the half
+		// below went uncovered. Empty means any finding will do.
+		says string
 	}{
 		{name: "the mint as it stands", mint: goodMint},
 		{
@@ -579,6 +736,7 @@ func token(k ...secretKind) (string, error) {
 		},
 		{
 			name: "a kind that is no longer a plain string, so it can carry the value",
+			says: "is no longer a plain string",
 			mint: goodMint,
 			kinds: `package pipeline
 type secretKind struct {
@@ -681,6 +839,82 @@ func mask(s foundSecret) (string, error) { return token(s.Kind) }
 `,
 		},
 		{
+			name: "a second mint beside the real one, handed the value at the call site",
+			says: "may be read only at the statements listed in valueReadsAllowed",
+			mint: goodMint,
+			also: `package pipeline
+func reshape(tok string, k secretKind, value string) string {
+	return tok + string(k) + value
+}
+func mapSecrets(secrets []foundSecret) []string {
+	tokens := make([]string, len(secrets))
+	for i, s := range secrets {
+		tok, _ := token(s.Kind)
+		tokens[i] = reshape(tok, s.Kind, s.Value)
+	}
+	return tokens
+}
+`,
+			want: true,
+		},
+		{
+			name: "the value converted to a kind in a helper, one layer away from any call of the mint",
+			says: "may be read only at the statements listed in valueReadsAllowed",
+			mint: goodMint,
+			also: `package pipeline
+func kindOf(s foundSecret) secretKind { return secretKind(s.Value) }
+`,
+			want: true,
+		},
+		{
+			name: "the two statements that may read the value, which the scan must leave alone",
+			mint: goodMint,
+			also: `package pipeline
+type row struct {
+	Kind, Value, Token string
+}
+func mapSecrets(secrets []foundSecret, rows []row) (map[foundSecret]string, []string) {
+	values := make([]string, len(secrets))
+	for i, s := range secrets {
+		values[i] = s.Value
+	}
+	out := map[foundSecret]string{}
+	for _, row := range rows {
+		out[foundSecret{Kind: secretKind(row.Kind), Value: row.Value}] = row.Token
+	}
+	return out, values
+}
+`,
+		},
+		{
+			name: "a kind that is an alias, so the value reaches the mint with no conversion anywhere",
+			says: "declares no type secretKind",
+			mint: goodMint,
+			kinds: `package pipeline
+type secretKind = string
+`,
+			want: true,
+		},
+		{
+			name: "a mint that names its entropy source without calling it",
+			says: "never calls ids.NewUnpredictable",
+			mint: `package pipeline
+import (
+	"fmt"
+
+	"MODULE/internal/ids"
+)
+func token(k secretKind) (string, error) {
+	mk := ids.NewUnpredictable
+	if mk == nil {
+		return "", fmt.Errorf("pipeline: no mint")
+	}
+	return "[" + string(k) + ":0000000000000000000000000]", nil
+}
+`,
+			want: true,
+		},
+		{
 			name: "the mint renamed away, so this scan would otherwise guard nothing",
 			mint: `package pipeline
 import "MODULE/internal/ids"
@@ -728,6 +962,13 @@ var _ = strings.Compare
 		got := mintFindings(files)
 		if (len(got) > 0) != tt.want {
 			t.Errorf("%s: findings = %v, want a finding = %v", tt.name, got, tt.want)
+			continue
+		}
+		if tt.says == "" {
+			continue
+		}
+		if !slices.ContainsFunc(got, func(s string) bool { return strings.Contains(s, tt.says) }) {
+			t.Errorf("%s: findings = %v, want one of them to say %q", tt.name, got, tt.says)
 		}
 	}
 }
