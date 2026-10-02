@@ -56,16 +56,20 @@ const MaxSecretsPerDelivery = 1024
 // That it is not derived is pinned structurally and not only by a test, because four derived
 // schemes in a row satisfied the behavioural tests. This function takes a kind and nothing else,
 // its body names nothing outside itself but fmt.Errorf and ids.NewUnpredictable, this package may
-// name internal/ids exactly once, here, and a foundSecret's Value may be read only at the two
-// statements of mapSecrets that have to read it. TestTheMaskingMintCannotSeeTheValue fails on
+// name internal/ids exactly once, here, and a foundSecret's Value may be named only at the two
+// statements of mapSecrets that have to name it. TestTheMaskingMintCannotSeeTheValue fails on
 // every way of changing that. Read it before widening this signature: a second parameter is how
 // all four were written.
 //
-// Read its caveat too, because the guarantee is narrower than it sounds and this sentence used to
-// overstate it. Closing this function alone only moved the fourth scheme one function over, into a
-// second mint beside it, which is why the Value rule exists. What is still open after that rule
-// (the value once it is in the values slice, a subpackage) is listed in the test file. The family
-// is narrowed to the places that already hold the value, not closed.
+// Read its caveat too, because the guarantee is narrower than it sounds and this comment has
+// twice overstated it. The two rules refuse every spelling in which the four schemes were
+// actually written, and nothing wider: the second of them reports a .Value selector, which is a
+// name and not the value, so a foundSecret handed whole to another function carries the value
+// past it. An author in this package can still write a derived placeholder in several ways, and
+// the caveat does not list them, because the list was written twice and went stale twice. What
+// the tripwire buys is that writing one has to be deliberate, and that it is visible in review as
+// a new function being handed the value. Closing it properly means following the value rather
+// than naming its readers, a dataflow pass over the package that B08 did not buy.
 //
 // Its characters are the ones the record format allows everywhere: ASCII letters, digits, a colon
 // and brackets. A ULID is 26 characters, so a token is 34 or 33 characters long.

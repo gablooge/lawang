@@ -306,12 +306,12 @@ telephone number and an IBAN, in `Title` and `Text` only.
   one. **The mint is closed:** `token` takes a `secretKind` and nothing else, its body names
   nothing it did not declare beyond `fmt.Errorf` and `ids.NewUnpredictable`, it must call that
   function and not merely name it, and `internal/pipeline` may name `internal/ids` exactly once,
-  in that call. **The value stays where it is:** a `foundSecret`'s `Value` may be read only at the
-  two statements of `mapSecrets` that have to read it. The first rule alone guards a function name
-  while the property is about the package, and the round 5 review proved the difference by putting
-  the fourth scheme back as a second mint beside `token`, with no forbidden import, every rule
-  satisfied and the offline oracle reproduced in full. A function that cannot be handed the value
-  cannot derive a placeholder from it, wherever it is written.
+  in that call. **The value is not named elsewhere:** a `foundSecret`'s `Value` may be named only
+  at the two statements of `mapSecrets` that have to name it. The first rule alone guards a
+  function name while the property is about the package, and the round 5 review proved the
+  difference by putting the fourth scheme back as a second mint beside `token`, with no forbidden
+  import, every rule satisfied and the offline oracle reproduced in full. Every spelling of that
+  scheme the reviews have written names the field, and the second rule reports each of them.
   `TestTheMaskingMintCannotSeeTheValue` fails on a wider signature, on a parameter that is not the
   kind, on a call site that converts a value into one, on a package-level or helper name reaching
   into the body, on an import that can digest a value or mint a ULID (`crypto/*`, `hash/*`,
@@ -320,7 +320,7 @@ telephone number and an IBAN, in `Title` and `Text` only.
   modelled on `TestRecordIDHasNoCallerOutsideRecord` and carries the same caveat: a scan reads
   source text, so it is a tripwire that tells an honest change at once, by name, and not a guard
   against text arranged to hide from it. **It narrows the family, it does not close it**, and the
-  Cost section says what is left. The behavioural tests stay, because they cover what a scan
+  Cost section says what that means. The behavioural tests stay, because they cover what a scan
   cannot see, that the bits a real run produces differ.
 - **Its 80 random bits come from `crypto/rand`** (`ids.NewUnpredictable`), not from `ids.New`,
   whose own doc comment forbids that use: `New` draws them from `math/rand` seeded once at process
@@ -384,23 +384,21 @@ telephone number and an IBAN, in `Title` and `Text` only.
   `record.Record.Version`, which is what a provider author reads, and `provider.VersionOrder`
   names the encodings that break the lexical promise and the layout that breaks the base64 one.
 - **The masking tripwire narrows the derived-placeholder family, it does not close it.** The two
-  rules of decision 5 keep a placeholder from being a function of the value along every route the
-  reviews have found: the mint cannot see the value, and the value cannot be read out of a
-  `foundSecret` anywhere but the two statements of `mapSecrets` that store it. Three routes are
-  measured and left open, all of them inside `internal/pipeline` and all of them visible in
-  review. (1) **The value after it leaves a `foundSecret`:** `mapSecrets` copies it into the
-  `values` slice the upsert takes, and `maskRecords` holds the record text it was found in, so a
-  second mint fed from `values[i]` reads no `.Value` and the scan is silent. That was run, and it
-  builds, lints and passes every test. (2) **A subpackage:** the walk is `os.ReadDir(".")`, so a
-  new `internal/pipeline/mask` would be invisible to it, as `pipelinedb` already is. (3) **A mint
-  that calls its entropy source and throws the result away:** the scan sees the call, not the use.
-  That one is caught a layer down, because a constant placeholder collides and
-  `TestTwoTokensMintedTogetherAreNotOneStepApart` fails. Closing route 1 means following the value
-  rather than naming its readers, which is a dataflow pass over the package and a larger thing
-  than this record decided to buy. What the tripwire buys is that every way the four schemes were
-  actually written is now refused at the source, by name, and that the remaining routes have to be
-  written deliberately. B11 onward should read the caveat at the top of
-  `internal/pipeline/mint_tripwire_test.go`, which is the list above, kept beside the rules.
+  rules of decision 5 refuse every spelling in which the four schemes were actually written, and
+  every bypass the reviews have written is reported by name. They do not make a derived
+  placeholder unwritable. The second rule reports a `.Value` selector, which is a name and not the
+  value: a `foundSecret` handed whole to another function takes the value with it, and
+  `fmt.Sprint` renders it without naming the field, as does `reflect`. The allow-list keys on
+  rendered statement text as well, so an allowed entry can be spoofed by a different statement
+  that renders identically to it. An author inside `internal/pipeline` can therefore still write a
+  derived placeholder in several ways. **This record does not enumerate them, deliberately.** Two
+  enumerations were written here and both went stale within a round, and a list of escape routes
+  invites the next reader to believe it is complete. What the tripwire buys is that writing a
+  derived placeholder has to be deliberate, and that it is visible in review as a new function
+  being handed the value. Closing it properly means following the value rather than naming its
+  readers, which is a dataflow pass over the package and a larger thing than this record decided
+  to buy. B11 onward should read the caveat at the top of
+  `internal/pipeline/mint_tripwire_test.go`, which says the same thing beside the rules.
 - **A required method on `provider.Provider` is a cost of its own.** Every provider must implement
   `VersionOrder`, including one whose versions never need ordering, and the registry refuses it at
   start-up if it does not. That is the point (an optional declaration leaves an unsafe default in

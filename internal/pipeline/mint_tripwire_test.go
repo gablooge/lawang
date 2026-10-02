@@ -32,33 +32,43 @@ import (
 //
 //  1. The mint is closed. pipeline.token takes a kind and nothing else, and its body reaches
 //     outside itself for nothing but fmt.Errorf and ids.NewUnpredictable.
-//  2. The value stays where it is. A .Value field may be named only at the two statements of
+//  2. The value is not named elsewhere. A .Value field may be named only at the two statements of
 //     mapSecrets that have to name it. With rule 1 alone the reviewer put the fourth scheme back
 //     one function over, as a second mint beside token taking (kind, value, the token's own clock
-//     prefix), with no forbidden import, no rule broken and the whole repository green. A function
-//     that cannot be handed the value cannot derive a placeholder from it, wherever it is written.
+//     prefix), with no forbidden import, no rule broken and the whole repository green. Rule 2
+//     reports every spelling of that scheme the reviews have written, because each of them names
+//     the field.
 //
-// What this does NOT cover, measured rather than assumed:
+// What this buys, and what it does not.
 //
-//   - The value after it leaves a foundSecret. mapSecrets copies it into the values slice the
-//     upsert takes, and maskRecords holds the record text it was found in. A placeholder derived
-//     from values[i], or from the text that the offsets point into, is outside every rule here.
-//     Rule 2 stops the value being taken out of a foundSecret; it does not follow it afterwards.
-//   - A subpackage. The walk is os.ReadDir("."), so a new internal/pipeline/mask package would be
-//     invisible to it, as pipelinedb already is.
-//   - Whether the mint uses what it calls. The body must call ids.NewUnpredictable, but it may
-//     throw the result away and return a constant, which collides and is caught one layer down by
-//     TestTwoTokensMintedTogetherAreNotOneStepApart rather than here.
-//   - A method named token beside the free one. The declaration scan takes free functions, so what
-//     stands between that method and a value is rule 2 at its call site, not a rule about its name.
+// The two rules refuse every spelling in which the four schemes were actually written, and every
+// bypass a review has written against this package is reported by name. They do not make a
+// derived placeholder unwritable. Rule 2 reports a .Value selector, which is a name and not the
+// value: a foundSecret handed whole to another function takes the value with it, and fmt.Sprint
+// renders it without naming the field, as does reflect. valueReadsAllowed keys on rendered
+// statement text as well, so an allowed entry can be spoofed by a different statement that
+// renders identically to it. An author inside this package can therefore still write a derived
+// placeholder in several ways, and this file no longer lists them: the list was written twice and
+// went stale twice, and a list of escape routes invites the next reader to believe it is
+// complete.
 //
-// What it does cover, which is easy to assume it does not: build tags and generated-code markers
-// buy nothing. The walk reads every non-test .go file of this directory whatever its //go:build
-// line says and whatever marker it carries, and both were tried against it.
+// What the tripwire buys is that writing a derived placeholder has to be deliberate, and that it
+// is visible in review as a new function being handed the value. Closing it properly means
+// following the value rather than naming its readers, which is a dataflow pass over the package
+// and is not part of B08.
 //
-// Like the RecordID scan, this is a tripwire and not a guard. It reads source text, and the list
-// above is what that costs. What it buys is that an honest change is told at once, by name, why
-// the mint is shaped the way it is.
+// Three properties of the scan itself, measured rather than assumed, because each is easy to get
+// backwards. Build tags and generated-code markers buy nothing: the walk reads every non-test .go
+// file of this directory whatever its //go:build line says and whatever marker it carries, and
+// both were tried against it. The walk is os.ReadDir("."), so it never descends, and a new
+// internal/pipeline/mask package would be invisible to it, as pipelinedb already is. The mint
+// must call ids.NewUnpredictable but may throw the result away and return a constant, which
+// collides and is caught one layer down by TestTwoTokensMintedTogetherAreNotOneStepApart rather
+// than here. These are facts about what the scan reads, not a list of the ways around it.
+//
+// Like the RecordID scan, this is a tripwire and not a guard. It reads source text, and what is
+// written above is what that costs. What it buys is that an honest change is told at once, by
+// name, why the mint is shaped the way it is.
 
 const (
 	// idsPackage holds the one entropy source a placeholder may use.
@@ -81,8 +91,10 @@ const (
 // This is what makes the rules above about the package rather than about one function name. The
 // mint cannot see a value, so a scheme that needs one is written beside the mint instead, which is
 // where the reviewer put it: a second function taking (kind, value, the token's clock prefix)
-// satisfies every rule about token and hands a sink the offline oracle in full. A value that is
-// never read outside these two statements cannot reach such a function, wherever it is declared.
+// satisfies every rule about token and hands a sink the offline oracle in full. Every spelling of
+// that scheme the reviews have written names a .Value somewhere, and each of them is reported
+// here. A foundSecret passed whole names none, which is the caveat above and not a gap this list
+// can close.
 //
 // The scan has no type information, so this is a rule about the name and not about the type: any
 // .Value in a non-test file of this package is a finding unless it is one of these. The second one
@@ -94,6 +106,14 @@ const (
 // below the first of these. Moving a read into another statement, renaming the variable it reads
 // from, or splitting it across two is reported, and the edit to this list is the conversation this
 // tripwire exists to force.
+//
+// A site is rendered text, so this list pins two strings and not two reads. A second statement
+// whose names are bound elsewhere and which renders byte-identically to an entry here is accepted:
+// a nested block in mapSecrets that shadows values with a package-level slice renders as the first
+// entry and passes. That buys an author nothing the values slice did not already give them, and it
+// is why this list is a prompt for a conversation rather than a proof. Rendering is stable in the
+// direction that matters: reformatting or wrapping an allowed statement makes it stop matching and
+// fails the test loudly, and the collision is the only quiet direction.
 var valueReadsAllowed = []string{
 	"mapSecrets: values[i] = s.Value",
 	"mapSecrets: out[foundSecret{Kind: secretKind(row.Kind), Value: row.Value}] = row.Token",
