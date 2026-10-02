@@ -58,7 +58,10 @@ type Provider interface {
 	//     in UTC, and it is VersionOrderLexical.
 	//   - A base64 change token passed straight through under VersionOrderLexical. Declare
 	//     VersionOrderBase64 for it: base64's ASCII order is not its value order, so the pipeline
-	//     has to decode it rather than compare the characters.
+	//     has to decode it rather than compare the characters. Check first that the decoded bytes
+	//     are most significant first, because that part is a promise and not a proof: a token
+	//     whose varying field is little-endian decodes cleanly and compares backwards, and a real
+	//     Graph changeKey is not uniformly big-endian. If it does not hold, re-spell it here.
 	//
 	// None of this changes what a sink sees. To a sink a version is opaque (ADR 4), so a
 	// normalizer is free to re-spell the provider's own token into something orderable.
@@ -121,13 +124,25 @@ const (
 	// no order at all), or for anything that mixes upper and lower case.
 	VersionOrderLexical
 
-	// VersionOrderBase64 means every version is base64 of a fixed-width big-endian value, ordered
-	// by the BYTES it decodes to. Either alphabet, padded or not, but one provider uses one.
+	// VersionOrderBase64 means every version is base64 of a fixed-width BIG-ENDIAN value, ordered
+	// by the BYTES it decodes to. Either RFC 4648 alphabet, padded or not: the pipeline normalises
+	// the spelling, so a provider does not have to pick one and cannot be caught out by its own
+	// encoder. It is what a Microsoft Graph changeKey and an Exchange ETag are, once the W/"..."
+	// wrapper is stripped.
 	//
-	// This one is proved and not promised: the pipeline decodes both versions and compares the
-	// bytes, so the alphabet's own ASCII order cannot mislead it. It is what a Microsoft Graph
-	// changeKey and an Exchange ETag are, once the W/"..." wrapper is stripped. Two versions that
-	// do not decode, or that decode to different widths, are refused.
+	// The ALPHABET and the WIDTH are proved: the pipeline decodes both versions and compares the
+	// bytes, so the alphabet's own ASCII order cannot mislead it, and two versions that do not
+	// decode, or that decode to different widths, are refused.
+	//
+	// "Big-endian" is the part that is still a PROMISE, and it is the same promise
+	// VersionOrderLexical makes one level down. Comparing decoded bytes is the value order only if
+	// the value is stored most significant first; a program holding the bytes cannot see their
+	// layout. Declare this for a little-endian counter and about half its pairs invert, which lets
+	// an older record take the head and the scope access is decided on, exactly as a misdeclared
+	// lexical version does. A real changeKey decodes to a structure whose leading fields are
+	// little-endian, so check two real values of one entity before declaring this, and re-spell
+	// the version in Normalize if the bytes do not grow with the value. ADR 12 decision 3 states
+	// the residual.
 	VersionOrderBase64
 )
 

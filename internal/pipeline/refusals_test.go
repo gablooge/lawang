@@ -466,18 +466,36 @@ func TestTheVersionOrderIsTheDeclaredOrderAndNothingElse(t *testing.T) {
 		{lex, "", "", 0, false, "an empty version is no version"},
 		{lex, "9", "10", 0, false, "an unpadded counter is not fixed width, so lexical refuses it"},
 
-		// Base64, by the bytes it decodes to. Proved, not promised, and this is the pair the
-		// round 2 review reproduced the failure with: 'z' is value 51 and '0' is value 52, so the
-		// older version sorts ABOVE the newer one in ASCII and BELOW it in value.
+		// Base64, by the bytes it decodes to. The alphabet and the width are proved; that those
+		// bytes are most significant first is the provider's promise (provider.VersionOrder says
+		// "big-endian"), and ADR 12 decision 3 names the residual that goes with it. This is the
+		// pair the round 2 review reproduced the failure with: 'z' is value 51 and '0' is value
+		// 52, so the older version sorts ABOVE the newer one in ASCII and BELOW it in value.
 		{b64, "CQAAABYAAABz", "CQAAABYAAAB0", -1, true, "a Graph changeKey ticking from z to 0"},
 		{lex, "CQAAABYAAABz", "CQAAABYAAAB0", 1, true, "the same pair read as characters, which is why base64 is its own order"},
 		{b64, "AAAAAAAAAAB/", "AAAAAAAAAABA", 1, true, "'/' is value 63 and 'A' is value 0, which is the other way round from ASCII again"},
 		{b64, "AAAA", "AAAA", 0, true, "the same token twice"},
 		{b64, "AAAAAA==", "AAAAAQ==", -1, true, "padded standard base64"},
 		{b64, "AAAA", "AAAAAAAA", 0, false, "a decoded width that changed is not a fixed width value"},
-		{b64, "AA-_", "AA+/", 0, false, "two alphabets are not one encoding"},
 		{b64, "not base64!", "AAAA", 0, false, "a version that does not decode"},
 		{b64, "", "AAAA", 0, false, "an empty version decodes to nothing"},
+
+		// The spelling is normalised, not detected, so one provider's own consistent encoding is
+		// never read as two encodings. The round 3 review measured the cost of detecting it: over
+		// 20,000 random pairs of 30 byte values (a real Graph changeKey's width) URL-safe
+		// encoded, 40% came out under two different detected alphabets and were dead-lettered,
+		// although one provider had encoded both the same way.
+		{b64, "AAAAAAAAAAAA", "____________", -1, true, "URL-safe, and the exact pair the review's probe refused"},
+		{b64, "____________", "AAAAAAAAAAAA", 1, true, "and back, because 63 is above 0 either way round"},
+		{b64, "AA-_", "AA+/", 0, true, "the two alphabets spell one value, so they are one version"},
+		{b64, "-___", "AAAA", 1, true, "URL-safe against standard, ordered by the bytes and not by the characters"},
+		{b64, "AAAAAA==", "AAAAAQ", -1, true, "padding is a spelling too: a padded pair against an unpadded one"},
+		{b64, "AAA=", "AAA", 0, true, "the same two bytes, written both ways"},
+		// What stays refused is what genuinely spells nothing. No encoder emits both alphabets in
+		// one string, so translating one into the other would invent a value rather than read it.
+		{b64, "AA+_", "AAAA", 0, false, "one string, both alphabets, so neither one spells it"},
+		{b64, "AA-/", "AAAA", 0, false, "and the other way round"},
+		{b64, "AA=A", "AAAA", 0, false, "padding in the middle is not padding"},
 
 		// A provider that declared nothing orders nothing, whatever the strings look like. Each
 		// of these pairs is ordered under some other declaration above.

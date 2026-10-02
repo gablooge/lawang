@@ -351,6 +351,54 @@ func TestABase64CounterIsOrderedByWhatItDecodesTo(t *testing.T) {
 	}
 }
 
+// TestAProviderThatEncodesURLSafeBase64IsNotTwoProviders is the round 3 review's reproduction.
+//
+// The alphabet used to be detected per string, and the detection is not stable within one
+// provider: a URL-safe string that happens to contain no "-" and no "_" is also valid standard
+// base64, so it was detected as one alphabet and its neighbour that does contain one was detected
+// as another, and the pair was refused as "two alphabets". The reviewer measured it over 20,000
+// random pairs of 30 byte values, the width of a real Graph changeKey, URL-safe encoded: 40% of
+// pairs refused. Those are legitimate deliveries turned into dead letters, so the entity's chain
+// stops advancing and an operator replays by hand. It fails closed, but the availability is gone.
+//
+// decodeBase64 normalises instead, and the pair below is the one the review dead-lettered. The
+// first version contains neither of the two URL-safe characters and the second is nothing but
+// them, so this is the detection's worst case and not a near miss.
+func TestAProviderThatEncodesURLSafeBase64IsNotTwoProviders(t *testing.T) {
+	t.Parallel()
+	e := setup(t, pipeline.Options{}, fake.NewOrdering(fake.DefaultKey, provider.VersionOrderBase64))
+	const (
+		older = "AAAAAAAAAAAA" // nine zero bytes, and valid under both alphabets
+		newer = "____________" // nine 0xFF bytes, and valid under the URL-safe one only
+	)
+	head := e.mustDrain(tenantA, ev(entity, older, listA)).Records[0]
+
+	// The chain advances, rather than the delivery becoming a dead letter nobody asked for.
+	moved := e.mustDrain(tenantA, ev(entity, newer, listA))
+	if len(moved.Records) != 1 || moved.Stale != 0 {
+		t.Fatalf("the newer URL-safe version prepared %d records and counted %d stale, want 1 and 0",
+			len(moved.Records), moved.Stale)
+	}
+	if moved.Records[0].Supersedes != record.Ref(head.ID) {
+		t.Errorf("the newer record supersedes %q, want the previous head %q", moved.Records[0].Supersedes, head.ID)
+	}
+
+	// And it is ordered, not merely admitted: the older one coming back is still held back, and
+	// still does not take the head or the scope.
+	replay := e.mustDrain(tenantA, ev(entity, older, listB))
+	if len(replay.Records) != 0 || replay.Stale != 1 {
+		t.Fatalf("the older URL-safe version prepared %d records and counted %d stale, want 0 and 1",
+			len(replay.Records), replay.Stale)
+	}
+	rows := e.ledgerRows()
+	wantHead(t, rows, moved.Records[0].ID)
+	for _, r := range rows {
+		if r.isHead && (r.version != newer || r.scope != head.Visibility.Scope) {
+			t.Errorf("the head is version %q in scope %q, want %q in %q", r.version, r.scope, newer, head.Visibility.Scope)
+		}
+	}
+}
+
 // TestADeliveryWhoseProviderDeclaresNoVersionOrderIsRefused is the other end of the same rule.
 //
 // A provider that declares nothing cannot register (TestNewRegistryRefusesAProviderWithNoVersionOrder

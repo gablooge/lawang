@@ -589,7 +589,10 @@ Microsoft Graph `changeKey`, an Exchange ETag), a hash and a UUID are all fixed 
 them sorts by value in ASCII. So `provider.VersionOrder` is a required method, validated at
 registration, and it is one of three: **decimal**, one run of digits ordered by the number it
 spells; **lexical**, a fixed width whose byte order is its value order (a ULID, Crockford base32,
-uppercase hex, an RFC 3339 timestamp in UTC); or **base64**, ordered by the bytes it decodes to.
+uppercase hex, an RFC 3339 timestamp in UTC); or **base64** of a fixed-width **big-endian** value,
+ordered by the bytes it decodes to. Decoding proves the alphabet and the width and not the layout,
+so base64 of a little-endian counter inverts the same way a misdeclared lexical version does; ADR
+12 decision 3 states both residuals.
 A version the declaration cannot read, and a provider that declares nothing, are **refused by
 name**, because guessing is how an older record supersedes a newer one at the sink and takes the
 scope access is decided on with it. For two records that carry the same version there is only
@@ -738,7 +741,8 @@ type Provider interface {
 	Normalize(h Hydrated, c Change) ([]Record, error)
 	// How this provider spells Record.Version, so internal/pipeline can order two versions of
 	// one entity without inferring an order from the strings (ADR 12 decision 1). Decimal,
-	// lexical or base64; the registry refuses anything else, the zero value included.
+	// lexical or base64 (of a big-endian value); the registry refuses anything else, the zero
+	// value included.
 	VersionOrder() VersionOrder
 }
 

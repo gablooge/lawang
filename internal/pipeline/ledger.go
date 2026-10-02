@@ -208,11 +208,17 @@ func (l ledger) admit(ctx context.Context, r record.Record) (record.Record, admi
 //     their bytes. The fixed width is proved here; that the byte order is the value order is the
 //     provider's promise and nothing in this program can check it. That is why it is declared once
 //     by a provider author reading provider.VersionOrder, and not inferred from two strings.
-//   - VersionOrderBase64: both versions must decode as base64, under the same alphabet, to the
-//     same number of bytes, and they are ordered by those bytes. Proved, not promised, which is
-//     the whole reason it is a separate order: base64's ASCII order is NOT its value order ('z' is
-//     value 51 and '0' is value 52, while ASCII puts 'z' above '0'), so a changeKey or an ETag
-//     compared as characters sorts backwards at every carry.
+//   - VersionOrderBase64: both versions must decode as base64, under either RFC 4648 alphabet and
+//     padded or not, to the same number of bytes, and they are ordered by those bytes. What that
+//     proves is the alphabet and the width, which is the whole reason it is a separate order:
+//     base64's ASCII order is NOT its value order ('z' is value 51 and '0' is value 52, while
+//     ASCII puts 'z' above '0'), so a changeKey or an ETag compared as characters sorts backwards
+//     at every carry. What it still RESTS ON is the provider's promise that the decoded bytes are
+//     most significant first, which provider.VersionOrder states as "big-endian": comparing bytes
+//     is the value order only for a big-endian value, and nothing here can see the layout of a
+//     payload it decodes. A little-endian counter declared as base64 gets the same unsafe half
+//     that a misdeclared lexical version gets, and ADR 12 decision 3 says so beside the lexical
+//     residual.
 //   - Anything else, VersionOrderUnset included, orders nothing (ok is false).
 //
 // Every refusal is the point of the function. Guessing an order for two strings whose order this
@@ -238,9 +244,9 @@ func compareVersions(order provider.VersionOrder, v, head string) (int, bool) {
 			return strings.Compare(v, head), true
 		}
 	case provider.VersionOrderBase64:
-		a, alphabetA, okA := decodeBase64(v)
-		b, alphabetB, okB := decodeBase64(head)
-		if okA && okB && alphabetA == alphabetB && len(a) == len(b) {
+		a, okA := decodeBase64(v)
+		b, okB := decodeBase64(head)
+		if okA && okB && len(a) == len(b) {
 			return bytes.Compare(a, b), true
 		}
 	case provider.VersionOrderUnset:
@@ -248,25 +254,56 @@ func compareVersions(order provider.VersionOrder, v, head string) (int, bool) {
 	return 0, false
 }
 
-// base64Alphabets are the four spellings of base64, in the order a version is tried against them.
-// A provider uses one of them, and compareVersions refuses two versions that did not decode under
-// the same one: two strings read through two different alphabets are not two values of one
-// encoding, and ordering them would be the guess this package exists to refuse.
-var base64Alphabets = [...]*base64.Encoding{
-	base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding,
-}
+// base64URLToStd rewrites the two characters that are all the URL-safe alphabet is: RFC 4648
+// section 5 is section 4 with 62 spelled "-" instead of "+" and 63 spelled "_" instead of "/".
+var base64URLToStd = strings.NewReplacer("-", "+", "_", "/")
 
-// decodeBase64 decodes s under the first alphabet that accepts it, and reports which one.
-func decodeBase64(s string) (decoded []byte, alphabet int, ok bool) {
+// decodeBase64 decodes s to the bytes it stands for, under either RFC 4648 alphabet and padded or
+// not, and reports whether s is base64 at all.
+//
+// It normalises rather than detecting, and the difference is not cosmetic. Detecting the alphabet
+// from the string was the first implementation, and it refused pairs a provider never meant to be
+// ambiguous: a 30 byte value (the width of a real Graph changeKey) URL-safe encoded contains no
+// "-" and no "_" often enough that 40% of random pairs came out under two different detected
+// alphabets and were dead-lettered, although one provider had encoded both the same way. That is
+// availability lost to a question that was never a real one.
+//
+// It was never a real one because the alphabet is not a fact about a string. Every byte a provider
+// could mean is reachable in both spellings, the two differ in exactly two characters, and a
+// string that contains neither is the same value under either, so there is nothing for a reader to
+// disambiguate and nothing to guess. That is also why this is normalised here instead of being
+// declared: a fourth constant beside VersionOrderBase64 would make every provider author answer a
+// question whose two answers decode identically, and a wrong answer would still decode identically,
+// so the declaration would cost a public contract and buy nothing. Contrast VersionOrderLexical,
+// where the declaration buys the one fact this program genuinely cannot see.
+//
+// What stays refused is what is genuinely unreadable: a string holding characters from both
+// alphabets at once, which no encoder emits and which therefore stands for no value, and anything
+// that is not base64 under either. Padding is likewise a spelling and not a value, so "AAA=" and
+// "AAA" decode to the same two bytes rather than being two alphabets.
+func decodeBase64(s string) (decoded []byte, ok bool) {
 	if s == "" {
-		return nil, 0, false
+		return nil, false
 	}
-	for i, enc := range base64Alphabets {
-		if b, err := enc.DecodeString(s); err == nil {
-			return b, i, true
-		}
+	urlSafe := strings.ContainsAny(s, "-_")
+	standard := strings.ContainsAny(s, "+/")
+	if urlSafe && standard {
+		// Neither RFC 4648 alphabet spells this, so it is not one base64 value, and translating it
+		// into one would be inventing the value rather than reading it.
+		return nil, false
 	}
-	return nil, 0, false
+	if urlSafe {
+		s = base64URLToStd.Replace(s)
+	}
+	enc := base64.RawStdEncoding
+	if strings.HasSuffix(s, "=") {
+		enc = base64.StdEncoding
+	}
+	b, err := enc.DecodeString(s)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
 }
 
 // compareDecimal orders two runs of decimal digits by the number they spell. Leading zeros are not

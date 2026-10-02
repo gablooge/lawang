@@ -1,6 +1,7 @@
 package pipeline_test
 
 import (
+	"bytes"
 	"math/big"
 	"strings"
 	"testing"
@@ -72,7 +73,15 @@ func TestTheRedactionMapStaysHereAndTheTokenGoesOut(t *testing.T) {
 // property it actually is.
 //
 // THE PROPERTY, in one sentence, so that nobody weakens it by accident: two mintings of one value
-// that agree in EVERY input a sink can see must still give two different tokens.
+// that agree in EVERY input a sink can see must still differ in the 80 bits of the token that are
+// supposed to be random.
+//
+// The sentence names the entropy and not the token on purpose, because the token is wider than the
+// guarantee. A placeholder is "[" + kind + ":" + a ULID + "]", and a ULID is 10 characters of
+// millisecond clock and 16 characters of entropy. The clock is not a secret and it is not ours to
+// promise: two drains are two round trips apart, so their clocks differ whatever the entropy is
+// derived from. An assertion over the whole token is therefore satisfied by the clock alone, and
+// says nothing at all about the part this test exists for.
 //
 // That sentence is what the bullet means by "a ULID, not a hash of the value". A token any sink
 // could compute from a guess would hand it an oracle: guess an address, compute its token, look
@@ -81,18 +90,26 @@ func TestTheRedactionMapStaysHereAndTheTokenGoesOut(t *testing.T) {
 // sink holds the salt: the tenant is its own, the kind is in the token's prefix, the record id is
 // on the record, and so is meta.delivery (TestTheDeliveryIDTravelsWithTheRecord pins that).
 //
-// Two earlier versions of this test were weaker than the sentence, and both survived a digest that
-// restored the whole oracle. Asserting that the token does not quote the value sees nothing, since
-// a digest quotes nothing; sha256(tenant, kind, value) died at that point. Minting the same value
-// in a SECOND delivery then let sha256(tenant, kind, value, meta.delivery) through, because the
-// two mintings differed in the delivery id and the external id, and a sink holds both.
+// Three earlier versions of this test were weaker than the sentence, and all three survived a
+// digest that restored the whole oracle. Asserting that the token does not quote the value sees
+// nothing, since a digest quotes nothing; sha256(tenant, kind, value) died at that point. Minting
+// the same value in a SECOND delivery then let sha256(tenant, kind, value, meta.delivery) through,
+// because the two mintings differed in the delivery id and the external id, and a sink holds both.
+// Fixing that but still comparing whole token strings let the digest back in a third time, inside
+// the ULID: keep the real clock, draw only the 80 entropy bits from sha256(tenant, kind, value),
+// and the last 16 characters of every token are the complete oracle while the two drains still
+// produce two different strings.
 //
 // So this drains one delivery, takes away the redaction_map row AND the record_ledger row as the
 // superuser (the ledger row is what would otherwise make the second drain a skip), and drains the
 // very same delivery again. The second minting sees the same tenant, the same delivery id, the
 // same record id, the same external id, the same version, the same scope, the same kind and the
 // same value. Every function of every input a sink can see therefore gives ONE answer here, and
-// only a token drawn from crypto/rand gives two.
+// only entropy drawn from crypto/rand gives two.
+//
+// So the assertion is over ulidIn(...).Entropy(), which is exactly the 80 bits the sentence above
+// names and nothing else. The whole-token and whole-text comparisons stay beside it, because a
+// token that repeats itself entirely is wrong too, but neither of them is what this test is for.
 func TestMintingOneValueTwiceGivesTwoTokens(t *testing.T) {
 	t.Parallel()
 	e := setup(t, pipeline.Options{})
@@ -134,10 +151,19 @@ func TestMintingOneValueTwiceGivesTwoTokens(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("the map holds %d rows after the second delivery, want one: %+v", len(rows), rows)
 	}
+	// The property itself: the 80 bits that are supposed to be random. Not the whole token, whose
+	// leading 48 are a clock that differs between two drains for free and would pass a placeholder
+	// whose entropy is sha256(tenant, kind, value).
+	firstEntropy := ulidIn(t, before).Entropy()
+	secondEntropy := ulidIn(t, rows[0].token).Entropy()
+	if bytes.Equal(firstEntropy, secondEntropy) {
+		t.Errorf("minting %q twice from identical inputs gave the same 80 entropy bits %x, so the "+
+			"tokens %q and %q can differ only in their clock: the placeholder is a function of what "+
+			"the sink already holds, which is the offline oracle ADR 12 decision 5 exists to prevent",
+			addr, firstEntropy, before, rows[0].token)
+	}
 	if rows[0].token == before {
-		t.Errorf("minting %q twice from identical inputs gave the same token %q: the placeholder is a "+
-			"function of what the sink already holds, which is the offline oracle ADR 12 decision 5 "+
-			"exists to prevent", addr, before)
+		t.Errorf("minting %q twice from identical inputs gave the same token %q", addr, before)
 	}
 	if !strings.Contains(a.Text, before) || !strings.Contains(b.Text, rows[0].token) {
 		t.Fatalf("a record does not carry the token its delivery minted: %q, then %q", a.Text, b.Text)

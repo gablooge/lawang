@@ -58,10 +58,29 @@ was declared and nothing else:
    order is not checkable and never was, which is the whole point of the round 2 finding. It must
    not be declared for base64, for RFC 4648 base32 (whose alphabet runs `A-Z` then `2-7`, while
    ASCII runs `2-7` then `A-Z`), for a UUID, or for anything mixing letter cases.
-3. **`VersionOrderBase64`**: both versions must decode as base64, under the same alphabet, to the
-   same number of bytes, ordered by those bytes. **Proved, not promised:** the pipeline decodes, so
-   the alphabet's ASCII order cannot mislead it, and this is how B13, B16 and B17 use a `changeKey`
-   or an ETag as it comes.
+3. **`VersionOrderBase64`**: both versions must decode as base64, under either RFC 4648 alphabet
+   and padded or not, to the same number of bytes, ordered by those bytes. **The alphabet and the
+   width are proved:** the pipeline decodes, so the alphabet's ASCII order cannot mislead it, and
+   a decoded width that changed is refused. **What is still promised is the layout**, and it is
+   the same promise lexical makes one level down: comparing decoded bytes is the value order only
+   if the value is stored most significant first, which `provider.VersionOrder` states as
+   "base64 of a fixed-width **big-endian** value". A program that has only the bytes cannot see
+   whether they are big-endian, so a provider that declares base64 for a little-endian counter
+   gets the unsafe direction for about half its pairs, exactly as a misdeclared lexical version
+   does. The residual is in decision 3 beside the lexical one, and B16 and B17 are asked there to
+   check the claim against two real values before they inherit it.
+
+   The alphabet is **normalised and not detected**, which is a change from the first
+   implementation. Detecting it per string refused pairs one provider had encoded one way: a
+   URL-safe string containing neither `-` nor `_` is also valid standard base64, so it was read
+   under one alphabet and its neighbour under another, and over 20,000 random pairs of 30 byte
+   values (a real `changeKey`'s width) 40% were dead-lettered. The question was never a real one:
+   the two alphabets differ in exactly two characters, every value is reachable in both, and a
+   string spells the same bytes either way, so there is nothing to disambiguate and a fourth
+   constant would make every provider author answer a question whose answers decode identically.
+   What stays refused is a string holding characters from both alphabets at once, which no
+   encoder emits, and anything that is not base64 at all. Padding is a spelling too, so `"AAA="`
+   and `"AAA"` are one version.
 4. **Anything the declaration cannot read is refused** (`ErrVersionNotComparable`, wrapping
    `ErrDeadLetter`, counted on `Prepared.VersionUnordered`). The head does not move, nothing is
    delivered, the error names the entity, both versions and the declared order, and the fix is on
@@ -149,17 +168,31 @@ whose out-of-order pairs differ in length. Under decision 1 the three directions
   same-width versions are not in byte order has the wrong record called stale. The symptom is a
   `Stale` count that is not zero while the sink stays behind. Nothing wrong is delivered and no
   access is widened, which is also the safe direction.
-- **An older record taking the head and its scope**, which is the unsafe one. It requires a
-  provider that declares `VersionOrderLexical` while its versions are not in byte order, and then
-  only for the pairs where the byte order and the value order disagree, which for a misdeclared
-  encoding is about half of them. **Nothing in this program can close that**, because "these bytes
-  sort the way this encoding's values sort" is not a fact about two strings: it is a fact about the
-  encoding, which is why decision 1 makes a provider state it once instead of letting the pipeline
+- **An older record taking the head and its scope**, which is the unsafe one. It has two sources,
+  and they are the same mistake at two levels:
+  - A provider that declares `VersionOrderLexical` while its versions are not in byte order. The
+    inversion hits the pairs where the byte order and the value order disagree, which for a
+    misdeclared encoding is about half of them.
+  - A provider that declares `VersionOrderBase64` for a payload whose varying field is **not most
+    significant first**. Decoding proves the alphabet and the width, and neither of those is the
+    layout. A little-endian counter decodes perfectly and compares backwards at every carry, so
+    the same half of its pairs invert. This one is worth naming for B16 and B17 in particular: a
+    real Graph `changeKey` decodes to `0f000000 16000000 <16 byte GUID> 0000 1d1a6140`, whose two
+    leading DWORDs are plainly little-endian, so the format is **not uniformly big-endian**. The
+    trailing change number looks big-endian and the GUID looks constant per item, which would make
+    a byte comparison right, but nothing in this branch evidences that. **B16 and B17 verify it
+    against two real `changeKey` values of one item before declaring `VersionOrderBase64`**, and
+    re-spell the version in the normalizer if it does not hold. Inheriting the claim from this
+    record is not verification.
+
+  **Nothing in this program can close either**, because "these bytes sort the way this value
+  sorts" is not a fact about two strings: it is a fact about the encoding and the layout behind
+  them, which is why decision 1 makes a provider state it once instead of letting the pipeline
   infer it every time. What is closed is the class that hurt twice here, since `VersionOrderUnset`
-  refuses, `VersionOrderDecimal` and `VersionOrderBase64` are both proved rather than trusted, and
-  `VersionOrderLexical` refuses a width that changed. What is left is a provider author declaring
-  something untrue about their own encoding, on a contract whose doc comment names, by name, every
-  encoding that would make it untrue.
+  refuses, `VersionOrderDecimal` is proved outright, `VersionOrderBase64` proves its alphabet and
+  its width, and `VersionOrderLexical` refuses a width that changed. What is left in both cases is
+  a provider author declaring something untrue about their own encoding, on a contract whose doc
+  comment names, by name, what would make it untrue.
 
 ### 4. A, B, and back to A: dead-lettered and counted, as ADR 4 requires
 
@@ -244,10 +277,18 @@ telephone number and an IBAN, in `Title` and `Text` only.
   the address appears in that tenant's records, which is exactly the fact masking withholds.
   Salting does not close it, because a sink holds every salt there is: the tenant is its own, the
   kind is in the token's prefix, and the record id and `meta.delivery` are both on the record. So
-  the property is that the token is not a function of ANY of them, and
+  the property is that **the token's 80 random bits are not a function of ANY of them**, and
   `TestMintingOneValueTwiceGivesTwoTokens` pins exactly that: it drains one delivery, deletes the
   `redaction_map` and `record_ledger` rows as the superuser, and drains the same delivery again, so
-  the second minting differs from the first in nothing a sink can see. One value keeps one token
+  the second minting differs from the first in nothing a sink can see.
+
+  The property names the 80 bits and not the token because the token is wider than the guarantee.
+  A ULID is 48 bits of millisecond clock and 80 of entropy, and the two drains are two round trips
+  apart, so their clocks differ whatever the entropy is derived from. Three versions of this test
+  compared whole token strings and all three survived a digest: the third kept the real clock and
+  drew only the entropy from `sha256(tenant, kind, value)`, which makes the last 16 characters of
+  every token a complete offline oracle while the two strings still differ. The assertion is
+  therefore on `Entropy()`, which is exactly the bits the sentence names. One value keeps one token
   within one tenant, so the same person reads as the same placeholder everywhere, and the same
   value in two tenants is two tokens.
 - **Its 80 random bits come from `crypto/rand`** (`ids.NewUnpredictable`), not from `ids.New`,
@@ -303,12 +344,14 @@ telephone number and an IBAN, in `Title` and `Text` only.
 - **The version order covers three spellings and refuses the rest.** A normalizer whose versions
   fit none of them loses every second delivery of an entity to `ErrVersionNotComparable`, which is
   loud and costs a dead letter per change. That is the price of not guessing, and it is deliberate:
-  the alternative is the failure round 1 found and the one round 2 found. A provider that declares
-  `VersionOrderLexical` for versions that are the same width but not in byte order gets the
-  residual of decision 3's third bullet, which this record does not claim to close. Every provider
-  from B11 on has to know all of this, and the normalizer contract now says so: it is written on
-  `provider.Provider.Normalize` and on `record.Record.Version`, which is what a provider author
-  reads, and `provider.VersionOrder` names the encodings that break the lexical promise.
+  the alternative is the failure round 1 found and the one round 2 found. **Two declarations can be
+  untrue without the program being able to tell**, and both get the residual of decision 3's third
+  bullet, which this record does not claim to close: `VersionOrderLexical` for versions that are
+  the same width but not in byte order, and `VersionOrderBase64` for a payload that decodes
+  cleanly but is not most significant first. Every provider from B11 on has to know all of this,
+  and the normalizer contract now says so: it is written on `provider.Provider.Normalize` and on
+  `record.Record.Version`, which is what a provider author reads, and `provider.VersionOrder`
+  names the encodings that break the lexical promise and the layout that breaks the base64 one.
 - **A required method on `provider.Provider` is a cost of its own.** Every provider must implement
   `VersionOrder`, including one whose versions never need ordering, and the registry refuses it at
   start-up if it does not. That is the point (an optional declaration leaves an unsafe default in
