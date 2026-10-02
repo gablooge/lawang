@@ -16,8 +16,9 @@ import (
 )
 
 // This file is a tripwire of the kind internal/ids already has for RecordID, and it is here for
-// the same reason: a property that a behavioural test keeps failing to pin is pinned by making
-// the thing it forbids unwritable instead.
+// the same reason: a behavioural test kept failing to pin a property, so the source text is
+// scanned instead. It narrows the ways the thing it forbids can be written; it does not make that
+// thing unwritable. The caveat below says what the two rules refuse and what they do not.
 //
 // ADR 12 decision 5 says a masking placeholder's 80 random bits are not a function of ANY input a
 // sink can see. Four schemes have now satisfied the behavioural tests while handing a sink a
