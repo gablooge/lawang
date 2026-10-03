@@ -25,6 +25,7 @@ package record
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -385,4 +386,43 @@ func (r Record) Seal(provider string, tenant tenancy.ID) (Record, error) {
 		return Record{}, err
 	}
 	return r, nil
+}
+
+// ErrNotThisTenantsRecord reports a stored document whose id is not the one this deployment
+// would mint for the record it holds, under the provider and the tenant it was read back for.
+// See Reopen.
+var ErrNotThisTenantsRecord = errors.New("record: the document does not carry the id this tenant's recipe mints for it")
+
+// Reopen reads back a document this deployment sealed and stored, and returns a Record that is
+// sealed for tenant again.
+//
+// It is for the one caller that has to deliver a record it did not seal in this process: the
+// worker's second commit (architecture 3.2, step 7), which delivers what its first commit
+// stored, possibly after a crash and from another process. Decoding alone is not enough there,
+// because a decoded record knows no tenant (the tenant is in no field of the envelope), so
+// SealedFor is false for it and every sink would refuse it as another tenant's record.
+//
+// It is not a way around the seal. The id is minted again, from the fields the document carries
+// and from provider and tenant, and a document whose stored id is not the one that comes out is
+// ErrNotThisTenantsRecord. So a document edited in the table, a document stored for one tenant
+// and read back for another, and a document read back under the wrong provider are all refused
+// here rather than delivered to somebody. What it cannot catch is a change to a field that is
+// not hashed into the id (the title, the text, the author), which is the same thing MarshalJSON
+// cannot catch for a record this process sealed: the id stands for the entity, the version and
+// the scope, and for nothing else (ADR 4).
+func Reopen(doc []byte, provider string, tenant tenancy.ID) (Record, error) {
+	var stored Record
+	if err := json.Unmarshal(doc, &stored); err != nil { // strict: the whole format, and then Validate
+		return Record{}, err
+	}
+	sealed, err := stored.Seal(provider, tenant)
+	if err != nil {
+		return Record{}, err
+	}
+	if sealed.ID != stored.ID {
+		// Neither id is in the error. One is a hash of the tenant, and the pair is the evidence
+		// of whatever went wrong, which belongs where the document is and not in a log line.
+		return Record{}, ErrNotThisTenantsRecord
+	}
+	return sealed, nil
 }
