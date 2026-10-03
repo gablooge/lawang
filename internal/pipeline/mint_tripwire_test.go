@@ -184,8 +184,8 @@ type srcFile struct {
 }
 
 // TestTheMaskingMintCannotSeeTheValue is the tripwire. It scans the non-test files of this
-// package against the two rules above, and fails when the mint stops going through
-// ids.NewUnpredictable for its bits.
+// package against the two rules above, and fails when the mint stops calling
+// ids.NewUnpredictable.
 func TestTheMaskingMintCannotSeeTheValue(t *testing.T) {
 	t.Parallel()
 	files := packageFiles(t)
@@ -359,7 +359,7 @@ func mintFindings(files []srcFile) []string {
 }
 
 // valueReadFindings reports every place in one file that names a .Value outside the statements on
-// valueReadsAllowed. It is the rule that keeps the value from reaching a second mint.
+// valueReadsAllowed.
 func valueReadFindings(fset *token.FileSet, rel string, file *ast.File) []string {
 	var findings []string
 	var stack []ast.Node
