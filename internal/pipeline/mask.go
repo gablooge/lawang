@@ -132,8 +132,9 @@ func findSecrets(text string) textScan {
 	return textScan{text: text, spans: kept}
 }
 
-// appendMatches adds every match of re that ok accepts, with the boundary rule applied when
-// bounded is set.
+// appendMatches adds the matches of re that pass every test in the loop below. Two of those tests
+// are the caller's: ok, which decides on the matched value, and bounded, which requires the match
+// to stand on its own.
 func appendMatches(dst []span, text string, re *regexp.Regexp, kind secretKind, ok func(string) bool, bounded bool) []span {
 	for _, m := range re.FindAllStringIndex(text, -1) {
 		v := text[m[0]:m[1]]
@@ -185,8 +186,10 @@ func isAlnum(c byte) bool {
 	return isDigit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
-// validPhone holds every rule the pattern cannot express. It is the whole of the phone rule, and
-// the pattern above only narrows what it has to look at.
+// validPhone reports whether a match of phoneRe is a telephone number. It is not the whole of the
+// phone rule, and neither is the pattern: the pattern settles the shape, down to which separators
+// count, and validPhone reads the leading plus and the digit groups. "555a010a1234" satisfies
+// validPhone and is still never masked, because the pattern does not match it.
 //
 // A leading plus is a country code, and a country code is what makes a run of grouped digits a
 // telephone number rather than something else that is written the same way. So the international
