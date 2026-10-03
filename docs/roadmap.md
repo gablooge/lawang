@@ -65,26 +65,27 @@ deregisters the provider-side webhook; no table contains token material (checked
 scans the database after a full connect); the local vault refuses to start in production without a
 key.
 
-### M3 · The other four providers (L)
+### M3 · Slack, the second provider (S)
+
+v0.1.0 ships two providers. Outlook, Teams and HubSpot were cut from this release on 2026-10-03,
+to hold the release date rather than for any reason of design, and they are the first entry under
+[After v0.1](#after-v01).
 
 - **Slack:** Events API, the URL challenge (signature-checked when a signing secret is set), the
   replay window, channels and DMs as scopes, mrkdwn links unwrapped before masking
-- **Outlook:** a Graph subscription per mailbox, the `validationToken` echo as plain text,
-  `clientState` checks, mixed-subscription batches split per owner, direct Graph hydration
-- **Teams:** channel-message subscriptions, hourly expiry, reply threading, system events skipped
-- **HubSpot:** reconcile-only by default, signed webhooks as an option
-- the renewal sweep, including recovery when a provider has deleted the subscription
+- registrars for the two providers, and the renewal sweep, including recovery when a provider has
+  deleted the subscription
 - `/v1/subscriptions/health`
 
-**Done when:** each provider lands a real event at the sink from a real tenant, and each has
-signature-negative, handshake, and normalizer golden-file tests; an expiring subscription renews
-before it lapses under a fast-forwarded clock.
+**Done when:** ClickUp and Slack each land a real event at the sink from a real tenant, and Slack
+has signature-negative, handshake and normalizer golden-file tests; an expiring subscription
+renews before it lapses under a fast-forwarded clock.
 
 ### M4 · Reconciliation and access sync (M)
 
 - cursors, chunked reconcile passes with pacing between chunks and never inside a transaction
-- reconcilers for ClickUp, Slack and HubSpot
-- member sources for all five providers; the identity resolver (email join, domain-restricted)
+- reconcilers for ClickUp and Slack
+- member sources for ClickUp and Slack; the identity resolver (email join, domain-restricted)
 - membership diff against a local record of what was sent, pushed to sinks that accept it
 - provider read failures abort the pass instead of reading as "no members"
 
@@ -126,7 +127,7 @@ What carries over, what changes, and what is intentionally left behind.
 
 | Capability | Milestone | Status in the rewrite |
 |---|---|---|
-| Five providers with webhook ingest | M1, M3 | same |
+| Five providers with webhook ingest | M1, M3 | **changed:** v0.1.0 ships ClickUp and Slack; Outlook, Teams and HubSpot are after v0.1 |
 | Constant-time signature checks over raw bytes; handshakes | M1, M3 | same |
 | Tenant from the owned row; ambiguous owner refused | M1 | same |
 | Outbox accept with delivery dedupe; 202 before any provider I/O | M1 | same |
@@ -137,8 +138,8 @@ What carries over, what changes, and what is intentionally left behind.
 | Strict stub sink; record format enforced in CI | M1 | same, and the stub is strict from day one |
 | Wire name separate from the internal key | M1 | same, now sink configuration |
 | Local, Nango and Azure-app vaults; connect CLI | M2 | same |
-| Registrars and renewal with deleted-subscription recovery | M3 | same |
-| Reconciliation for ClickUp, Slack and HubSpot | M4 | **changed:** chunked commits, pacing outside transactions |
+| Registrars and renewal with deleted-subscription recovery | M3 | same, for the two providers v0.1.0 ships |
+| Reconciliation for ClickUp, Slack and HubSpot | M4 | **changed:** chunked commits, pacing outside transactions, and HubSpot after v0.1 |
 | Membership sync with a shadow diff and email identity join | M4 | **generalized** into access sync for any sink that accepts membership |
 | DMs made private through a flag | M1, M3 | **changed:** one uniform scope-membership rule, no private flag |
 | Worker as a single sequential loop | M0 | **changed:** independent goroutines; sweeps elected by advisory lock |
@@ -153,6 +154,12 @@ What carries over, what changes, and what is intentionally left behind.
 
 Roughly in priority order.
 
+- **Outlook, Teams and HubSpot.** Cut from v0.1.0 on 2026-10-03, when M1 had slipped and the
+  remaining items no longer fitted the release date. They are deferred, not dropped: the design
+  below them (the shared Graph client, the per-mailbox and per-channel subscription model, the
+  reconcile-only HubSpot path) is still in [architecture.md](architecture.md), and they are
+  tracked as B16, B17 and B18 under the `Post v0.1.0` milestone. Teams is the cheapest of the
+  three to add once the Graph client exists, because it shares it with Outlook.
 - **Deletions.** Providers that report deletes, and reconciliation that notices absences, emit
   `op: "delete"` records. Format v1 already defines them, so shipping this does not change the
   format ([ADR 4](adr/0004-record-format-v1.md)).

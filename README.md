@@ -5,9 +5,9 @@
 *Lawang* is Javanese for door or gate: the thing every change passes through, and where it is
 decided who may see it.
 
-Lawang connects a workspace's SaaS tools (Slack, Microsoft Teams, Outlook, ClickUp, HubSpot),
-receives their webhooks directly, and turns every change into a clean, permission-stamped record
-delivered exactly once to your memory, search, or RAG system.
+Lawang connects a workspace's SaaS tools (ClickUp and Slack in v0.1.0, with Microsoft Teams,
+Outlook and HubSpot after it), receives their webhooks directly, and turns every change into a
+clean, permission-stamped record delivered exactly once to your memory, search, or RAG system.
 
 > **Status: pre-alpha.** The foundations are built (M0: configuration, id recipes, Postgres with
 > row-level security, the outbox), the record format is settled
@@ -21,7 +21,7 @@ delivered exactly once to your memory, search, or RAG system.
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in
 > [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the
-> point where it runs end to end against real providers.
+> point where it runs end to end against real ClickUp and Slack workspaces.
 
 ---
 
@@ -70,15 +70,20 @@ slow (fetching the full object, normalizing, delivering) happens in the worker, 
 retries on a backoff ladder and eventually parks as a replayable dead-letter state instead of
 getting lost.
 
-## Providers planned for v0.1
+## Providers
 
-| Provider | Ingest | Where visibility comes from |
-|---|---|---|
-| ClickUp | webhook (one per workspace) | list members |
-| Slack | Events API | channel members; DM participants |
-| Microsoft Teams | Graph subscription, renewed hourly | channel members |
-| Outlook | Graph subscription per mailbox, renewed | the mailbox owner |
-| HubSpot | reconcile-only by default, webhooks optional | portal owners |
+v0.1.0 ships two of these. The other three were cut from the release on 2026-10-03 so that the
+date would hold, not because the design changed: they are designed for throughout
+[docs/architecture.md](docs/architecture.md) and are the first entry under
+[After v0.1](docs/roadmap.md#after-v01).
+
+| Provider | In | Ingest | Where visibility comes from |
+|---|---|---|---|
+| ClickUp | v0.1.0 | webhook (one per workspace) | list members |
+| Slack | v0.1.0 | Events API | channel members; DM participants |
+| Microsoft Teams | after v0.1 | Graph subscription, renewed hourly | channel members |
+| Outlook | after v0.1 | Graph subscription per mailbox, renewed | the mailbox owner |
+| HubSpot | after v0.1 | reconcile-only by default, webhooks optional | portal owners |
 
 Adding a provider means adding one Go package that implements a small set of interfaces. See
 [docs/architecture.md](docs/architecture.md#extension-points).
