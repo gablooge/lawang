@@ -894,6 +894,50 @@ Built-in implementations planned for v0.1:
 | Identity | email join (normalized, domain-restricted); replaceable |
 | Masking | conservative regex baseline (emails, phone numbers, IBANs) in `internal/pipeline`, with the map from placeholder to value kept in `redaction_map` and never sent anywhere ([ADR 12](adr/0012-ledger-supersede-masking.md)); replaceable |
 
+### The three sinks (B09, `internal/sink`)
+
+All three marshal through `record.Record.MarshalJSON`, which validates the record and checks its
+seal, and all three apply the **wire name**: `sink.Names` maps an internal provider key to what
+this sink's receiver calls that source, and it replaces `source` alone. The scope id keeps the
+internal provider key in its first segment, because that is the join key with the membership
+message ([ADR 3](adr/0003-scope-id-format.md)), and so does the prefix of `external_id`, so
+`source` and the scope's first segment need not match.
+
+A failure comes back as a `*sink.Fault`, which carries an `Action` for the worker (`retry`,
+`halt` or `dead letter`, the sink rows of [section 11](#11-failure-handling)), the `outbox.Cause`
+that goes into the dead letter, and a `Detail` that is one of the package's own phrases. It wraps
+nothing: the error of `net/http` is a `*url.Error` whose text quotes the request URL, and a sink
+URL's query string is where many receivers carry their API key. A record the receiver refused
+on its own comes back in `DeliveryResult.Rejected` instead, and the rest of the batch counts as
+delivered.
+
+**`http`** posts `{"records":[<record document>, ...]}` to a configured endpoint, with
+`Content-Type: application/json` and the tenant's bearer token in an `Authorization` header. The
+tenant is in no field: at a sink it is established by the per-tenant credential
+([section 4](#4-trust-model)), and a tenant with no credential is a refusal, not a default. A
+2xx answer may name the records the receiver refused,
+`{"rejected":[{"id":"rec_...","code":"..."}]}`; an empty body means every record was taken, and
+an answer that names an id that was not sent, or that does not parse, leaves the sink unable to
+say what landed, so nothing is marked delivered and the batch is sent again. A status outside 2xx
+is classified: 401 and 403 halt, 408 and 429 retry, any other 4xx dead-letters, and everything
+else retries. Redirects are not followed, so a receiver cannot send the next request, with its
+credential, somewhere else. The sink sends at most `MaxRequestBytes` (8 MiB by default) in one
+request and splits a batch to stay under it, and it reads at most 64 KiB of an answer.
+
+**`stub`** is the strict test double of principle 5. It decodes every document with
+`internal/record`'s strict decoder, which the agreement tests hold equal to the schema, and adds
+what a receiver has that a validator does not: it refuses a record id it already holds whose
+content differs, comparing the documents without `meta`, which is not part of a record's content.
+That is the check ADR 4 decision 7's promise to a sink rests on, that one id never appears with
+two scopes. It also bounds a document before the decoder sees it (8 MiB by default), because
+nothing in the format bounds one once unknown fields are counted, and it walks the `supersedes`
+chain with a visited set, because a cycle across records is invisible to anything that validates
+one record at a time.
+
+**`jsonl`** appends one document per line to `<tenant>.jsonl` under a configured directory, owner
+only. The tenant is the file. The file is a log: a record delivered twice is written twice, and a
+reader folds it by `id`, taking the last line for an id.
+
 ---
 
 ## 8. Package layout
@@ -1010,6 +1054,7 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands |
 | Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered; ops is alerted |
 | Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; replay is always safe |
+| Sink answers 2xx and does not say what it did with the batch (the answer does not parse, or names a record that was not sent) | retryable | nothing is marked delivered and the whole batch is sent again: a sink that is idempotent on the record id loses nothing by a repeat, and a guess here loses a record |
 | Vault unreachable | fail closed | retry on the ladder; nothing is delivered unverified |
 | Accept path out of time (a saturated pool, a slow database) | retryable | 503 with a `Retry-After`, nothing stored |
 
@@ -1029,5 +1074,5 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Crypto | standard library `crypto/hmac`, `crypto/aes`, `crypto/cipher` |
 | Metrics | `github.com/prometheus/client_golang` |
 | Tests | standard `testing`, `testcontainers-go` for Postgres |
-| JSON Schema validation | `github.com/santhosh-tekuri/jsonschema/v6`, in tests only: pure Go, draft 2020-12, asserts formats on request, and the one module it builds with (`golang.org/x/text`) was already in the module graph. The `lawang` binary does not link it. Production code validates with `record.Validate`, which the tests hold equal to the schema. It becomes a runtime dependency only if the strict stub sink (B09) validates with the schema itself |
+| JSON Schema validation | `github.com/santhosh-tekuri/jsonschema/v6`, in tests only: pure Go, draft 2020-12, asserts formats on request, and the one module it builds with (`golang.org/x/text`) was already in the module graph. The `lawang` binary does not link it. Production code validates with `record.Validate`, which the tests hold equal to the schema. It stays test-only: the strict stub sink of B09 decodes with `internal/record`'s strict decoder instead of compiling the schema, which also gives it the three rules no schema can state |
 | MCP (later) | `github.com/modelcontextprotocol/go-sdk` |

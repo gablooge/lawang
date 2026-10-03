@@ -268,3 +268,12 @@ func validName(s string, maxLen int, hyphen bool) bool {
 // the provider registry calls this, and a test holds the two to the same verdict on every
 // candidate. ADR 3 freezes the grammar at v0.1.0 in both directions, hyphen included.
 func ValidProviderKey(s string) bool { return validName(s, maxKind, false) }
+
+// ValidSource reports whether s may be a Record.Source: a lowercase letter followed by up to 63
+// of a-z, 0-9, underscore and hyphen, so at most 64 bytes.
+//
+// It is the rule Validate applies to Source, exported because Source is also where a sink's wire
+// name goes (principle 4). A sink checks a configured name once, where the configuration is read,
+// rather than meeting a bad one in MarshalJSON per record. Every provider key is a source name,
+// because the key grammar is this one without the hyphen and a quarter of the length.
+func ValidSource(s string) bool { return validName(s, maxSource, true) }
