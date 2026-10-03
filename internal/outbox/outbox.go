@@ -402,23 +402,217 @@ func (o *Outbox) Get(ctx context.Context, tenant tenancy.ID, id string) (Row, er
 	return row, err
 }
 
-// MarkPrepared records that the ledger rows and prepared records are committed. After this, a
-// crash re-drains into delivery, not into preparing again.
-func (o *Outbox) MarkPrepared(ctx context.Context, c Claimed) error {
+// Work is what a claim needs in order to work its row: the provider the delivery was accepted
+// under, the state the row is in, and the stored body.
+//
+// Body is nil unless State is StatePending. A prepared row is delivered from the records it
+// stored and its body is never read again (architecture 3.2, step 7), so it is not fetched: a
+// row that halts once a minute waiting for an operator would otherwise read its whole webhook
+// body every time.
+type Work struct {
+	Provider string
+	State    string
+	Body     []byte
+}
+
+// Work reads what the claim needs, bound to the row's own tenant and as the application role.
+// The claim itself runs across tenants as lawang_worker, which is granted neither the body nor
+// the state, so this is the second transaction of architecture 3.2, step 2.
+func (o *Outbox) Work(ctx context.Context, c Claimed) (Work, error) {
+	var w Work
+	err := o.db.TenantTx(ctx, c.tenant, func(tx pgx.Tx) error {
+		row, err := outboxdb.New(tx).Work(ctx, c.id)
+		if err != nil {
+			return err
+		}
+		w = Work{Provider: row.Provider, State: row.State, Body: row.RawBody}
+		return nil
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return Work{}, ErrNotFound
+	case err != nil:
+		return Work{}, fmt.Errorf("outbox: work: %w", err)
+	}
+	return w, nil
+}
+
+// Release gives a claimed row back without working it, and gives the attempt back with it. It
+// is for a worker that is shutting down and will not reach the rows it claimed: another replica
+// takes them at once instead of waiting out the lease, and nothing is charged to the ladder for
+// an attempt that never happened.
+func (o *Outbox) Release(ctx context.Context, c Claimed) error {
 	return o.transition(ctx, c, func(tx pgx.Tx) error {
-		return held(outboxdb.New(tx).MarkPrepared(ctx, outboxdb.MarkPreparedParams{ID: c.id, LeaseToken: c.token}))
+		return held(outboxdb.New(tx).Release(ctx, outboxdb.ReleaseParams{ID: c.id, LeaseToken: c.token}))
 	})
 }
 
+// PreparedRecord is one record a delivery was prepared into: the record id a sink is idempotent
+// on, and the document that sink receives.
+//
+// The document is what record.Record.MarshalJSON wrote, with no wire name applied, because the
+// wire name is the sink's and two sinks may call one source two things (principle 4). It is
+// stored and not re-derived, because record_ledger holds what was PREPARED: a worker that
+// prepared a delivery and then died would skip every one of its own records on the next attempt
+// and deliver nothing. record.Reopen reads one back and refuses a document that does not hash to
+// the record id stored beside it.
+type PreparedRecord struct {
+	RecordID string
+	Document []byte
+}
+
+// PrepareIn stores the records a delivery was prepared into and moves the row to prepared, in
+// the caller's transaction, which must be bound to c.Tenant() (store.TenantTx) and is the same
+// transaction the caller wrote its ledger rows in. That is step 6 of architecture 3.2: the
+// ledger rows and the prepared records commit together, and after it a crash re-drains into
+// delivery and never prepares again.
+//
+// There is deliberately no variant that opens a transaction of its own. A row marked prepared
+// without the ledger rows beside it, or with ledger rows that did not commit with it, is a
+// delivery that can never be reconstructed, and this signature is what keeps the two together.
+//
+// It fails closed on a transaction bound to the wrong tenant without having to ask which tenant
+// that is: the state change is guarded by the lease and by the row being visible at all, so it
+// matches no row and reports ErrLeaseLost, and the insert would be refused by the table's policy.
+//
+// recs may be empty: a delivery whose every record the ledger already held is prepared with
+// nothing to deliver, and MarkDelivered finishes it like any other.
+func (o *Outbox) PrepareIn(ctx context.Context, tx pgx.Tx, c Claimed, recs []PreparedRecord) error {
+	if c.token == "" {
+		return ErrLeaseLost
+	}
+	q := outboxdb.New(tx)
+	// First, so that a worker whose lease was taken over is refused here and never reaches the
+	// insert, where it would meet the other worker's rows on the primary key instead.
+	if err := held(q.MarkPrepared(ctx, outboxdb.MarkPreparedParams{ID: c.id, LeaseToken: c.token})); err != nil {
+		return err
+	}
+	if len(recs) == 0 {
+		return nil
+	}
+	ids := make([]string, len(recs))
+	docs := make([][]byte, len(recs))
+	for i, r := range recs {
+		if r.RecordID == "" || !storable(r.RecordID) {
+			return errors.New("outbox: a prepared record needs a storable record id")
+		}
+		ids[i], docs[i] = r.RecordID, r.Document
+	}
+	if err := q.StorePreparedRecords(ctx, outboxdb.StorePreparedRecordsParams{
+		OutboxID: c.id, RecordIds: ids, Documents: docs,
+	}); err != nil {
+		return fmt.Errorf("outbox: store the prepared records: %w", err)
+	}
+	return nil
+}
+
+// PreparedRecords is what a claim of this row still has to deliver, in delivery order: the
+// records of the delivery that are neither delivered nor dead.
+//
+// A re-drain after a crash therefore offers exactly what is left, and never a record the sink
+// has already taken or one that is waiting for a replay. A row that was never prepared has none.
+func (o *Outbox) PreparedRecords(ctx context.Context, c Claimed) ([]PreparedRecord, error) {
+	var out []PreparedRecord
+	err := o.db.TenantTx(ctx, c.tenant, func(tx pgx.Tx) error {
+		rows, err := outboxdb.New(tx).PreparedRecords(ctx, c.id)
+		if err != nil {
+			return err
+		}
+		out = make([]PreparedRecord, len(rows))
+		for i, r := range rows {
+			out[i] = PreparedRecord{RecordID: r.RecordID, Document: r.Document}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("outbox: prepared records: %w", err)
+	}
+	return out, nil
+}
+
+// DeadRecord is one record of a delivery that did not get through, and why. It is the per-record
+// dead letter of architecture section 11: the rest of the batch still lands.
+type DeadRecord struct {
+	// RecordID must be one of the records this delivery still has to deliver. One that is not,
+	// or one named twice, is refused rather than ignored: see MarkDelivered.
+	RecordID string
+	// Cause is what is stored for it, under the same rule as the row's own: a class of this
+	// package, a status and a code, never text from the system that refused it.
+	Cause Cause
+}
+
+// ErrNoSuchRecord reports a DeadRecord that is not a record this delivery still has to deliver:
+// an id from another delivery, an id the sink invented, an id named twice, or one that has
+// already been delivered. Nothing is written.
+var ErrNoSuchRecord = errors.New("outbox: no such record waiting in this delivery")
+
 // MarkDelivered finishes the row, and makes the next version of its entity claimable.
-func (o *Outbox) MarkDelivered(ctx context.Context, c Claimed) error {
-	return o.transition(ctx, c, func(tx pgx.Tx) error { return markDeliveredIn(ctx, tx, c) })
+//
+// dead names the records of this delivery that did not get through, each with its own cause, and
+// every other record still waiting is marked delivered. That is the sink contract written into
+// the database: a sink's answer covers every record of the batch, the ones it names were refused
+// and the rest were taken, so the dead letters and the records that landed are recorded in one
+// transaction and neither is lost.
+//
+// A record named in dead that this delivery is not waiting on is ErrNoSuchRecord and nothing is
+// written, which also refuses one named twice. The caller checks the same thing first and treats
+// it as an unreadable answer (architecture section 11), because a sink that answers about
+// records it was not given has said nothing trustworthy about the ones it was. This is the
+// second line, so that no caller can write a dead letter against another delivery's record.
+func (o *Outbox) MarkDelivered(ctx context.Context, c Claimed, dead []DeadRecord) error {
+	return o.transition(ctx, c, func(tx pgx.Tx) error { return markDeliveredIn(ctx, tx, c, dead) })
 }
 
 // markDeliveredIn is MarkDelivered inside a transaction already bound to the row's tenant.
-func markDeliveredIn(ctx context.Context, tx pgx.Tx, c Claimed) error {
+//
+// The record statements run inside finishIn's callback, which is to say AFTER the ordering key's
+// advisory lock and not before it. Taking a row lock on outbox_record first would break the rule
+// that keeps this package deadlock free (the advisory lock comes before any row lock): Replay
+// takes the key's lock and then revives the same records, so a transition that locked those
+// records and then asked for the key would be the other half of a deadlock.
+func markDeliveredIn(ctx context.Context, tx pgx.Tx, c Claimed, dead []DeadRecord) error {
 	return finishIn(ctx, tx, c, func(q *outboxdb.Queries) (string, error) {
+		for _, d := range dead {
+			n, err := q.MarkRecordDead(ctx, outboxdb.MarkRecordDeadParams{
+				OutboxID: c.id, RecordID: d.RecordID,
+				DeadReason: reasonNotRetryable, LastError: clip(d.Cause.String()),
+			})
+			if err != nil {
+				return "", err
+			}
+			if n == 0 {
+				return "", fmt.Errorf("%w: %s", ErrNoSuchRecord, d.RecordID)
+			}
+		}
+		// After the refusals, so that what is left is exactly what the sink took.
+		if err := q.MarkRecordsDelivered(ctx, c.id); err != nil {
+			return "", err
+		}
 		return q.MarkDelivered(ctx, outboxdb.MarkDeliveredParams{ID: c.id, LeaseToken: c.token})
+	})
+}
+
+// Halt records a failure the retry ladder must not walk, and leaves the row where it is: still
+// prepared or still pending, still the head of its key, claimable again after pause.
+//
+// It is the answer to everything that trying again at once cannot fix and that must still never
+// destroy a record: the sink refusing the request itself rather than anything in it
+// (sink.ActionHalt, architecture section 11, where the row "stays prepared, nothing is marked
+// delivered and no record is dead-lettered"), a tenant whose sink cannot be built, and a sink
+// that answered in a way its contract does not allow. An operator changes a credential, a
+// number, an endpoint or a receiver, and the next claim after that delivers.
+//
+// The attempt is given back (attempts goes down by one), so a halting sink walks no ladder and
+// trips no abandonment however long it halts. Nothing else about the row changes, so the later
+// versions of its entity wait behind it rather than passing an undelivered one.
+func (o *Outbox) Halt(ctx context.Context, c Claimed, pause time.Duration, cause Cause) error {
+	if pause <= 0 {
+		return errors.New("outbox: halt needs a positive pause")
+	}
+	return o.transition(ctx, c, func(tx pgx.Tx) error {
+		return held(outboxdb.New(tx).Halt(ctx, outboxdb.HaltParams{
+			ID: c.id, LeaseToken: c.token, PauseSeconds: pause.Seconds(), LastError: clip(cause.String()),
+		}))
 	})
 }
 
@@ -452,6 +646,7 @@ func finishIn(ctx context.Context, tx pgx.Tx, c Claimed, finish func(*outboxdb.Q
 const (
 	reasonRetriesExhausted = "retries exhausted"
 	reasonNotRetryable     = "not retryable"
+	reasonAbandoned        = "attempts exhausted without a recorded failure"
 )
 
 // Fail handles a retryable failure: it schedules the next attempt from the ladder, or parks the
@@ -476,6 +671,21 @@ func (o *Outbox) MarkDead(ctx context.Context, c Claimed, cause Cause) error {
 	return o.markDead(ctx, c, reasonNotRetryable, cause)
 }
 
+// MarkAbandoned parks a row that has been claimed more often than the ladder can account for,
+// without a single attempt having reported what went wrong.
+//
+// attempts is incremented by the claim and read by nothing but Fail, so a row whose worker dies
+// or hangs on every attempt never reaches Fail at all: its lease simply runs out, another worker
+// takes it over, and it holds every later version of its entity behind it forever. The drain
+// therefore asks Ladder.Exhausted at claim time, before any work is done on the row, and parks
+// one that is past the end of the ladder here. The next version of its entity is then claimable.
+//
+// The dead letter says exactly that and no more, because nothing recorded why: the reason is
+// "attempts exhausted without a recorded failure" and the cause is ClassWorkerLost.
+func (o *Outbox) MarkAbandoned(ctx context.Context, c Claimed) error {
+	return o.markDead(ctx, c, reasonAbandoned, NewCause(ClassWorkerLost))
+}
+
 func (o *Outbox) markDead(ctx context.Context, c Claimed, reason string, cause Cause) error {
 	return o.transition(ctx, c, func(tx pgx.Tx) error {
 		return finishIn(ctx, tx, c, func(q *outboxdb.Queries) (string, error) {
@@ -490,6 +700,19 @@ func (o *Outbox) markDead(ctx context.Context, c Claimed, reason string, cause C
 // may be in flight right now, and the replayed row must not be leased alongside it. It is
 // delivered after every version accepted before the replay, as a late arrival of an old version.
 // A row that died after it was prepared comes back prepared, and is not prepared again.
+//
+// It replays both kinds of dead letter, which is what makes the per-record one replayable at
+// all:
+//
+//   - A dead ROW: the delivery itself failed, and every record it had prepared is still waiting,
+//     so the whole delivery goes again.
+//   - The dead RECORDS of a DELIVERED row: the sink refused some records of a batch and took the
+//     rest, so the row finished as delivered. Those records come back and the row with them, and
+//     the next drain offers exactly them. The records that landed stay delivered and are not
+//     sent a second time.
+//
+// A delivered row with no dead record is ErrNotFound: there is nothing left to offer, and making
+// a finished delivery claimable again would deliver it for nothing.
 func (o *Outbox) Replay(ctx context.Context, tenant tenancy.ID, id string) error {
 	if !storable(id) {
 		return ErrNotFound // as in Get
@@ -502,7 +725,12 @@ func (o *Outbox) Replay(ctx context.Context, tenant tenancy.ID, id string) error
 		if err := q.LockOrderingKeyOf(ctx, id); err != nil {
 			return err
 		}
-		n, err = q.Replay(ctx, id)
+		if n, err = q.Replay(ctx, id); err != nil || n == 0 {
+			return err
+		}
+		// After the row, because the row's own statement is what decides whether there is
+		// anything to replay, and it asks whether a record of it is dead.
+		_, err = q.ReviveDeadRecords(ctx, id)
 		return err
 	})
 	if err != nil {

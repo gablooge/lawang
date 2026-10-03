@@ -164,7 +164,7 @@ func TestStressOrderingUnderRandomLoad(t *testing.T) {
 						err = e.ob.MarkDead(ctx, c, badShape)
 						toReplay <- dead{c.Tenant(), c.ID()}
 					} else {
-						err = e.ob.MarkDelivered(ctx, c)
+						err = e.ob.MarkDelivered(ctx, c, nil)
 						delivered.Add(1)
 					}
 					if err != nil && running() {

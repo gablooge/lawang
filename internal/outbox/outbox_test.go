@@ -115,6 +115,23 @@ func (e *env) claimNone(why string) {
 	}
 }
 
+// prepare is PrepareIn in a transaction of its own, which is what a caller with nothing else to
+// commit would write. The worker's own transaction also holds the ledger rows of the same
+// delivery, which is why PrepareIn takes the transaction and does not open one.
+//
+// ctx is a parameter because one test prepares under a cancelled context.
+func (e *env) prepare(ctx context.Context, c outbox.Claimed, recs ...outbox.PreparedRecord) error {
+	e.t.Helper()
+	return e.db.TenantTx(ctx, c.Tenant(), func(tx pgx.Tx) error {
+		return e.ob.PrepareIn(ctx, tx, c, recs)
+	})
+}
+
+// doc is a stand-in for a record document: this package never looks inside one.
+func doc(recordID string) outbox.PreparedRecord {
+	return outbox.PreparedRecord{RecordID: recordID, Document: []byte(`{"id":"` + recordID + `"}`)}
+}
+
 // admin changes rows behind the application's back, to move time along.
 func (e *env) admin(sql string) { testdb.Exec(e.t, e.tdb.AdminURL, sql) }
 
@@ -253,16 +270,16 @@ func TestSecondVersionIsNotClaimableWhileTheFirstIsInFlight(t *testing.T) {
 	c1 := e.claimOne(v1)
 	e.claimNone("v1 is leased, so v2 must wait behind it")
 
-	if err := e.ob.MarkPrepared(e.ctx, c1); err != nil {
+	if err := e.prepare(e.ctx, c1); err != nil {
 		t.Fatal(err)
 	}
 	e.claimNone("v1 is prepared but not delivered, so v2 must still wait")
 
-	if err := e.ob.MarkDelivered(e.ctx, c1); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c1, nil); err != nil {
 		t.Fatal(err)
 	}
 	c2 := e.claimOne(v2)
-	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c2, nil); err != nil {
 		t.Fatal(err)
 	}
 	e.claimNone("everything is delivered")
@@ -309,7 +326,7 @@ func TestRetryKeepsThePreparedState(t *testing.T) {
 	e := setup(t)
 	v1 := e.accept(tenantA, "task:1", 1)
 	c := e.claimOne(v1)
-	if err := e.ob.MarkPrepared(e.ctx, c); err != nil {
+	if err := e.prepare(e.ctx, c); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.ob.Fail(e.ctx, c, outbox.Ladder{time.Hour}, sinkTimeout); err != nil {
@@ -339,7 +356,7 @@ func TestExhaustedLadderParksTheRowAndReplayRevivesIt(t *testing.T) {
 
 	// A dead letter does not hold its entity hostage.
 	c2 := e.claimOne(v2)
-	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c2, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -373,8 +390,8 @@ func TestAnExpiredLeaseIsTakenOverAndTheOldHolderIsShutOut(t *testing.T) {
 
 	// The first worker was only slow, not dead, and now comes back.
 	for name, err := range map[string]error{
-		"MarkPrepared":  e.ob.MarkPrepared(e.ctx, crashed),
-		"MarkDelivered": e.ob.MarkDelivered(e.ctx, crashed),
+		"MarkPrepared":  e.prepare(e.ctx, crashed),
+		"MarkDelivered": e.ob.MarkDelivered(e.ctx, crashed, nil),
 		"Fail":          e.ob.Fail(e.ctx, crashed, outbox.DefaultLadder, sink503),
 		"MarkDead":      e.ob.MarkDead(e.ctx, crashed, badShape),
 	} {
@@ -382,13 +399,13 @@ func TestAnExpiredLeaseIsTakenOverAndTheOldHolderIsShutOut(t *testing.T) {
 			t.Errorf("%s by the old holder: err = %v, want ErrLeaseLost", name, err)
 		}
 	}
-	if err := e.ob.MarkDelivered(e.ctx, takeover); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, takeover, nil); err != nil {
 		t.Errorf("the current holder: %v", err)
 	}
-	if err := e.ob.MarkDelivered(e.ctx, takeover); !errors.Is(err, outbox.ErrLeaseLost) {
+	if err := e.ob.MarkDelivered(e.ctx, takeover, nil); !errors.Is(err, outbox.ErrLeaseLost) {
 		t.Errorf("delivering twice: err = %v, want ErrLeaseLost", err)
 	}
-	if err := e.ob.MarkDelivered(e.ctx, outbox.Claimed{}); !errors.Is(err, outbox.ErrLeaseLost) {
+	if err := e.ob.MarkDelivered(e.ctx, outbox.Claimed{}, nil); !errors.Is(err, outbox.ErrLeaseLost) {
 		t.Errorf("a Claimed that never came from Claim: err = %v, want ErrLeaseLost", err)
 	}
 }
@@ -420,8 +437,8 @@ func TestAClaimedAimedAtAnotherTenantChangesNothing(t *testing.T) {
 
 	swapped := outbox.WithTenant(genuine, tenantB)
 	for name, err := range map[string]error{
-		"MarkPrepared":  e.ob.MarkPrepared(e.ctx, swapped),
-		"MarkDelivered": e.ob.MarkDelivered(e.ctx, swapped),
+		"MarkPrepared":  e.prepare(e.ctx, swapped),
+		"MarkDelivered": e.ob.MarkDelivered(e.ctx, swapped, nil),
 		"Fail":          e.ob.Fail(e.ctx, swapped, outbox.Ladder{time.Hour}, sink503),
 		"MarkDead":      e.ob.MarkDead(e.ctx, swapped, badShape),
 	} {
@@ -440,7 +457,7 @@ func TestAClaimedAimedAtAnotherTenantChangesNothing(t *testing.T) {
 		t.Errorf("tenant B's own row = state %q, lease %v, err %v, want pending and still leased", row.State, row.LeaseUntil, err)
 	}
 	// The lease itself is untouched: its real holder still finishes the row.
-	if err := e.ob.MarkDelivered(e.ctx, genuine); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, genuine, nil); err != nil {
 		t.Errorf("the genuine holder afterwards: %v", err)
 	}
 }
@@ -479,8 +496,8 @@ func TestAnErrorIsNotALostLease(t *testing.T) {
 	}
 
 	for name, err := range map[string]error{
-		"MarkPrepared":  e.ob.MarkPrepared(cancelled, c),
-		"MarkDelivered": e.ob.MarkDelivered(cancelled, c),
+		"MarkPrepared":  e.prepare(cancelled, c),
+		"MarkDelivered": e.ob.MarkDelivered(cancelled, c, nil),
 		"Fail":          e.ob.Fail(cancelled, c, outbox.Ladder{time.Hour}, sink503),
 		"Fail to dead":  e.ob.Fail(cancelled, c, outbox.Ladder{}, sink503),
 		"MarkDead":      e.ob.MarkDead(cancelled, c, badShape),
@@ -499,7 +516,7 @@ func TestAnErrorIsNotALostLease(t *testing.T) {
 	if !reflect.DeepEqual(before, after) {
 		t.Errorf("the row changed:\nbefore %+v\nafter  %+v", before, after)
 	}
-	if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c, nil); err != nil {
 		t.Errorf("the same lease, once the context is good again: %v", err)
 	}
 
@@ -688,7 +705,7 @@ func TestStrandedKeysFindsAKeyWithWorkAndNoHead(t *testing.T) {
 		var err error
 		switch c.ID() {
 		case done:
-			err = e.ob.MarkDelivered(e.ctx, c)
+			err = e.ob.MarkDelivered(e.ctx, c, nil)
 		case dead:
 			err = e.ob.MarkDead(e.ctx, c, badShape)
 		case backoff:
@@ -757,7 +774,7 @@ func TestStrandedKeysFindsAKeyWithWorkAndNoHead(t *testing.T) {
 	var claimed []string
 	for _, c := range e.claim() {
 		if c.ID() == first["lost:a"] {
-			if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
+			if err := e.ob.MarkDelivered(e.ctx, c, nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -938,7 +955,7 @@ func TestConcurrentWorkersDeliverEachEntityInOrder(t *testing.T) {
 					delete(inFlight, key)
 					delivered++
 					mu.Unlock()
-					if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
+					if err := e.ob.MarkDelivered(e.ctx, c, nil); err != nil {
 						t.Errorf("MarkDelivered: %v", err)
 						return
 					}
@@ -987,7 +1004,7 @@ func TestReplayNeverOvertakesAVersionInFlight(t *testing.T) {
 		t.Errorf("replayed v1 has seq %d, v2 has %d: a replay must go to the back of its queue", first.Seq, second.Seq)
 	}
 
-	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c2, nil); err != nil {
 		t.Fatal(err)
 	}
 	e.claimOne(v1)
@@ -997,7 +1014,7 @@ func TestReplayRestoresThePreparedState(t *testing.T) {
 	e := setup(t)
 	v1 := e.accept(tenantA, "task:1", 1)
 	c := e.claimOne(v1)
-	if err := e.ob.MarkPrepared(e.ctx, c); err != nil {
+	if err := e.prepare(e.ctx, c); err != nil {
 		t.Fatal(err)
 	}
 	// The sink stays down until the ladder is used up: the commonest dead letter there is.
@@ -1015,10 +1032,10 @@ func TestReplayRestoresThePreparedState(t *testing.T) {
 		t.Errorf("state after replaying a row that died prepared = %q, want prepared (it must not prepare twice)", row.State)
 	}
 	c = e.claimOne(v1)
-	if err := e.ob.MarkPrepared(e.ctx, c); !errors.Is(err, outbox.ErrLeaseLost) {
+	if err := e.prepare(e.ctx, c); !errors.Is(err, outbox.ErrLeaseLost) {
 		t.Errorf("preparing the replayed row again: err = %v, want ErrLeaseLost", err)
 	}
-	if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c, nil); err != nil {
 		t.Error(err)
 	}
 }

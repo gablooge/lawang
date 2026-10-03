@@ -733,12 +733,19 @@ func TestEveryPolicySaysWhatTheDesignSaysItSays(t *testing.T) {
 	const (
 		byTenantID = "((tenant_id)::text = current_tenant())"
 		byID       = "((id)::text = current_tenant())"
+		// outbox_record carries no tenant of its own, on purpose (ADR 14): a second copy of the
+		// tenant is a second thing that can disagree with the delivery's own row, and a record
+		// row written under the wrong tenant would be invisible to the tenant whose drain then
+		// delivers a batch with a record missing from it. So its policy asks the delivery.
+		byDelivery = "(EXISTS ( SELECT 1\n   FROM outbox o\n" +
+			"  WHERE ((o.id = outbox_record.outbox_id) AND ((o.tenant_id)::text = current_tenant()))))"
 	)
 	want := map[string]policy{
 		"tenants/tenant_isolation":       {"*", "public", byID, byID, "a tenant sees its own row (migration 00001)"},
 		"outbox/tenant_isolation":        {"*", "public", byTenantID, byTenantID, "migration 00002"},
 		"outbox/worker_claim_select":     {"r", "lawang_worker", "true", "", "the worker claims across tenants, which is its whole job (migration 00002)"},
 		"outbox/worker_claim_update":     {"w", "lawang_worker", "true", "true", "attempts, lease_until and lease_token (migration 00002)"},
+		"outbox_record/tenant_isolation": {"*", "public", byDelivery, byDelivery, "the records of a delivery belong to the delivery's tenant and to nobody else (migration 00005, ADR 14)"},
 		"subscriptions/tenant_isolation": {"*", "public", byTenantID, byTenantID, "migration 00003"},
 		"subscriptions/resolver_read":    {"r", "lawang_resolver", "true", "", "deriving the tenant is the resolver's whole job (migration 00003)"},
 		"record_ledger/tenant_isolation": {"*", "public", byTenantID, byTenantID, "the supersede chain is per tenant (migration 00004)"},

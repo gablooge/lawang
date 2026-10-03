@@ -39,6 +39,12 @@ const (
 	ClassVaultUnavailable
 	// ClassInternal: a failure of Lawang's own, such as its database.
 	ClassInternal
+	// ClassWorkerLost: nothing reported what happened to this row. Every attempt on it was
+	// claimed and none of them came back, so its lease ran out again and again while it held
+	// every later version of its entity behind it. It is the one failure with no facts to it:
+	// a worker that dies or hangs writes nothing, which is why the class exists instead of a
+	// status or a code.
+	ClassWorkerLost
 )
 
 var classText = map[Class]string{
@@ -52,6 +58,7 @@ var classText = map[Class]string{
 	ClassSinkUnreadable:      "the sink's answer could not be read",
 	ClassVaultUnavailable:    "vault unavailable",
 	ClassInternal:            "internal error",
+	ClassWorkerLost:          "no attempt on this row reported an outcome",
 }
 
 // maxCodeLen bounds a provider's or sink's error code.
