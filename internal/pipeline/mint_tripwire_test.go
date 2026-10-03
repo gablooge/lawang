@@ -240,9 +240,12 @@ func packageFiles(t *testing.T) []srcFile {
 	return files
 }
 
-// mintFindings parses the files and returns everything about them that would let a placeholder be
-// a function of the value it stands for, each as one sentence. An empty result is the invariant
-// holding.
+// mintFindings parses the files and returns one sentence for each thing it looks for and finds: a
+// mint that is missing, that has the wrong signature, or whose body reaches outside itself or
+// never calls ids.NewUnpredictable; a call of the mint that computes its argument; a forbidden
+// import, a dot import or a go:linkname; a .Value read that is not on valueReadsAllowed; an
+// internal/ids reference count other than one; a secretKind that is no longer a plain string; and
+// a file that does not parse.
 func mintFindings(files []srcFile) []string {
 	fset := token.NewFileSet()
 	var findings []string
