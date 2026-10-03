@@ -20,9 +20,11 @@ clean, permission-stamped record delivered exactly once to your memory, search, 
 > noise, checks every record against the tenant of the row being drained, keeps the supersede chain
 > forward only (under the version spelling each provider declares, refusing what it cannot order
 > rather than guessing), and masks addresses, telephone numbers and bank accounts with the map from
-> placeholder to value kept locally. **No provider is
+> placeholder to value kept locally. The three sinks are built as well: `http`, a strict `stub`
+> that refuses whatever the format refuses and remembers what it holds, and `jsonl` files for
+> development. **No provider is
 > registered yet**, so every `/ingress/{provider}` segment is a 404 until ClickUp lands, and
-> nothing drains the outbox: the worker and the sinks are the next items. The design
+> nothing drains the outbox: the worker is the next item. The design
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in
 > [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the

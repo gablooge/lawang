@@ -25,6 +25,16 @@ const (
 	ClassSinkRejected
 	// ClassSinkUnauthorized: the sink refused the credential (401) or lacks a grant (403).
 	ClassSinkUnauthorized
+	// ClassSinkRefused: the sink refused the request itself rather than anything in it, by a
+	// status that is a verdict on the request message: its size (413), its URL (414), its
+	// media type (415) or its protocol version (400, 426). It says nothing about any record,
+	// so nothing is marked delivered and nothing is dead-lettered; an operator changes a
+	// number or a receiver, and the batch goes again.
+	ClassSinkRefused
+	// ClassSinkUnreadable: the sink answered, and the answer did not say what it did with the
+	// batch. Nothing is marked delivered and the batch is sent again, because a sink that is
+	// idempotent on the record id loses nothing by a repeat and a guess here loses a record.
+	ClassSinkUnreadable
 	// ClassVaultUnavailable: a secret could not be read, so nothing may be delivered.
 	ClassVaultUnavailable
 	// ClassInternal: a failure of Lawang's own, such as its database.
@@ -38,6 +48,8 @@ var classText = map[Class]string{
 	ClassSinkUnavailable:     "sink unavailable",
 	ClassSinkRejected:        "sink rejected the record",
 	ClassSinkUnauthorized:    "sink refused the credential",
+	ClassSinkRefused:         "sink refused the request",
+	ClassSinkUnreadable:      "the sink's answer could not be read",
 	ClassVaultUnavailable:    "vault unavailable",
 	ClassInternal:            "internal error",
 }

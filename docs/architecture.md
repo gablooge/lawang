@@ -894,6 +894,121 @@ Built-in implementations planned for v0.1:
 | Identity | email join (normalized, domain-restricted); replaceable |
 | Masking | conservative regex baseline (emails, phone numbers, IBANs) in `internal/pipeline`, with the map from placeholder to value kept in `redaction_map` and never sent anywhere ([ADR 12](adr/0012-ledger-supersede-masking.md)); replaceable |
 
+### The three sinks (B09, `internal/sink`)
+
+All three marshal through `record.Record.MarshalJSON`, which validates the record and checks its
+seal, and all three apply the **wire name**: `sink.Names` maps an internal provider key to what
+this sink's receiver calls that source, and it replaces `source` alone. The scope id keeps the
+internal provider key in its first segment, because that is the join key with the membership
+message ([ADR 3](adr/0003-scope-id-format.md)), and so does the prefix of `external_id`, so
+`source` and the scope's first segment need not match.
+
+`Deliver` answers in one of exactly two ways, and nothing else. Either a `DeliveryResult`, which
+covers every record of the batch: the ones in `Rejected` were refused and dead-letter one by one,
+and every other record was taken. Or a `*sink.Fault`, with the zero `DeliveryResult`: nothing in
+the batch counts as delivered and the whole batch goes again, at once on `retry` and after an
+operator has fixed the credential on `halt`. The repeat costs nothing, because a sink is
+idempotent on the record id.
+
+So **a `Fault` is about the delivery and never about a record**, and a record's own fate is only
+ever a `Rejection`. There are therefore two actions and not three: a sink never asks the worker to
+kill a row, which is what keeps a batch that is sent in several requests honest. A receiver that
+refuses one request has said something about the records in that request and nothing about the
+records in the others, so each of those records comes back as a `Rejection` and the rest of the
+batch is still offered. Before this, a refusal of the second of three requests dead-lettered the
+whole batch: the records that had already landed, and the records the receiver was never offered.
+
+A `Fault` carries the `Action` for the worker, the `outbox.Cause` that goes into the outbox, and
+a `Detail` that is one of the package's own phrases. It wraps nothing: the error of `net/http` is
+a `*url.Error` whose text quotes the request URL, and a sink URL's query string is where many
+receivers carry their API key.
+
+**`http`** posts records to a configured endpoint. This is the **frozen wire protocol** of v1,
+written for a receiver author; [ADR 13](adr/0013-sink-wire-protocol.md) records the decision
+behind the two strict parts of it and what they cost.
+
+*The request.* `POST` to the endpoint, with `Content-Type: application/json`,
+`Accept: application/json`, the tenant's bearer token in an `Authorization` header, and a body of
+
+```json
+{"v":1,"records":[<record document>, ...]}
+```
+
+`v` is the version of this protocol. The tenant is in no field: at a sink it is established by
+the per-tenant credential ([section 4](#4-trust-model)), and a tenant with no credential is a
+refusal, not a default. The sink sends at most `MaxRequestBytes` (8 MiB by default) in one
+request and splits a batch into as many requests as that takes.
+
+*The answer, on a 2xx.* The batch landed. An empty body, whitespace, or `{}` means every record
+was taken. Any other body **must** be a JSON object carrying a `rejected` member, spelled exactly
+that way, **whose value is a JSON list**:
+
+```json
+{"rejected":[{"id":"rec_...","code":"..."}]}
+```
+
+Anything else is **unreadable**: a body that does not parse, a body that is not a JSON object, a
+body that is a JSON object with members but none of them `rejected`, a `rejected` that is not a
+list, an id that was not in the request, and an id named twice. Unreadable means nothing is
+marked delivered and the batch is sent again. The cost is deliberate: a receiver that answers
+200 with its own bookkeeping and no `rejected` member fails loudly rather than having its
+refused records silently marked delivered. The sink reads at most 64 KiB of an answer, one byte
+more than the limit so that it can tell a complete answer from one it cut short.
+
+**`{"rejected":null}` is unreadable.** `null` is not a list. A receiver that refused nothing
+answers with no body, or with `[]`. This is spelled out because a serializer that writes an
+absent list as `null` is ordinary, and reading it as an empty list would mark a whole batch
+delivered on an answer the sink did not understand.
+
+*The answer, on anything else.* Three bands, and the first two are faults about the delivery, so
+nothing in the batch counts as delivered and the whole batch goes again:
+
+- **halt**, a verdict on the request and not on anything in it: the credential (401, 403), and
+  **every other 4xx outside the two bands below, which is the default**. An operator changes a
+  credential, a number, an endpoint or a receiver; the ladder would only send the same request
+  again. Nothing is killed.
+- **retry**: 408, 429 and everything that is not a 4xx.
+- **a refusal of the records of that one request**: **422 alone**, the one status HTTP defines
+  as a verdict on the content of the request rather than on the request message. Each record in
+  that request comes back as a `Rejection` carrying the status and the receiver's code, and the
+  records of the other requests are still offered.
+
+**A receiver that wants to refuse one record answers 2xx with a `rejected` list, and that is the
+only way.** A 422 kills every record of the request it answered, and which records share a
+request is decided by the sender's byte arithmetic and not by the receiver. Any other 4xx halts
+and kills nothing: a receiver that refuses records with a bare 404 or 409 stops that tenant's
+deliveries until an operator looks, which is the fail-closed trade
+[ADR 13](adr/0013-sink-wire-protocol.md) records, in place of destroying the tenant's records
+quietly. **A receiver that does not speak `v` answers 426** (400 is read the same way), which
+halts and kills nothing: a version no record caused must not dead-letter any record.
+
+*What the sink requires of its caller.* Every record of a batch must be sealed for the tenant it
+is delivered under. The tenant is in no field of the envelope, so a record sealed for another
+tenant marshals to the same bytes and would go out under this tenant's credential. Each
+`Deliver` checks it with `record.SealedFor` rather than trusting the caller, and reports a
+record that fails as a `Rejection` with the internal code `wrong_tenant`, without sending,
+writing or storing it. `internal/pipeline` checks it too, where a batch is built.
+
+Redirects are not followed, so a receiver cannot send the next request, with its credential,
+somewhere else.
+
+**`stub`** is the strict test double of principle 5. It decodes every document with
+`internal/record`'s strict decoder, which the agreement tests hold equal to the schema, and adds
+what a receiver has that a validator does not: it refuses a record id it already holds whose
+content differs, comparing the documents without `meta`, which is not part of a record's content.
+That is the check ADR 4 decision 7's promise to a sink rests on, that one id never appears with
+two scopes. It also bounds a document before the decoder sees it (8 MiB by default), because
+nothing in the format bounds one once unknown fields are counted, and it walks the `supersedes`
+chain with a visited set, because a cycle across records is invisible to anything that validates
+one record at a time.
+
+**`jsonl`** appends one document per line to `<tenant>.jsonl` under a configured directory, owner
+only: it creates the directory 0700 with the files 0600, and refuses at start-up a directory
+that is already there with a wider mode, because the listing names one file per tenant and a
+group-writable one lets another user put a symbolic link where a tenant's file goes. The tenant
+is the file. The file is a log: a record delivered twice is written twice, and a
+reader folds it by `id`, taking the last line for an id.
+
 ---
 
 ## 8. Package layout
@@ -1007,9 +1122,13 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | A resolved delivery that can never be stored (an ordering key the table refuses) | unstorable | parked as poison, answered 2xx, so the provider does not retry what cannot work |
 | Hydration fails | degradable | deliver a minimal record, the change is still tracked |
 | Normalizer fails | non-retryable | dead-letter with the reason; fix and replay |
-| Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands |
-| Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered; ops is alerted |
-| Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; replay is always safe |
+| Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands. A sink reports it as a `Rejection` and never as a whole-batch action, so a record is never killed without having been offered |
+| Sink rejects a whole request of a batch that was split across several (**422**, the whole refusal band) | non-retryable | each record of that request dead-letters as its own `Rejection`; the other requests of the batch are still sent and keep their own outcome |
+| Sink refuses the request itself rather than anything in it: **every 4xx that is not 401, 403, 408, 422 or 429**, which is the default for a status this sink does not recognise | halt | the row stays prepared, nothing is marked delivered and **no record is dead-lettered**: none of these says anything about a record, and an operator changes a credential, a number (`MaxRequestBytes`), the endpoint or the receiver; ops is alerted. Dead-lettering them killed every record of every chunk of every batch on that endpoint, permanently, with `last_error` reading "sink rejected the record (status NNN)", so an endpoint typo (404) or a large bearer token behind a small header buffer (431) destroyed a tenant's records quietly ([ADR 13](adr/0013-sink-wire-protocol.md)) |
+| Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered, including anything an earlier request of the same batch landed, so the whole batch is sent again once an operator has fixed it; ops is alerted |
+| A record in a batch is not sealed for the tenant it is being delivered under | non-retryable | that record dead-letters as its own `Rejection` with `internal error (code wrong_tenant)` and is not sent, written or stored; the rest of the batch goes. Both `internal/pipeline` and every `Deliver` check it, because the tenant is in no field of the envelope and nothing downstream can see the mistake |
+| Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; nothing is marked delivered, including anything an earlier request of the same batch landed, and replay is always safe because a sink is idempotent on the record id |
+| Sink answers 2xx and does not say what it did with the batch (the answer does not parse, is not a JSON object, carries members but none of them `rejected`, has a `rejected` that is not a list including `null`, or names a record that was not sent or names one twice) | retryable | nothing is marked delivered and the whole batch is sent again: a sink that is idempotent on the record id loses nothing by a repeat, and a guess here loses a record |
 | Vault unreachable | fail closed | retry on the ladder; nothing is delivered unverified |
 | Accept path out of time (a saturated pool, a slow database) | retryable | 503 with a `Retry-After`, nothing stored |
 
@@ -1029,5 +1148,5 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Crypto | standard library `crypto/hmac`, `crypto/aes`, `crypto/cipher` |
 | Metrics | `github.com/prometheus/client_golang` |
 | Tests | standard `testing`, `testcontainers-go` for Postgres |
-| JSON Schema validation | `github.com/santhosh-tekuri/jsonschema/v6`, in tests only: pure Go, draft 2020-12, asserts formats on request, and the one module it builds with (`golang.org/x/text`) was already in the module graph. The `lawang` binary does not link it. Production code validates with `record.Validate`, which the tests hold equal to the schema. It becomes a runtime dependency only if the strict stub sink (B09) validates with the schema itself |
+| JSON Schema validation | `github.com/santhosh-tekuri/jsonschema/v6`, in tests only: pure Go, draft 2020-12, asserts formats on request, and the one module it builds with (`golang.org/x/text`) was already in the module graph. The `lawang` binary does not link it. Production code validates with `record.Validate`, which the tests hold equal to the schema. It stays test-only: the strict stub sink of B09 decodes with `internal/record`'s strict decoder instead of compiling the schema, which also gives it the three rules no schema can state |
 | MCP (later) | `github.com/modelcontextprotocol/go-sdk` |

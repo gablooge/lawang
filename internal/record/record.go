@@ -186,11 +186,19 @@ func (r Record) currentSeal() seal {
 }
 
 // SealedFor reports whether Seal minted this record's ID for tenant, and the record still says
-// what was sealed. It is for the one place where a tenant and a record meet again after Seal: the
-// stage that writes the ledger and hands records to Sink.Deliver. The tenant is in no field of
-// the envelope, so a record sealed for tenant A marshals exactly the same when it is delivered
-// under tenant B, and neither MarshalJSON nor any sink can notice. That stage can: it calls
-// SealedFor with the tenant it is about to deliver under, and treats false as a refusal.
+// what was sealed. It is for every place where a tenant and a record meet again after Seal. The
+// tenant is in no field of the envelope, so a record sealed for tenant A marshals exactly the
+// same when it is delivered under tenant B, and MarshalJSON cannot notice: it checks that the
+// seal is intact and never whose it is. SealedFor is the only thing in the program that can see
+// the difference, so a caller holding a tenant calls it with the tenant it is about to act
+// under and treats false as a refusal.
+//
+// There is deliberately more than one such caller, and none of them is redundant.
+// internal/pipeline asks before it writes the ledger row, which is where a mistake would first
+// be recorded, and every internal/sink implementation asks again before the record is
+// marshalled, which is where the bytes would go out under another tenant's bearer token, into a
+// file named after another tenant, or into another tenant's store. Do not remove one because
+// another exists.
 //
 // A consequence to know about: a sealed Record and the same record decoded from its own document
 // are not equal under == or reflect.DeepEqual, because only the sealed one knows its tenant,
