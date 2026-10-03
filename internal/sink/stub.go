@@ -116,7 +116,7 @@ func (s *Stub) Deliver(_ context.Context, t tenancy.ID, recs []record.Record) (D
 		if err != nil {
 			result.Rejected = append(result.Rejected, Rejection{
 				ID:     r.ID,
-				Cause:  outbox.NewCause(outbox.ClassInternal),
+				Cause:  outbox.NewCause(outbox.ClassInternal).WithCode(codeInvalidRecord),
 				Detail: detailInvalidRecord,
 			})
 			continue

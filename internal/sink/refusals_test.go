@@ -45,7 +45,9 @@ func TestARecordTheFormatRefusesIsOneRejection(t *testing.T) {
 		if len(result.Rejected) != 1 {
 			t.Fatalf("%s: rejected %+v, want one", name, result.Rejected)
 		}
-		if want := "internal error"; result.Rejected[0].Cause.String() != want {
+		// The code is what an operator reading last_error or dead_reason has to go on,
+		// because a Detail is for a log line and is not stored.
+		if want := "internal error (code invalid_record)"; result.Rejected[0].Cause.String() != want {
 			t.Errorf("%s: cause %q, want %q", name, result.Rejected[0].Cause.String(), want)
 		}
 		if result.Rejected[0].Detail != "the record does not pass the format" {

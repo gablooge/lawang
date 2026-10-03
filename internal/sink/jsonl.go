@@ -15,8 +15,9 @@ import (
 	"github.com/gablooge/lawang/internal/tenancy"
 )
 
-// File modes for the JSONL sink. A record holds a title, a text and an author, so the directory
-// and the files are the owner's alone.
+// File modes for the JSONL sink. A record holds a title, a text and an author, so the files are
+// the owner's alone, and so is the directory: NewJSONL creates it with this mode and refuses one
+// that is already there with a wider one.
 const (
 	jsonlDirMode  os.FileMode = 0o700
 	jsonlFileMode os.FileMode = 0o600
@@ -66,6 +67,20 @@ func NewJSONL(cfg JSONLConfig) (*JSONL, error) {
 	if err := os.MkdirAll(cfg.Dir, jsonlDirMode); err != nil {
 		return nil, fmt.Errorf("sink: jsonl: %w", err)
 	}
+	// MkdirAll applies jsonlDirMode to a directory it creates and changes nothing about one
+	// that is already there, so "owner only" has to be checked and not assumed. A directory
+	// anyone may read lists one file per tenant, named after the tenant; one anyone may write
+	// lets another user put a symbolic link where a tenant's file goes, and O_APPEND|O_CREATE
+	// follows it. Either is a refusal at start-up, the way a missing credential is.
+	info, err := os.Stat(cfg.Dir)
+	if err != nil {
+		// MkdirAll has just answered for this path, so this is the branch for a directory
+		// that went away in between. No test reaches it.
+		return nil, fmt.Errorf("sink: jsonl: %w", err)
+	}
+	if perm := info.Mode().Perm(); perm&^jsonlDirMode != 0 {
+		return nil, fmt.Errorf("sink: jsonl: the directory is mode %#o, and this sink writes a tenant's records only to a directory that is the owner's alone (%#o)", perm, jsonlDirMode)
+	}
 	return &JSONL{dir: cfg.Dir, names: cfg.Names}, nil
 }
 
@@ -90,7 +105,7 @@ func (j *JSONL) Deliver(ctx context.Context, t tenancy.ID, recs []record.Record)
 		if err != nil {
 			result.Rejected = append(result.Rejected, Rejection{
 				ID:     r.ID,
-				Cause:  outbox.NewCause(outbox.ClassInternal),
+				Cause:  outbox.NewCause(outbox.ClassInternal).WithCode(codeInvalidRecord),
 				Detail: detailInvalidRecord,
 			})
 		}

@@ -171,6 +171,64 @@ func TestTheJSONLFilesAreTheOwnersAlone(t *testing.T) {
 	}
 }
 
+// TestNewJSONLRefusesADirectoryOthersCanReachInto. MkdirAll applies the mode to a directory it
+// creates and changes nothing about one that is already there, so "the owner's alone" is a
+// promise this sink has to check. The directory lists one file per tenant, named after the
+// tenant, so anyone who can read it reads the tenant ids; anyone who can write it can put a
+// symbolic link where a tenant's file goes, and O_APPEND|O_CREATE|O_WRONLY follows it. The
+// refusal is at start-up, the way a missing credential is.
+func TestNewJSONLRefusesADirectoryOthersCanReachInto(t *testing.T) {
+	t.Parallel()
+	for name, mode := range map[string]os.FileMode{
+		"world readable and writable": 0o777,
+		"group readable":              0o740,
+		"world readable":              0o704,
+		"group writable":              0o720,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			dir := filepath.Join(t.TempDir(), "sink")
+			if err := os.Mkdir(dir, mode); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			// Mkdir applies the umask, so the mode is set again once it exists.
+			if err := os.Chmod(dir, mode); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+			s, err := sink.NewJSONL(sink.JSONLConfig{Dir: dir})
+			if err == nil {
+				t.Fatalf("NewJSONL took a %04o directory and returned %v", mode, s)
+			}
+		})
+	}
+}
+
+// TestNewJSONLTakesADirectoryThatIsAlreadyTheOwnersAlone: the check above refuses what is wider
+// than 0700 and nothing else, so a sink restarted on its own directory still starts.
+func TestNewJSONLTakesADirectoryThatIsAlreadyTheOwnersAlone(t *testing.T) {
+	t.Parallel()
+	for name, mode := range map[string]os.FileMode{
+		"the mode this sink creates": 0o700,
+		"narrower":                   0o500,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			dir := filepath.Join(t.TempDir(), "sink")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.Chmod(dir, mode); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+			// The test's own cleanup has to be able to remove it again.
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+			if _, err := sink.NewJSONL(sink.JSONLConfig{Dir: dir}); err != nil {
+				t.Fatalf("NewJSONL on a %04o directory: %v", mode, err)
+			}
+		})
+	}
+}
+
 // TestAppendLineRefusesADocumentWithALineFeed: json.Marshal writes a line feed inside a string
 // as \n, so this is about a document that came from somewhere else. One with a line feed in it
 // would be two lines of the file, the second of them a record nothing ever wrote.

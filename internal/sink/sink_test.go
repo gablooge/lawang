@@ -3,8 +3,13 @@ package sink_test
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -204,32 +209,182 @@ func TestNamesValidate(t *testing.T) {
 
 // TestADetailIsAlwaysThisPackagesOwnPhrase: every Detail a Fault or a Rejection carries is one
 // of the phrases written in this package, so no text from a sink reaches a log line through one.
+//
+// The claim is about every Detail the package assigns, so the test reads the package's own
+// source rather than a list someone keeps by hand, which is what round 1 found this test was
+// doing. Three things are checked there:
+//
+//   - the detail* constants and sink.FaultDetails are the same set, so a thirteenth constant
+//     that is not in the list fails here instead of passing unnoticed;
+//   - every Detail: in a composite literal is a plain identifier, never a string literal, a
+//     call or anything concatenated, which is how remote text would get in;
+//   - every identifier used that way is either one of those constants or a variable assigned
+//     only from them, or from transportDetail, whose own test holds every phrase it returns
+//     against the list.
 func TestADetailIsAlwaysThisPackagesOwnPhrase(t *testing.T) {
 	t.Parallel()
 	if len(sink.FaultDetails) == 0 {
 		t.Fatalf("the list of details is empty")
 	}
-	seen := map[string]bool{}
+	listed := map[string]bool{}
 	for _, detail := range sink.FaultDetails {
 		if detail == "" {
 			t.Errorf("an empty phrase is in the list")
 		}
-		if seen[detail] {
+		if listed[detail] {
 			t.Errorf("%q is in the list twice", detail)
 		}
-		seen[detail] = true
+		listed[detail] = true
 	}
+
+	files := packageFiles(t)
+	// The detail* constants, by name, with the phrase each one holds.
+	phrases := map[string]string{}
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, name := range value.Names {
+					if !strings.HasPrefix(name.Name, "detail") || i >= len(value.Values) {
+						continue
+					}
+					lit, ok := value.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						t.Errorf("%s is not a string constant", name.Name)
+						continue
+					}
+					phrase, err := strconv.Unquote(lit.Value)
+					if err != nil {
+						t.Fatalf("%s: %v", name.Name, err)
+					}
+					phrases[name.Name] = phrase
+				}
+			}
+		}
+	}
+	if len(phrases) != len(sink.FaultDetails) {
+		t.Errorf("the package declares %d detail constants and FaultDetails lists %d", len(phrases), len(sink.FaultDetails))
+	}
+	for name, phrase := range phrases {
+		if !listed[phrase] {
+			t.Errorf("%s = %q is not in FaultDetails", name, phrase)
+		}
+	}
+
+	// Every Detail: the package assigns, and every identifier one of them names.
+	named := map[string]bool{}
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			kv, ok := n.(*ast.KeyValueExpr)
+			if !ok {
+				return true
+			}
+			if key, ok := kv.Key.(*ast.Ident); !ok || key.Name != "Detail" {
+				return true
+			}
+			ident, ok := kv.Value.(*ast.Ident)
+			if !ok {
+				t.Errorf("a Detail is set from %T, want one of this package's own phrases", kv.Value)
+				return true
+			}
+			named[ident.Name] = true
+			return true
+		})
+	}
+	if len(named) == 0 {
+		t.Fatalf("no Detail is assigned anywhere, so this test is checking nothing")
+	}
+	for name := range named {
+		if _, ok := phrases[name]; ok {
+			continue
+		}
+		checkAssignments(t, files, name)
+	}
+}
+
+// checkAssignments fails unless every assignment to name in the package's own source hands it
+// one of the detail constants or the phrase transportDetail chose.
+func checkAssignments(t *testing.T, files []*ast.File, name string) {
+	t.Helper()
+	assigned := 0
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			assign, ok := n.(*ast.AssignStmt)
+			if !ok {
+				return true
+			}
+			for i, lhs := range assign.Lhs {
+				if ident, ok := lhs.(*ast.Ident); !ok || ident.Name != name || i >= len(assign.Rhs) {
+					continue
+				}
+				assigned++
+				switch rhs := assign.Rhs[i].(type) {
+				case *ast.Ident:
+					if !strings.HasPrefix(rhs.Name, "detail") {
+						t.Errorf("%s is assigned from %s, which is not one of this package's phrases", name, rhs.Name)
+					}
+				case *ast.CallExpr:
+					// transportDetail returns a constant of this file for every error
+					// it is given, which TestTransportDetailIsReadFromTheErrorsType...
+					// holds against FaultDetails case by case.
+					fn, ok := rhs.Fun.(*ast.Ident)
+					if !ok || fn.Name != "transportDetail" {
+						t.Errorf("%s is assigned from a call this test does not know", name)
+					}
+				default:
+					t.Errorf("%s is assigned from %T, want one of this package's phrases", name, rhs)
+				}
+			}
+			return true
+		})
+	}
+	if assigned == 0 {
+		t.Errorf("%s is used as a Detail and assigned nowhere this test can see", name)
+	}
+}
+
+// packageFiles parses the package's own source, leaving the tests out: what the tests assign to
+// a Detail is not what the claim is about.
+func packageFiles(t *testing.T) []*ast.File {
+	t.Helper()
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	var files []*ast.File
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		files = append(files, file)
+	}
+	if len(files) == 0 {
+		t.Fatalf("no source file was parsed")
+	}
+	return files
 }
 
 // TestAnActionAlwaysHasAName, including the zero value and a number that is not an action.
 func TestAnActionAlwaysHasAName(t *testing.T) {
 	t.Parallel()
 	for action, want := range map[sink.Action]string{
-		sink.ActionUnset:      "unclassified",
-		sink.ActionRetry:      "retry",
-		sink.ActionHalt:       "halt",
-		sink.ActionDeadLetter: "dead letter",
-		sink.Action(200):      "unknown action 200",
+		sink.ActionUnset: "unclassified",
+		sink.ActionRetry: "retry",
+		sink.ActionHalt:  "halt",
+		sink.Action(200): "unknown action 200",
 	} {
 		if got := action.String(); got != want {
 			t.Errorf("Action(%d).String() = %q, want %q", action, got, want)

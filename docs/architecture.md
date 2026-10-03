@@ -903,26 +903,42 @@ internal provider key in its first segment, because that is the join key with th
 message ([ADR 3](adr/0003-scope-id-format.md)), and so does the prefix of `external_id`, so
 `source` and the scope's first segment need not match.
 
-A failure comes back as a `*sink.Fault`, which carries an `Action` for the worker (`retry`,
-`halt` or `dead letter`, the sink rows of [section 11](#11-failure-handling)), the `outbox.Cause`
-that goes into the dead letter, and a `Detail` that is one of the package's own phrases. It wraps
-nothing: the error of `net/http` is a `*url.Error` whose text quotes the request URL, and a sink
-URL's query string is where many receivers carry their API key. A record the receiver refused
-on its own comes back in `DeliveryResult.Rejected` instead, and the rest of the batch counts as
-delivered.
+`Deliver` answers in one of exactly two ways, and nothing else. Either a `DeliveryResult`, which
+covers every record of the batch: the ones in `Rejected` were refused and dead-letter one by one,
+and every other record was taken. Or a `*sink.Fault`, with the zero `DeliveryResult`: nothing in
+the batch counts as delivered and the whole batch goes again, at once on `retry` and after an
+operator has fixed the credential on `halt`. The repeat costs nothing, because a sink is
+idempotent on the record id.
+
+So **a `Fault` is about the delivery and never about a record**, and a record's own fate is only
+ever a `Rejection`. There are therefore two actions and not three: a sink never asks the worker to
+kill a row, which is what keeps a batch that is sent in several requests honest. A receiver that
+refuses one request has said something about the records in that request and nothing about the
+records in the others, so each of those records comes back as a `Rejection` and the rest of the
+batch is still offered. Before this, a refusal of the second of three requests dead-lettered the
+whole batch: the records that had already landed, and the records the receiver was never offered.
+
+A `Fault` carries the `Action` for the worker, the `outbox.Cause` that goes into the outbox, and
+a `Detail` that is one of the package's own phrases. It wraps nothing: the error of `net/http` is
+a `*url.Error` whose text quotes the request URL, and a sink URL's query string is where many
+receivers carry their API key.
 
 **`http`** posts `{"records":[<record document>, ...]}` to a configured endpoint, with
-`Content-Type: application/json` and the tenant's bearer token in an `Authorization` header. The
-tenant is in no field: at a sink it is established by the per-tenant credential
-([section 4](#4-trust-model)), and a tenant with no credential is a refusal, not a default. A
-2xx answer may name the records the receiver refused,
+`Content-Type: application/json`, `Accept: application/json` and the tenant's bearer token in an
+`Authorization` header. The tenant is in no field: at a sink it is established by the per-tenant
+credential ([section 4](#4-trust-model)), and a tenant with no credential is a refusal, not a
+default. A 2xx answer may name the records the receiver refused,
 `{"rejected":[{"id":"rec_...","code":"..."}]}`; an empty body means every record was taken, and
 an answer that names an id that was not sent, or that does not parse, leaves the sink unable to
 say what landed, so nothing is marked delivered and the batch is sent again. A status outside 2xx
-is classified: 401 and 403 halt, 408 and 429 retry, any other 4xx dead-letters, and everything
-else retries. Redirects are not followed, so a receiver cannot send the next request, with its
-credential, somewhere else. The sink sends at most `MaxRequestBytes` (8 MiB by default) in one
-request and splits a batch to stay under it, and it reads at most 64 KiB of an answer.
+is classified: 401 and 403 halt and 408, 429 and everything that is not a 4xx retries, both of
+them faults about the delivery; any other 4xx is the receiver refusing what was sent, which is a
+verdict on the records of that one request, so each of them comes back as a `Rejection` carrying
+the status and the receiver's code. Redirects are not followed, so a receiver cannot send the
+next request, with its credential, somewhere else. The sink sends at most `MaxRequestBytes`
+(8 MiB by default) in one request and splits a batch to stay under it, and it reads at most
+64 KiB of an answer, one byte more than the limit so that it can tell a complete answer from one
+it cut short.
 
 **`stub`** is the strict test double of principle 5. It decodes every document with
 `internal/record`'s strict decoder, which the agreement tests hold equal to the schema, and adds
@@ -935,7 +951,10 @@ chain with a visited set, because a cycle across records is invisible to anythin
 one record at a time.
 
 **`jsonl`** appends one document per line to `<tenant>.jsonl` under a configured directory, owner
-only. The tenant is the file. The file is a log: a record delivered twice is written twice, and a
+only: it creates the directory 0700 with the files 0600, and refuses at start-up a directory
+that is already there with a wider mode, because the listing names one file per tenant and a
+group-writable one lets another user put a symbolic link where a tenant's file goes. The tenant
+is the file. The file is a log: a record delivered twice is written twice, and a
 reader folds it by `id`, taking the last line for an id.
 
 ---
@@ -1051,9 +1070,10 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | A resolved delivery that can never be stored (an ordering key the table refuses) | unstorable | parked as poison, answered 2xx, so the provider does not retry what cannot work |
 | Hydration fails | degradable | deliver a minimal record, the change is still tracked |
 | Normalizer fails | non-retryable | dead-letter with the reason; fix and replay |
-| Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands |
-| Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered; ops is alerted |
-| Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; replay is always safe |
+| Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands. A sink reports it as a `Rejection` and never as a whole-batch action, so a record is never killed without having been offered |
+| Sink rejects a whole request of a batch that was split across several (any 4xx that is not 401, 403, 408 or 429) | non-retryable | each record of that request dead-letters as its own `Rejection`; the other requests of the batch are still sent and keep their own outcome |
+| Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered, including anything an earlier request of the same batch landed, so the whole batch is sent again once an operator has fixed it; ops is alerted |
+| Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; nothing is marked delivered, including anything an earlier request of the same batch landed, and replay is always safe because a sink is idempotent on the record id |
 | Sink answers 2xx and does not say what it did with the batch (the answer does not parse, or names a record that was not sent) | retryable | nothing is marked delivered and the whole batch is sent again: a sink that is idempotent on the record id loses nothing by a repeat, and a guess here loses a record |
 | Vault unreachable | fail closed | retry on the ladder; nothing is delivered unverified |
 | Accept path out of time (a saturated pool, a slow database) | retryable | 503 with a `Retry-After`, nothing stored |

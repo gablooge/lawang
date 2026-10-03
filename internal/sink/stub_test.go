@@ -140,37 +140,61 @@ func TestTheStubRefusesWhateverTheSchemaRefuses(t *testing.T) {
 // TestTheStubRefusesTheThreeByteAndNameRulesNoSchemaCanMake: the three checks ADR 4 says a sink
 // validating with the schema alone has to make itself, in the form a schema cannot see. Each
 // document here is one a JSON Schema validator accepts.
+//
+// Each case asserts the rule that refused it and not merely that something did. Every one of
+// these documents differs from a valid one in more than one way a decoder could trip over, so
+// one refusal that swallowed all four would otherwise keep the test green while the three rules
+// it is named for had gone.
 func TestTheStubRefusesTheThreeByteAndNameRulesNoSchemaCanMake(t *testing.T) {
 	t.Parallel()
 	valid := doc(t, rec(t, tenantA))
 	id := rec(t, tenantA).ID
 
-	for name, document := range map[string][]byte{
+	for name, c := range map[string]struct {
+		document []byte
+		want     string
+	}{
 		// encoding/json puts U+FFFD in place of a lone surrogate escape, so this document and
 		// the one with \uDC00 would decode to one external id.
-		"an unpaired surrogate escape": bytes.Replace(valid,
-			[]byte(`"title":"Numbers are in"`), []byte(`"title":"\uD800 is half a pair"`), 1),
+		"an unpaired surrogate escape": {
+			document: bytes.Replace(valid,
+				[]byte(`"title":"Numbers are in"`), []byte(`"title":"\uD800 is half a pair"`), 1),
+			want: "the record has an escape for half of a surrogate pair",
+		},
 		// The same, one level down: an invalid byte becomes U+FFFD as well.
-		"bytes that are not UTF-8": bytes.Replace(valid,
-			[]byte(`"title":"Numbers are in"`), []byte("\"title\":\"\xff\xfe\""), 1),
+		"bytes that are not UTF-8": {
+			document: bytes.Replace(valid,
+				[]byte(`"title":"Numbers are in"`), []byte("\"title\":\"\xff\xfe\""), 1),
+			want: "the record is not valid UTF-8",
+		},
 		// Decoders disagree about which of the two counts, so a validator and a consumer can
 		// read two different scopes out of this one document.
-		"a field name used twice": bytes.Replace(valid,
-			[]byte(`"title":`), []byte(`"text":"first","title":`), 1),
+		"a field name used twice": {
+			document: bytes.Replace(valid,
+				[]byte(`"title":`), []byte(`"text":"first","title":`), 1),
+			want: "the record uses a field name twice in one object",
+		},
 		// JSON Schema cannot compare two fields of one document.
-		"a record that supersedes itself": bytes.Replace(valid,
-			[]byte(`"supersedes":null`), []byte(`"supersedes":"`+id+`"`), 1),
+		"a record that supersedes itself": {
+			document: bytes.Replace(valid,
+				[]byte(`"supersedes":null`), []byte(`"supersedes":"`+id+`"`), 1),
+			want: "supersedes names the record itself",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			if bytes.Equal(document, valid) {
+			if bytes.Equal(c.document, valid) {
 				t.Fatalf("the document was not edited, so the case proves nothing")
 			}
-			if schemaRefuses(t, document) {
+			if schemaRefuses(t, c.document) {
 				t.Fatalf("the schema refuses this document, so it is not a rule beyond the schema")
 			}
-			if err := newStub(t, sink.StubConfig{}).Accept(tenantA, document); err == nil {
+			err := newStub(t, sink.StubConfig{}).Accept(tenantA, c.document)
+			if err == nil {
 				t.Fatalf("the stub accepted it")
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("Accept: %v, want the refusal to be %q", err, c.want)
 			}
 		})
 	}
@@ -200,6 +224,37 @@ func TestTheStubRefusesARepeatedIDWithDifferentContent(t *testing.T) {
 				t.Fatalf("the first document was refused: %v", err)
 			}
 			err := s.Accept(tenantA, changed)
+			if !errors.Is(err, sink.ErrRepeatDiffers) {
+				t.Fatalf("second Accept: %v, want ErrRepeatDiffers", err)
+			}
+			if got := len(s.Documents(tenantA)); got != 1 {
+				t.Fatalf("the stub holds %d documents, want the first one only", got)
+			}
+		})
+	}
+}
+
+// TestTheStubComparesANumberByTheLiteralItWasWrittenWith: contentOf decodes with
+// json.Decoder.UseNumber, so a number keeps the literal it arrived with. Without it every number
+// is read as a float64 and written back in the shortest spelling that round-trips, and two
+// documents that differ in the last digit of a twenty digit integer become one content: the stub
+// would answer "the same record" to the second and go on holding the first. That is a silent
+// wrong acceptance in the one check ADR 4 decision 7's promise to a sink rests on, and it is the
+// dangerous direction, because a refusal would at least be loud.
+func TestTheStubComparesANumberByTheLiteralItWasWrittenWith(t *testing.T) {
+	t.Parallel()
+	first := doc(t, rec(t, tenantA))
+	for name, pair := range map[string][2]string{
+		"a twenty digit integer and the same integer plus one": {"12345678901234567890", "12345678901234567891"},
+		"an integer and the same value written as a decimal":   {"1", "1.0"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			s := newStub(t, sink.StubConfig{})
+			if err := s.Accept(tenantA, withRaw(t, first, "extra", pair[0])); err != nil {
+				t.Fatalf("the first document was refused: %v", err)
+			}
+			err := s.Accept(tenantA, withRaw(t, first, "extra", pair[1]))
 			if !errors.Is(err, sink.ErrRepeatDiffers) {
 				t.Fatalf("second Accept: %v, want ErrRepeatDiffers", err)
 			}
@@ -343,6 +398,29 @@ func TestTheStubRefusesASupersedeCycle(t *testing.T) {
 	// A chain that does not close is still taken.
 	if err := s.Accept(tenantA, withSupersedes(first, "rec_00000000000000000000000000000001")); err != nil {
 		t.Fatalf("a chain pointing at a record that never arrived: %v", err)
+	}
+}
+
+// TestTheStubRefusesATwoRecordSupersedeCycle is the shortest cycle that spans two records, and
+// the one the walk reaches on its second step rather than its third. A one-record cycle is the
+// self-supersede rule, which Validate makes on its own.
+func TestTheStubRefusesATwoRecordSupersedeCycle(t *testing.T) {
+	t.Parallel()
+	s := newStub(t, sink.StubConfig{})
+	first := rec(t, tenantA, func(r *record.Record) { r.Version = "1" })
+	second := rec(t, tenantA, func(r *record.Record) { r.Version = "2" })
+	withSupersedes := func(r record.Record, id string) []byte {
+		r.Supersedes = record.Ref(id)
+		return doc(t, r)
+	}
+	if err := s.Accept(tenantA, withSupersedes(first, second.ID)); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if err := s.Accept(tenantA, withSupersedes(second, first.ID)); !errors.Is(err, sink.ErrSupersedeCycle) {
+		t.Fatalf("the closing record: %v, want ErrSupersedeCycle", err)
+	}
+	if got := len(s.Documents(tenantA)); got != 1 {
+		t.Fatalf("the stub holds %d documents, want the one that did not close a loop", got)
 	}
 }
 

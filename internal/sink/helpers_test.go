@@ -87,6 +87,24 @@ func edit(t testing.TB, in []byte, f func(map[string]any)) []byte {
 	return out
 }
 
+// withRaw returns in with one top-level member set to raw, exactly as written. It is how a test
+// puts a number in a document with the literal it wants: edit sends every number through an any,
+// and encoding/json then writes it back as a float64. An unknown field is part of the format
+// outside visibility, which is what lets v1 grow.
+func withRaw(t testing.TB, in []byte, name, raw string) []byte {
+	t.Helper()
+	var tree map[string]json.RawMessage
+	if err := json.Unmarshal(in, &tree); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	tree[name] = json.RawMessage(raw)
+	out, err := json.Marshal(tree)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return out
+}
+
 // The schema is compiled from record.Schema(), the embedded bytes, so what these tests prove is
 // true of what the binary carries. Formats are asserted, which is how a careful sink validates.
 var (

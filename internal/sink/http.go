@@ -38,12 +38,23 @@ const (
 )
 
 // faultDetails is every phrase above, as a list a test can walk.
-// TestADetailIsAlwaysThisPackagesOwnPhrase holds the two together.
+// TestADetailIsAlwaysThisPackagesOwnPhrase reads the constants out of this package's own source
+// and holds the two together, so a thirteenth phrase that is not listed here fails.
 var faultDetails = []string{
 	detailTimedOut, detailNoSuchHost, detailRefused, detailTLS, detailConnection,
 	detailCancelled, detailNoCredential, detailUnreadableReply, detailRecordTooLarge,
 	detailNoRequest, detailInvalidRecord, detailWriteFailed,
 }
+
+// The error codes this package puts in a Cause for a record Lawang itself refused. Detail says
+// the same thing at length, but a Detail is for a log line and never reaches the outbox, so
+// without these a record Lawang refused reads in last_error and dead_reason as a bare "internal
+// error", which is also what a database failure of its own would say. Each is a constant of
+// this program, which is what outbox.Cause.WithCode asks of a code.
+const (
+	codeRecordTooLarge = "record_too_large"
+	codeInvalidRecord  = "invalid_record"
+)
 
 // Defaults of HTTPConfig.
 const (
@@ -100,6 +111,9 @@ type HTTPConfig struct {
 // in no field: the receiver learns it from the credential, which is the trust root for a sink
 // delivery (architecture section 4).
 //
+// The request also carries Accept: application/json, because the only answer this sink can read
+// is the JSON one below.
+//
 // A 2xx answer means the batch landed. Its body may name the records the receiver refused:
 //
 //	{"rejected":[{"id":"rec_...","code":"unsupported_kind"}]}
@@ -108,8 +122,15 @@ type HTTPConfig struct {
 // not in the request, and a body that does not parse, leave the sink unable to say what landed,
 // so nothing is marked delivered and the batch is retried.
 //
-// Any other status is classified by statusFault, and the dead letter or the retry follows from
-// that. The client's CheckRedirect returns http.ErrUseLastResponse, so a 3xx comes back as the
+// Any other status is classified by statusOf. 401 and 403 halt and everything that is not a 4xx
+// is retried, and both are about the delivery rather than about any record: nothing in the batch
+// counts as delivered and the whole batch goes again. Every other 4xx is the receiver refusing
+// what was sent, which is a verdict on the records of that one request, so each of them comes
+// back as a Rejection and the records of the other requests are still offered. That is what
+// keeps a batch too large for one request from having a record's fate decided by which request
+// it fell into.
+//
+// The client's CheckRedirect returns http.ErrUseLastResponse, so a 3xx comes back as the
 // response and the next request still goes to the configured endpoint rather than to one the
 // receiver named.
 type HTTP struct {
@@ -195,7 +216,7 @@ func (h *HTTP) Deliver(ctx context.Context, t tenancy.ID, recs []record.Record) 
 		if len(chunk) == 0 {
 			return nil
 		}
-		rejected, err := h.send(ctx, token, chunk, ids)
+		rejected, err := h.send(ctx, token, chunk, ids, size)
 		if err != nil {
 			return err
 		}
@@ -241,13 +262,13 @@ func (h *HTTP) marshalAll(recs []record.Record) ([][]byte, DeliveryResult) {
 		case err != nil:
 			result.Rejected = append(result.Rejected, Rejection{
 				ID:     r.ID,
-				Cause:  outbox.NewCause(outbox.ClassInternal),
+				Cause:  outbox.NewCause(outbox.ClassInternal).WithCode(codeInvalidRecord),
 				Detail: detailInvalidRecord,
 			})
 		case bodyFraming+len(doc) > h.maxBytes:
 			result.Rejected = append(result.Rejected, Rejection{
 				ID:     r.ID,
-				Cause:  outbox.NewCause(outbox.ClassInternal),
+				Cause:  outbox.NewCause(outbox.ClassInternal).WithCode(codeRecordTooLarge),
 				Detail: detailRecordTooLarge,
 			})
 		default:
@@ -258,9 +279,11 @@ func (h *HTTP) marshalAll(recs []record.Record) ([][]byte, DeliveryResult) {
 }
 
 // send posts one request and reads its answer. ids are the record ids of chunk, in order, and are
-// what a "rejected" entry is checked against.
-func (h *HTTP) send(ctx context.Context, token string, chunk [][]byte, ids []string) ([]Rejection, error) {
-	body := make([]byte, 0, bodyFraming+len(chunk)*64)
+// what a "rejected" entry is checked against. size is the length the body will come to, which
+// Deliver's loop has already added up, so a chunk of several megabytes is copied once and not
+// grown a dozen times.
+func (h *HTTP) send(ctx context.Context, token string, chunk [][]byte, ids []string, size int) ([]Rejection, error) {
+	body := make([]byte, 0, size)
 	body = append(body, bodyPrefix...)
 	for i, doc := range chunk {
 		if i > 0 {
@@ -301,7 +324,11 @@ func (h *HTTP) send(ctx context.Context, token string, chunk [][]byte, ids []str
 	}()
 	answer, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, statusFault(resp.StatusCode, codeFrom(answer, readErr))
+		v := statusOf(resp.StatusCode, codeFrom(answer, readErr))
+		if v.fault != nil {
+			return nil, v.fault
+		}
+		return refusals(ids, v.refused), nil
 	}
 	if readErr != nil || len(answer) > maxResponseBytes {
 		return nil, unreadableFault(resp.StatusCode)
@@ -352,22 +379,54 @@ func unreadableFault(status int) *Fault {
 	}
 }
 
-// statusFault is what the sink does about a status outside 2xx, and it is the whole of the rule:
+// statusVerdict is what the sink makes of a status outside 2xx. Exactly one of the two is set,
+// and which one is the difference between a failure of the delivery and a failure of the
+// records, which is the whole reason a batch too large for one request is still safe to split.
+type statusVerdict struct {
+	// fault is set when the delivery is what went wrong: the credential was refused (halt), or
+	// the sink could not take the batch just now (retry). Neither says anything about a record,
+	// so nothing in the batch counts as delivered and the whole batch goes again.
+	fault *Fault
+	// refused is set when the receiver refused what was sent. It is the Cause that each record
+	// of that one request carries as its own Rejection: a refusal speaks for the records in the
+	// request it answered and for nothing else in the batch.
+	refused outbox.Cause
+}
+
+// statusOf is what the sink does about a status outside 2xx, and it is the whole of the rule:
 // the cases below are the statuses named in architecture section 11, and anything else is
 // retried. TestTheStatusTable walks it.
-func statusFault(status int, code string) *Fault {
-	action, class := ActionRetry, outbox.ClassSinkUnavailable
+func statusOf(status int, code string) statusVerdict {
 	switch {
 	case status == http.StatusUnauthorized, status == http.StatusForbidden:
 		// The credential was refused, so the ladder would only repeat it.
-		action, class = ActionHalt, outbox.ClassSinkUnauthorized
+		return statusVerdict{fault: &Fault{
+			Action: ActionHalt,
+			Cause:  outbox.NewCause(outbox.ClassSinkUnauthorized).WithStatus(status).WithCode(code),
+		}}
 	case status == http.StatusRequestTimeout, status == http.StatusTooManyRequests:
 		// Both ask for the same bytes again later.
 	case status >= 400 && status <= 499:
 		// The receiver refused what was sent, and the same bytes come back the same way.
-		action, class = ActionDeadLetter, outbox.ClassSinkRejected
+		return statusVerdict{
+			refused: outbox.NewCause(outbox.ClassSinkRejected).WithStatus(status).WithCode(code),
+		}
 	}
-	return &Fault{Action: action, Cause: outbox.NewCause(class).WithStatus(status).WithCode(code)}
+	return statusVerdict{fault: &Fault{
+		Action: ActionRetry,
+		Cause:  outbox.NewCause(outbox.ClassSinkUnavailable).WithStatus(status).WithCode(code),
+	}}
+}
+
+// refusals turns a receiver's refusal of one request into one Rejection per record that was in
+// it. The Detail is empty, as it is for a record named in a "rejected" list, because what refused
+// the record is the receiver and its own error code is already in the Cause.
+func refusals(ids []string, cause outbox.Cause) []Rejection {
+	rejections := make([]Rejection, 0, len(ids))
+	for _, id := range ids {
+		rejections = append(rejections, Rejection{ID: id, Cause: cause})
+	}
+	return rejections
 }
 
 // codeFrom reads the receiver's own error code out of an error response, as the one field

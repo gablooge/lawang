@@ -36,17 +36,28 @@ import (
 // scope for one tenant, and the worker re-delivers after a crash between its two commits
 // (architecture section 3.2, step 7).
 //
-// Deliver returns a DeliveryResult when the batch reached the receiver, whether or not every
-// record in it was taken, and a *Fault when it did not. On a Fault the DeliveryResult is the zero
-// value and nothing in the batch counts as delivered, so the worker sends the whole batch again.
+// Deliver answers in one of exactly two ways, and the worker's two jobs follow from which:
+//
+//   - A DeliveryResult and no error. Every record of the batch has an outcome: the ones in
+//     Rejected were refused and dead-letter one by one, and every other record was taken.
+//   - A *Fault. The DeliveryResult is the zero value, nothing in the batch counts as delivered,
+//     and the whole batch goes again: at once on ActionRetry, and after an operator has fixed
+//     the credential on ActionHalt. The repeat costs nothing, because a sink is idempotent on
+//     Record.ID.
+//
+// So a Fault is always about the delivery and never about a record, and a record's own fate is
+// only ever reported as a Rejection. That is what makes a batch safe to send in several requests:
+// a sink that cannot deliver all of a batch says so for the batch, and never kills a record it
+// has not offered.
 type Sink interface {
 	Deliver(ctx context.Context, t tenancy.ID, recs []record.Record) (DeliveryResult, error)
 }
 
-// DeliveryResult is what one batch came to. A record not named in Rejected was taken.
+// DeliveryResult is what one batch came to, and it covers every record in it: a record not named
+// in Rejected was taken.
 type DeliveryResult struct {
-	// Rejected names the records the receiver refused, one entry each. The rest of the batch
-	// landed, so each of these dead-letters on its own (architecture section 11).
+	// Rejected names the records that did not get through, one entry each. Every other record
+	// of the batch landed, so each of these dead-letters on its own (architecture section 11).
 	Rejected []Rejection
 }
 
@@ -63,8 +74,11 @@ type Rejection struct {
 	Detail string
 }
 
-// Action is what the worker does about a Fault. The three are the sink rows of the failure table
-// in architecture section 11.
+// Action is what the worker does about a Fault. There are two, because a Fault is about the
+// delivery and never about a record: both leave the batch undelivered and send it again, and
+// they differ in what has to happen first. The third sink row of architecture section 11, a
+// record that dead-letters, is a Rejection and not a Fault, so that a sink never asks for a
+// record to be killed without having offered it.
 type Action uint8
 
 const (
@@ -75,8 +89,6 @@ const (
 	// ActionHalt leaves the row prepared and marks nothing delivered: the credential was
 	// refused, so sending it again changes nothing and an operator has to look.
 	ActionHalt
-	// ActionDeadLetter kills the row, which then waits for a replay.
-	ActionDeadLetter
 )
 
 // String names the action for an operator reading a log line.
@@ -86,8 +98,6 @@ func (a Action) String() string {
 		return "retry"
 	case ActionHalt:
 		return "halt"
-	case ActionDeadLetter:
-		return "dead letter"
 	case ActionUnset:
 		return "unclassified"
 	default:
@@ -95,7 +105,10 @@ func (a Action) String() string {
 	}
 }
 
-// Fault is a delivery that did not happen, in the only form a sink reports one.
+// Fault is a delivery that did not happen, in the only form a sink reports one. It is about the
+// batch as a whole: a record the receiver refused is a Rejection in the DeliveryResult instead,
+// so a partly delivered batch that then faults still names the records the receiver refused and
+// still leaves the records it never saw alive.
 //
 // It carries an Action, an outbox.Cause and a Detail, and it wraps nothing: errors.Unwrap of a
 // Fault is nil, and a transport error is read for its classification and then dropped. That is
@@ -133,9 +146,10 @@ func (f *Fault) Error() string {
 // scope as opaque.
 type Names map[string]string
 
-// Validate reports the first entry of n that could not be used: a key that is not a provider key
+// Validate reports an entry of n that could not be used: a key that is not a provider key
 // (record.ValidProviderKey, ADR 3), or a value that is not a source name (record.ValidSource). A
-// sink calls it where it is built, rather than discovering a bad name one record at a time.
+// sink calls it where it is built, rather than discovering a bad name one record at a time. With
+// two bad entries it names one of them, and a map has no order, so which one is not fixed.
 func (n Names) Validate() error {
 	for key, wire := range n {
 		if !record.ValidProviderKey(key) {
