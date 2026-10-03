@@ -199,13 +199,51 @@ func NewHTTP(cfg HTTPConfig) (*HTTP, error) {
 		token:    cfg.Token,
 		maxBytes: maxBytes,
 		client: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: newTransport(),
 			// A 3xx is handed back as the response instead of being followed. A receiver that
 			// answered one would otherwise choose where the next request, with its
 			// Authorization header, goes.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}, nil
+}
+
+// maxIdleConnsPerHost is how many idle connections one sink keeps to its own receiver.
+//
+// A sink talks to one host, and the drain delivers from a pool of goroutines, so the number that
+// matters is how many deliveries one sink has in flight at once. Below that, every delivery past
+// the limit closes its connection when it finishes and the next one dials again, which is a TCP
+// handshake and a TLS handshake per delivery. 32 is above any drain pool this fits in a
+// connection pool of its own (internal/worker sizes its goroutines against pool_max_conns, which
+// is max(4, NumCPU) by default), and idle connections cost nothing once the churn stops:
+// IdleConnTimeout closes them.
+const maxIdleConnsPerHost = 32
+
+// newTransport is one HTTP transport per sink, which is to say one connection pool per sink.
+//
+// http.DefaultTransport, which a nil Transport uses, is a single pool shared by every client in
+// the process, and its MaxIdleConnsPerHost is 2. B10 is the first item that runs more than one
+// sink at once: sharing one pool across them makes one tenant's delivery wait for another's
+// idle connection, and two sinks pointed at one host (two tenants of one receiver) share the
+// same two slots. Measured on issue #55, under the connection churn of a test that starts a
+// server per case, a transport per sink cut the failures from 1,480 to 209 in the same stress
+// run, a sevenfold reduction, which says most of that churn was the shared pool and not socket
+// exhaustion.
+//
+// It is a clone of the default, so the proxy, dialler and HTTP/2 settings a deployment relies on
+// are the standard ones, with only the per-host idle limit raised.
+func newTransport() http.RoundTripper {
+	t, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// Something in this process replaced http.DefaultTransport with a round tripper of its
+		// own, which the standard library allows and which a test harness sometimes does. There
+		// is nothing to clone then, and using what is there is better than ignoring it.
+		return http.DefaultTransport
+	}
+	clone := t.Clone()
+	clone.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	return clone
 }
 
 // minRequestBytes is the smallest configurable request size: the framing plus a record id, which
