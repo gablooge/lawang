@@ -179,6 +179,11 @@ func (s *Stub) Accept(t tenancy.ID, doc []byte) error {
 	}
 	content, err := contentOf(doc)
 	if err != nil {
+		// Unreachable through Accept. contentOf decodes the same bytes record's strict
+		// UnmarshalJSON has just accepted one line above, and that refuses every document
+		// that is not a JSON object, so neither the decode nor the re-marshal of the tree
+		// it produces can fail here. No test reaches it. It is kept because the guarantee
+		// lives in another package and a future change there would land here first.
 		return fmt.Errorf("sink: stub: %w", err)
 	}
 

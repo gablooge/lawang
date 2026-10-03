@@ -126,7 +126,7 @@ the request message. Each of the nearest candidates was weighed and left out:
 | 404, 410, 421 | The request target: a typo in `Endpoint`, a receiver that is gone, a receiver that moved. |
 | 405 | The method. The sink only ever sends `POST`. |
 | 406 | The `Accept` header, which this sink sets to one constant. |
-| 409 | A conflict with the state of the **target resource**, which is the endpoint and not a record. It names no record, and it is what a receiver answers on a lost race, which wants a retry and not a dead letter. The per-record conflict this format can have, an id that arrives again with different content, is reported by a conformant receiver in a `rejected` list. |
+| 409 | A conflict with the state of the **target resource**, which is the endpoint and not a record. It names no record, and the per-record conflict this format can have, an id that arrives again with different content, is reported by a conformant receiver in a `rejected` list. A receiver that answers 409 to the re-send that idempotence on `Record.ID` makes routine is therefore not conformant, so it gets the default for a receiver that is not: it halts, which stalls and loses nothing. In the refusal band it would dead-letter records that in fact landed, and in the retry band the ladder would dead-letter them at its end. |
 | 411, 431 | `Content-Length` and the header fields. See below. |
 | 413, 414, 415 | The request's size, its URL and its media type: `MaxRequestBytes`, the endpoint, a constant. |
 | 426 | The protocol version. |

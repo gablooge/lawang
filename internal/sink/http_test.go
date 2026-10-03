@@ -880,10 +880,11 @@ func TestABatchWhoseRecordsAreAllRejectedSendsNothing(t *testing.T) {
 // TestAFaultOnTheFirstRequestOfASplitBatchStopsTheRest: on a Fault nothing counts as delivered,
 // so there is no reason to go on sending, and the worker re-sends the whole batch.
 //
-// The batch opens with a record the format refuses, so marshalAll has put a Rejection in the
-// result before the first request is built. That is what makes the zero-value assertion below
-// able to fail: without it the result is empty whatever Deliver does with it, and the check is
-// satisfied by the handler rather than by the code.
+// The batch opens with the zero Record, which is sealed for no tenant, so marshalAll has put a
+// Rejection in the result before the first request is built. That is what makes the zero-value
+// assertion below able to fail: without it the result is empty whatever Deliver does with it,
+// and the check is satisfied by the handler rather than by the code. Which of marshalAll's
+// rejections it is does not matter here, only that there is one.
 func TestAFaultOnTheFirstRequestOfASplitBatchStopsTheRest(t *testing.T) {
 	t.Parallel()
 	recs := make([]record.Record, 4)
@@ -1002,6 +1003,16 @@ func TestASinkURLSecretNeverLeaves(t *testing.T) {
 		r.Version = "2"
 		r.Text = strings.Repeat("x", 4096)
 	})
+	// Sealed for this tenant and still refused by the format, built the same way
+	// TestARecordTheFormatRefusesIsOneRejection builds it: the audience is changed after
+	// Seal, which is outside what the seal covers, so SealedFor stays true and Validate
+	// inside MarshalJSON goes false. The guard below pins that premise, because the site
+	// this record drives is reached only by a record that gets past rejectUnsealed.
+	broken := rec(t, tenantA, func(r *record.Record) { r.Version = "3" })
+	broken.Visibility.Audience = "nobody"
+	if !broken.SealedFor(tenantA) {
+		t.Fatalf("the record is no longer sealed for the tenant, so the attempt below drives the wrong-tenant site and not the format one")
+	}
 
 	// The attempts below drive every place this package builds a Fault or a Rejection, against
 	// an endpoint whose query string holds the marker. A receiver that echoes the request URL
@@ -1029,6 +1040,13 @@ func TestASinkURLSecretNeverLeaves(t *testing.T) {
 	// arrived with the halt band and survived a Detail built from the receiver's echoed code
 	// (mutation T3). A split batch is driven too, because a leak confined to a request that is
 	// not the first of one is otherwise unsearched (mutation T2).
+	//
+	// An attempt drives the site it is named for only while the record it carries still gets
+	// that far. Site 10 was reached by the zero Record until a check added ahead of it in
+	// marshalAll, the one site 11 is about, began refusing that record first: the list still
+	// read as eleven, the attempt still produced its one Rejection, and nothing failed, while
+	// site 10 went unsearched and mutation T5 survived the package. So an attempt whose record
+	// has to pass an earlier check asserts that it does, next to the record and not here.
 	endpointOf := func(base string) string { return base + "/deliver?api_key=" + marker }
 	echoing := `{"code":"see https://sink.example/deliver?api_key=` + marker + `"}`
 
@@ -1126,9 +1144,12 @@ func TestASinkURLSecretNeverLeaves(t *testing.T) {
 			recs: []record.Record{big, recs[0]}, wantRejections: 1,
 		},
 		{
+			// broken and not the zero Record. The zero Record is sealed for no tenant,
+			// so rejectUnsealed refuses it ahead of json.Marshal and this attempt drove
+			// site 11 twice while site 10 went undriven, which mutation T5 survived.
 			name: "a record the format refuses", endpoint: endpointOf,
 			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) },
-			recs:    []record.Record{{}, recs[0]}, wantRejections: 1,
+			recs:    []record.Record{broken, recs[0]}, wantRejections: 1,
 		},
 		{
 			name: "a record sealed for another tenant", endpoint: endpointOf,

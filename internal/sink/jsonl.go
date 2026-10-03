@@ -127,10 +127,18 @@ func (j *JSONL) Deliver(ctx context.Context, t tenancy.ID, recs []record.Record)
 		return DeliveryResult{}, writeFault()
 	}
 	if _, err := f.Write(lines); err != nil {
+		// The open above has just succeeded, so reaching this needs the write itself to
+		// fail: a full disk, an I/O error, or the file taken away underneath. No test
+		// reaches it, because provoking one needs a filesystem a test cannot stand up.
+		// It is a retry and not a partial success: a short write leaves a truncated line
+		// in the file, and the whole batch goes again.
 		_ = f.Close()
 		return DeliveryResult{}, writeFault()
 	}
 	if err := f.Close(); err != nil {
+		// Close is where a buffered write is finally answered for, so a failure here is
+		// the same class as the one above and gets the same answer: nothing in the batch
+		// counts as delivered. No test reaches it, for the same reason.
 		return DeliveryResult{}, writeFault()
 	}
 	return result, nil

@@ -501,10 +501,12 @@ type statusVerdict struct {
 //   - 400 is a verdict on the request message, and a receiver refusing this protocol's version
 //     answers it (ADR 13), so it would kill records for a mismatch no record caused.
 //   - 409 is a conflict with the state of the target resource, which is the endpoint and not a
-//     record. It names no record, and it is what a receiver answers on a lost race, which is
-//     retryable rather than fatal. The per-record conflict this format can have, an id that
+//     record. It names no record, and the per-record conflict this format can have, an id that
 //     arrives again with different content, is reported by a conformant receiver in a
-//     "rejected" list.
+//     "rejected" list. A receiver that answers 409 to the re-send that idempotence on Record.ID
+//     makes routine is therefore not conformant, so it gets the default below and halts, which
+//     stalls and loses nothing: in the refusal band it would dead-letter records that in fact
+//     landed, and in the retry band the ladder would dead-letter them at its end.
 //   - 404, 405, 406, 410, 411, 415, 421 and 431 are all verdicts on the request target, the
 //     method, the Accept header, the resource's existence, Content-Length, the media type, the
 //     authority or the header fields. None of them is about a record.
