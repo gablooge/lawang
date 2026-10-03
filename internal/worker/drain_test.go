@@ -306,6 +306,39 @@ func TestARefusedRecordDiesWhileTheRestOfTheBatchLands(t *testing.T) {
 	}
 }
 
+// TestADeliveryWhoseRecordsTheLedgerAlreadyHoldsIsFinished. A provider that sends one change
+// twice, in two bodies that are not byte-identical, is two outbox rows and one record: the
+// ledger holds the record id from the first, so the second prepares nothing at all. There is
+// nothing to offer a sink, and the row has to be finished rather than left for the ladder,
+// which would park a delivery that was never wrong.
+func TestADeliveryWhoseRecordsTheLedgerAlreadyHoldsIsFinished(t *testing.T) {
+	t.Parallel()
+	e := setup(t, worker.Options{})
+	first := ev(entity, "1", listA)
+	again := ev(entity, "1", listA)
+	again.Title = "the same version in another body" // a new delivery id, the same record id
+	firstID := e.accept(tenantA, "fake:S1", first)
+	againID := e.accept(tenantA, "fake:S1", again)
+
+	for e.drainOnce() > 0 { //nolint:revive // drain until there is nothing claimable left
+	}
+
+	e.wantState(firstID, outbox.StateDelivered, "")
+	e.wantState(againID, outbox.StateDelivered, "")
+	if got := len(e.documents(tenantA)); got != 1 {
+		t.Errorf("the stub holds %d documents, want 1: the second delivery carried a record the ledger held", got)
+	}
+	if got := e.recordStates(againID); len(got) != 0 {
+		t.Errorf("the second delivery stored %v, want nothing: it prepared no records", got)
+	}
+	if n := e.ledgerCount(); n != 1 {
+		t.Errorf("the ledger holds %d rows, want 1", n)
+	}
+	if calls := e.sinks.callCount(); calls != 1 {
+		t.Errorf("the sink was called %d times, want once: an empty batch is not offered", calls)
+	}
+}
+
 // TestARowNobodyReportsOnIsParkedAndItsEntityMovesOn. A worker that dies on every attempt
 // records nothing, so the row's lease expires and it is claimed again forever, holding every
 // later version of its entity behind it. The drain looks at the attempt count before it does
