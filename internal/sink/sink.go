@@ -49,6 +49,19 @@ import (
 // only ever reported as a Rejection. That is what makes a batch safe to send in several requests:
 // a sink that cannot deliver all of a batch says so for the batch, and never kills a record it
 // has not offered.
+//
+// # The caller's obligation, and what a sink does when it is broken
+//
+// Every record of recs must be sealed for t (record.Record.SealedFor). The tenant is in no field
+// of the envelope, so a record sealed for another tenant marshals to the same bytes and goes out
+// under this tenant's credential, into this tenant's file, to this tenant's receiver, and
+// nothing downstream can see it. The caller holds that: internal/pipeline builds one Prepared
+// per claimed outbox row, under that row's tenant, and checks SealedFor there.
+//
+// A sink does not take that on trust. Each Deliver asks SealedFor about every record and reports
+// a record that fails it as a Rejection with outbox.ClassInternal and the code wrong_tenant,
+// without sending, writing or storing it. A mixed batch therefore loses the foreign records and
+// delivers the rest, rather than delivering a tenant's records to somebody else.
 type Sink interface {
 	Deliver(ctx context.Context, t tenancy.ID, recs []record.Record) (DeliveryResult, error)
 }
@@ -105,8 +118,17 @@ const (
 	ActionUnset Action = iota
 	// ActionRetry puts the row back on the backoff ladder, which dead-letters it at its end.
 	ActionRetry
-	// ActionHalt leaves the row prepared and marks nothing delivered: the credential was
-	// refused, so sending it again changes nothing and an operator has to look.
+	// ActionHalt leaves the row prepared and marks nothing delivered: sending the same
+	// request again changes nothing until an operator changes a credential, a number, an
+	// endpoint or a receiver. It is the one outcome that does not recover on its own, so ops
+	// is alerted, the way architecture section 11 says for the credential.
+	//
+	// The Cause says which thing an operator has to change, and a worker must not guess from
+	// the Action: outbox.ClassSinkUnauthorized is the credential (401, 403) and
+	// outbox.ClassSinkRefused is the request itself (every other 4xx outside the refusal
+	// band), where the fix is MaxRequestBytes, the endpoint, the media type or the receiver's
+	// version. Sending an operator to the vault for a 413 is the misdirection
+	// ClassSinkRefused exists to prevent.
 	ActionHalt
 )
 
@@ -203,4 +225,30 @@ func checkTenant(t tenancy.ID) error {
 		return fmt.Errorf("sink: %w", err)
 	}
 	return nil
+}
+
+// rejectUnsealed is the Rejection for a record that record.Seal did not mint for t, and whether
+// there is one. Every Deliver asks it about every record, before the record is marshalled.
+//
+// The tenant is in no field of the envelope, so a record sealed for tenant A marshals to exactly
+// the same bytes when it goes out under tenant B: MarshalJSON checks that the seal is intact and
+// never whose it is, and no receiver can tell. SealedFor is the one thing in the program that
+// can see it, and this package is the one that holds a per-tenant bearer token, writes a file
+// named after a tenant and files documents under a tenant, so each sink asks rather than
+// trusting that somebody upstream did.
+//
+// It is Lawang's own defect and never the receiver's, so it is ClassInternal with a code of this
+// package's own, like the two refusals in marshalAll: a Detail is for a log line and is not
+// stored, and without the code the dead letter would read as a bare "internal error". It is a
+// Rejection and not a Fault because it is a verdict on that one record, and the rest of the
+// batch is still offered.
+func rejectUnsealed(r record.Record, t tenancy.ID) (Rejection, bool) {
+	if r.SealedFor(t) {
+		return Rejection{}, false
+	}
+	return Rejection{
+		ID:     r.ID,
+		Cause:  outbox.NewCause(outbox.ClassInternal).WithCode(codeWrongTenant),
+		Detail: detailWrongTenant,
+	}, true
 }

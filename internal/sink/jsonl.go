@@ -98,6 +98,12 @@ func (j *JSONL) Deliver(ctx context.Context, t tenancy.ID, recs []record.Record)
 		lines  []byte
 	)
 	for _, r := range recs {
+		// The tenant is the file here, so a record sealed for another tenant would be
+		// written into this one's and a reader of the file would have no way to know.
+		if rejection, wrong := rejectUnsealed(r, t); wrong {
+			result.Rejected = append(result.Rejected, rejection)
+			continue
+		}
 		doc, err := json.Marshal(j.names.rename(r))
 		if err == nil {
 			lines, err = appendLine(lines, doc)

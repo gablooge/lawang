@@ -58,18 +58,30 @@ func TestTheStatusTable(t *testing.T) {
 	cases := map[int]want{
 		401: {action: sink.ActionHalt, class: "sink refused the credential (status 401)"},
 		403: {action: sink.ActionHalt, class: "sink refused the credential (status 403)"},
-		// A verdict on the request Lawang built, not on anything in it: its size, its URL,
-		// its media type or its protocol version. An operator changes a number or a
-		// receiver, and until then the ladder would only repeat the same request.
+		// Every 4xx that the refusal band does not name is a verdict on the request and
+		// not on anything in it, so it halts and kills nothing. This is the default and not
+		// a list, which is what makes a status nobody has thought of safe: an operator
+		// changes a number, a credential, an endpoint or a receiver, and until then the
+		// ladder would only send the same request again.
 		400: {action: sink.ActionHalt, class: "sink refused the request (status 400)"},
+		402: {action: sink.ActionHalt, class: "sink refused the request (status 402)"},
+		404: {action: sink.ActionHalt, class: "sink refused the request (status 404)"},
+		405: {action: sink.ActionHalt, class: "sink refused the request (status 405)"},
+		406: {action: sink.ActionHalt, class: "sink refused the request (status 406)"},
+		409: {action: sink.ActionHalt, class: "sink refused the request (status 409)"},
+		410: {action: sink.ActionHalt, class: "sink refused the request (status 410)"},
+		411: {action: sink.ActionHalt, class: "sink refused the request (status 411)"},
 		413: {action: sink.ActionHalt, class: "sink refused the request (status 413)"},
 		414: {action: sink.ActionHalt, class: "sink refused the request (status 414)"},
 		415: {action: sink.ActionHalt, class: "sink refused the request (status 415)"},
+		421: {action: sink.ActionHalt, class: "sink refused the request (status 421)"},
 		426: {action: sink.ActionHalt, class: "sink refused the request (status 426)"},
-		404: {refused: true, class: "sink rejected the record (status 404)"},
-		409: {refused: true, class: "sink rejected the record (status 409)"},
+		431: {action: sink.ActionHalt, class: "sink refused the request (status 431)"},
+		451: {action: sink.ActionHalt, class: "sink refused the request (status 451)"},
+		499: {action: sink.ActionHalt, class: "sink refused the request (status 499)"},
+		// The whole refusal band: the one status HTTP defines as a verdict on the content
+		// of the request rather than on the request message.
 		422: {refused: true, class: "sink rejected the record (status 422)"},
-		499: {refused: true, class: "sink rejected the record (status 499)"},
 		408: {action: sink.ActionRetry, class: "sink unavailable (status 408)"},
 		429: {action: sink.ActionRetry, class: "sink unavailable (status 429)"},
 		500: {action: sink.ActionRetry, class: "sink unavailable (status 500)"},
@@ -92,6 +104,17 @@ func TestTheStatusTable(t *testing.T) {
 		}
 		if got := cause.String(); got != w.class {
 			t.Errorf("status %d: cause %q, want %q", status, got, w.class)
+		}
+	}
+	// The refusal band is exactly 422, and nothing else may kill a record. This is the
+	// assertion that fails if the default for an unrecognised 4xx is ever inverted back:
+	// before ADR 13's second revision, 404, 405, 406, 410, 411, 421 and 431 all dead-lettered
+	// every record of every chunk of every batch on that endpoint, permanently and quietly,
+	// so an endpoint typo destroyed a tenant's records and nothing halted to say so.
+	for status := 400; status <= 499; status++ {
+		_, _, refused := sink.StatusVerdict(status, "")
+		if want := status == http.StatusUnprocessableEntity; refused != want {
+			t.Errorf("status %d: refused %v, want %v: the refusal band is 422 alone", status, refused, want)
 		}
 	}
 	// Every status from 100 to 599 is either a refusal of the records or a fault with one of
@@ -121,8 +144,10 @@ func TestALiveAnswerIsClassifiedTheSameWay(t *testing.T) {
 	for status, want := range map[int]sink.Action{
 		401: sink.ActionHalt,
 		403: sink.ActionHalt,
+		404: sink.ActionHalt,
 		413: sink.ActionHalt,
 		426: sink.ActionHalt,
+		431: sink.ActionHalt,
 		500: sink.ActionRetry,
 		503: sink.ActionRetry,
 		422: sink.ActionUnset,
@@ -306,6 +331,19 @@ func TestAnAnswerThatDoesNotSayWhatLandedIsRetried(t *testing.T) {
 		"a string": `"ok"`,
 		"a number": `12`,
 		"null":     `null`,
+		// The member has to be a list. A receiver that writes something else there has
+		// said something this sink cannot read, and the sink does not guess at it. null
+		// is the one that matters: encoding/json reads the literal null into a slice as an
+		// empty one with no error, so before this it meant "every record landed", which is
+		// the one direction the strict answer exists to refuse. A serializer that writes an
+		// absent list as null is ordinary.
+		"the member is null":     `{"rejected":null}`,
+		"the member is a string": `{"rejected":"all of them"}`,
+		"the member is an object": fmt.Sprintf(
+			`{"rejected":{"id":%q}}`, known.ID),
+		"the member is a number":              `{"rejected":5}`,
+		"the member is a list of strings":     fmt.Sprintf(`{"rejected":[%q]}`, known.ID),
+		"the member is a list holding a null": `{"rejected":[null]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -530,6 +568,74 @@ func TestAVerdictOnTheRequestHaltsAndKillsNoRecord(t *testing.T) {
 				t.Errorf("rejected %+v, want none", result.Rejected)
 			}
 		})
+	}
+}
+
+// TestAnUnrecognisedStatusHaltsAndKillsNoRecord is the pin on the default the maintainer
+// inverted, and it is a live test because the band is only worth anything through Deliver.
+//
+// Each of these dead-lettered both records of the batch before, permanently and quietly, with
+// last_error reading "sink rejected the record (status NNN)" and nothing halting to point an
+// operator anywhere. 404 is an endpoint typo, 405 a receiver that takes only GET on that path,
+// 410 and 421 a receiver that moved, 406 the Accept header, and 411 and 431 the request's own
+// headers. 431 in particular is provoked by a tenant whose bearer token is a large JWT in front
+// of a proxy with a small header buffer, which made the loss per-tenant and decided by the shape
+// of one tenant's credential. 402 and 451 are verdicts on the account and on the resource, 409
+// is a conflict with the state of the endpoint that names no record, and 499 is a status no
+// standard defines, which is the case the default exists for.
+func TestAnUnrecognisedStatusHaltsAndKillsNoRecord(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{402, 404, 405, 406, 409, 410, 411, 421, 431, 451, 499} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			t.Parallel()
+			recs := []record.Record{
+				rec(t, tenantA, func(r *record.Record) { r.Version = "1" }),
+				rec(t, tenantA, func(r *record.Record) { r.Version = "2" }),
+			}
+			s := serving(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}, sink.HTTPConfig{})
+			result, err := s.Deliver(context.Background(), tenantA, recs)
+			f := fault(t, err)
+			if f.Action != sink.ActionHalt {
+				t.Errorf("action %v, want halt: nothing in this answer is about a record, so no record may be killed", f.Action)
+			}
+			if want := fmt.Sprintf("sink refused the request (status %d)", status); f.Cause.String() != want {
+				t.Errorf("cause %q, want %q", f.Cause.String(), want)
+			}
+			if len(result.Rejected) != 0 {
+				t.Errorf("rejected %+v, want none", result.Rejected)
+			}
+		})
+	}
+}
+
+// TestTheRefusalBandIsOneStatus, live: 422 is the one status outside 2xx that refuses the records
+// of the request it answered, and a receiver that uses it still has every record of that request
+// dead-lettered, because which records share a request is the sender's arithmetic and not the
+// receiver's choice. That is why the protocol asks a receiver to answer 2xx with a "rejected"
+// list instead.
+func TestTheRefusalBandIsOneStatus(t *testing.T) {
+	t.Parallel()
+	recs := []record.Record{
+		rec(t, tenantA, func(r *record.Record) { r.Version = "1" }),
+		rec(t, tenantA, func(r *record.Record) { r.Version = "2" }),
+	}
+	s := serving(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = io.WriteString(w, `{"code":"bad_kind"}`)
+	}, sink.HTTPConfig{})
+	result, err := s.Deliver(context.Background(), tenantA, recs)
+	if err != nil {
+		t.Fatalf("Deliver: %v, want the refusal reported record by record", err)
+	}
+	if len(result.Rejected) != 2 {
+		t.Fatalf("rejected %+v, want both records of the request", result.Rejected)
+	}
+	for _, r := range result.Rejected {
+		if want := "sink rejected the record (status 422, code bad_kind)"; r.Cause.String() != want {
+			t.Errorf("cause %q, want %q", r.Cause.String(), want)
+		}
 	}
 }
 
@@ -897,15 +1003,32 @@ func TestASinkURLSecretNeverLeaves(t *testing.T) {
 		r.Text = strings.Repeat("x", 4096)
 	})
 
-	// The attempts below drive every place http.go builds a Fault or a Rejection, against an
-	// endpoint whose query string holds the marker. A receiver that echoes the request URL
-	// back is a real thing for a 404. The places, so that a tenth one added to http.go is
-	// visibly missing from this list rather than silently unreached: the no-credential
-	// refusal, the status halt, the status retry, the per-request refusal, the unreadable
-	// answer, the transport failure, the 2xx "rejected" list, the record that is too large and
-	// the record the format refuses. The tenth, the NewRequestWithContext branch, is
-	// unreachable from a caller that passes a context, and its Detail is a constant of this
-	// package that carries nothing from the request.
+	// The attempts below drive every place this package builds a Fault or a Rejection, against
+	// an endpoint whose query string holds the marker. A receiver that echoes the request URL
+	// back is a real thing for a 404. The places, so that a twelfth one added to this package
+	// is visibly missing from this list rather than silently unreached:
+	//
+	//  1. the no-credential refusal, which is the one that holds the endpoint and the token
+	//     at once;
+	//  2. the credential halt (401, 403);
+	//  3. the request halt, which is every other 4xx outside the refusal band;
+	//  4. the status retry (5xx and anything else);
+	//  5. the refusal of the records of one request (422);
+	//  6. the unreadable answer;
+	//  7. the transport failure;
+	//  8. the 2xx "rejected" list;
+	//  9. the record that is larger than one request;
+	// 10. the record the format refuses;
+	// 11. the record that is not sealed for the tenant it is being delivered under.
+	//
+	// The twelfth, the NewRequestWithContext branch, is unreachable from a caller that passes
+	// a context, and its Detail is a constant of this package that carries nothing from the
+	// request.
+	//
+	// Two of these are here because a leak reached them and nothing searched them. Site 3
+	// arrived with the halt band and survived a Detail built from the receiver's echoed code
+	// (mutation T3). A split batch is driven too, because a leak confined to a request that is
+	// not the first of one is otherwise unsearched (mutation T2).
 	endpointOf := func(base string) string { return base + "/deliver?api_key=" + marker }
 	echoing := `{"code":"see https://sink.example/deliver?api_key=` + marker + `"}`
 
@@ -942,7 +1065,35 @@ func TestASinkURLSecretNeverLeaves(t *testing.T) {
 			},
 		},
 		{name: "401", endpoint: endpointOf, handler: status(401), wantFault: true},
+		// The halt band outside the credential, which is where the ClassSinkRefused fault
+		// is built. 413 and 404 are the two shapes of it: a verdict on the request message,
+		// and the default for a 4xx this sink does not recognise.
+		{name: "413", endpoint: endpointOf, handler: status(413), wantFault: true},
+		{name: "404", endpoint: endpointOf, handler: status(404), wantFault: true},
 		{name: "500", endpoint: endpointOf, handler: status(500), wantFault: true},
+		{
+			// A split batch, so that the fault comes from a request that is not the
+			// first. The first request answers 204 and the second halts.
+			name: "a halt on the second request of a split batch", endpoint: endpointOf,
+			wantFault: true, recs: []record.Record{big, recs[0]},
+			cfg: sink.HTTPConfig{MaxRequestBytes: len(doc(t, big)) + 64},
+			handler: func() http.HandlerFunc {
+				var mu sync.Mutex
+				sent := 0
+				return func(w http.ResponseWriter, _ *http.Request) {
+					mu.Lock()
+					sent++
+					n := sent
+					mu.Unlock()
+					if n == 1 {
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
+					w.WriteHeader(http.StatusRequestEntityTooLarge)
+					_, _ = io.WriteString(w, echoing)
+				}
+			}(),
+		},
 		{name: "an answer that cannot be read", endpoint: endpointOf, wantFault: true, handler: func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = io.WriteString(w, `not json, and here is the url again: ?api_key=`+marker)
 		}},
@@ -978,6 +1129,11 @@ func TestASinkURLSecretNeverLeaves(t *testing.T) {
 			name: "a record the format refuses", endpoint: endpointOf,
 			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) },
 			recs:    []record.Record{{}, recs[0]}, wantRejections: 1,
+		},
+		{
+			name: "a record sealed for another tenant", endpoint: endpointOf,
+			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) },
+			recs:    []record.Record{rec(t, tenantB), recs[0]}, wantRejections: 1,
 		},
 	}
 	for _, a := range attempts {

@@ -1,6 +1,7 @@
 package sink_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -25,8 +26,16 @@ import (
 func TestARecordTheFormatRefusesIsOneRejection(t *testing.T) {
 	t.Parallel()
 	good := rec(t, tenantA)
-	// The zero Record has no format, no id and no scope, so MarshalJSON refuses it.
-	batch := []record.Record{{}, good}
+	// Sealed for this tenant and still refused by the format, so the rejection is about the
+	// format and not about the seal: the audience is changed after Seal, which leaves
+	// SealedFor true (the seal covers the id, the external id, the version, the scope, the op
+	// and the kind) and Validate inside MarshalJSON false.
+	broken := rec(t, tenantA, func(r *record.Record) { r.Version = "2" })
+	broken.Visibility.Audience = "nobody"
+	if !broken.SealedFor(tenantA) {
+		t.Fatalf("the record stopped being sealed for the tenant, so this case no longer tests the format")
+	}
+	batch := []record.Record{broken, good}
 
 	httpSink := serving(t, func(w http.ResponseWriter, r *http.Request) {
 		if _, err := io.ReadAll(r.Body); err != nil {
@@ -59,6 +68,66 @@ func TestARecordTheFormatRefusesIsOneRejection(t *testing.T) {
 	}
 	if got := len(lines(t, dir, tenantA)); got != 1 {
 		t.Errorf("the file has %d lines, want the good one", got)
+	}
+}
+
+// TestARecordSealedForAnotherTenantIsRefusedByEverySink.
+//
+// The tenant is in no field of the envelope, so a record sealed for tenant B marshals exactly
+// the same when it goes out under tenant A, and neither MarshalJSON nor a receiver can tell.
+// Before this check, HTTP.Deliver posted tenant B's record to tenant A's endpoint under tenant
+// A's bearer token with no error and no rejection, jsonl wrote it into tenant A's file and the
+// stub filed it under tenant A. record.SealedFor is the one thing that can see it, and the
+// Sink interface now says each Deliver asks it.
+func TestARecordSealedForAnotherTenantIsRefusedByEverySink(t *testing.T) {
+	t.Parallel()
+	good := rec(t, tenantA)
+	foreign := rec(t, tenantB)
+	batch := []record.Record{foreign, good}
+
+	var posted [][]byte
+	httpSink := serving(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read: %v", err)
+		}
+		posted = append(posted, body)
+		w.WriteHeader(http.StatusNoContent)
+	}, sink.HTTPConfig{})
+	stub := newStub(t, sink.StubConfig{})
+	jsonlSink, dir := newJSONL(t, nil)
+
+	for name, s := range map[string]sink.Sink{"http": httpSink, "stub": stub, "jsonl": jsonlSink} {
+		result, err := s.Deliver(context.Background(), tenantA, batch)
+		if err != nil {
+			t.Fatalf("%s: Deliver: %v", name, err)
+		}
+		if len(result.Rejected) != 1 || result.Rejected[0].ID != foreign.ID {
+			t.Fatalf("%s: rejected %+v, want the foreign record alone", name, result.Rejected)
+		}
+		if want := "internal error (code wrong_tenant)"; result.Rejected[0].Cause.String() != want {
+			t.Errorf("%s: cause %q, want %q", name, result.Rejected[0].Cause.String(), want)
+		}
+		if want := "the record was not sealed for this tenant"; result.Rejected[0].Detail != want {
+			t.Errorf("%s: detail %q, want %q", name, result.Rejected[0].Detail, want)
+		}
+	}
+
+	// And the foreign record reached no receiver under tenant A.
+	for i, body := range posted {
+		if bytes.Contains(body, []byte(foreign.ID)) {
+			t.Errorf("request %d carried the foreign record: %s", i, body)
+		}
+	}
+	if docs := stub.Documents(tenantA); len(docs) != 1 || !bytes.Contains(docs[0], []byte(good.ID)) {
+		t.Errorf("the stub holds %d documents under tenant A, want the tenant's own", len(docs))
+	}
+	if docs := stub.Documents(tenantB); len(docs) != 0 {
+		t.Errorf("the stub filed %d documents under tenant B, want none: nothing was delivered under it", len(docs))
+	}
+	written := lines(t, dir, tenantA)
+	if len(written) != 1 || bytes.Contains(written[0], []byte(foreign.ID)) {
+		t.Errorf("the file holds %d lines, want the tenant's own record alone", len(written))
 	}
 }
 

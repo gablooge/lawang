@@ -35,15 +35,16 @@ const (
 	detailNoRequest       = "the request could not be built"
 	detailInvalidRecord   = "the record does not pass the format"
 	detailWriteFailed     = "the file could not be written"
+	detailWrongTenant     = "the record was not sealed for this tenant"
 )
 
 // faultDetails is every phrase above, as a list a test can walk.
 // TestADetailIsAlwaysThisPackagesOwnPhrase reads the constants out of this package's own source
-// and holds the two together, so a thirteenth phrase that is not listed here fails.
+// and holds the two together, so a fourteenth phrase that is not listed here fails.
 var faultDetails = []string{
 	detailTimedOut, detailNoSuchHost, detailRefused, detailTLS, detailConnection,
 	detailCancelled, detailNoCredential, detailUnreadableReply, detailRecordTooLarge,
-	detailNoRequest, detailInvalidRecord, detailWriteFailed,
+	detailNoRequest, detailInvalidRecord, detailWriteFailed, detailWrongTenant,
 }
 
 // The error codes this package puts in a Cause for a record Lawang itself refused. Detail says
@@ -54,6 +55,7 @@ var faultDetails = []string{
 const (
 	codeRecordTooLarge = "record_too_large"
 	codeInvalidRecord  = "invalid_record"
+	codeWrongTenant    = "wrong_tenant"
 )
 
 // Defaults of HTTPConfig.
@@ -115,7 +117,9 @@ type HTTPConfig struct {
 // delivery (architecture section 4). "v" is the version of this protocol, ProtocolVersion, and
 // it is what lets the answer grow a second member one day without every receiver written for v1
 // having to guess. A receiver that does not speak the version refuses the request with 426, or
-// with 400, and both halt: see the status bands below.
+// with 400, and both halt: see the status bands below. Nothing bounds the bearer token's
+// length, so a large credential in front of a proxy with a small header buffer draws a 431,
+// which halts for the same reason.
 //
 // The request also carries Accept: application/json, because the only answer this sink can read
 // is the JSON one below.
@@ -126,30 +130,33 @@ type HTTPConfig struct {
 //
 // The answer is strict about that member, which is the decision on issue #9. An empty body,
 // whitespace, or {} means every record was taken. Any other body must be a JSON object carrying
-// a "rejected" member, spelled exactly that way; a body that is valid JSON and carries no member
-// this sink knows is unreadable, as are a body that does not parse, a body that is not an
-// object, an id that was not in the request and an id named twice. Unreadable means nothing is
-// marked delivered and the batch is retried. The cost, which the maintainer accepted: a receiver
-// that answers 200 with its own bookkeeping and no "rejected" member now fails loudly instead of
+// a "rejected" member, spelled exactly that way, whose value is a JSON list; a body that is
+// valid JSON and carries no member this sink knows is unreadable, as are a body that does not
+// parse, a body that is not an object, a "rejected" that is not a list (null included), an id
+// that was not in the request and an id named twice. Unreadable means nothing is marked
+// delivered and the batch is retried. The cost, which the maintainer accepted: a receiver that
+// answers 200 with its own bookkeeping and no "rejected" member now fails loudly instead of
 // losing the records it refused silently.
 //
 // Any other status is classified by statusOf, in three bands.
 //
-//   - A verdict on the request this sink built, which halts: the credential (401, 403) and the
-//     request message itself, its size (413), its URL (414), its media type (415) and its
-//     protocol version (400, 426). None of them says anything about a record. An operator
-//     changes a number, a credential or a receiver, and until then the ladder would only send
-//     the same request again.
+//   - Halt, a verdict on the request and not on anything in it: the credential (401, 403) and
+//     every other 4xx outside the two bands below, which is the default. An operator changes a
+//     credential, a number, an endpoint or a receiver, and until then the ladder would only
+//     send the same request again. Nothing is killed.
 //   - Retried: 408, 429 and everything that is not a 4xx.
-//   - Every other 4xx is the receiver refusing what was sent, which is a verdict on the records
-//     of that one request, so each of them comes back as a Rejection and the records of the
-//     other requests are still offered.
+//   - A refusal of the records of that one request: 422 alone, which is the one status HTTP
+//     defines as a verdict on the content of the request. Each record of that request comes
+//     back as a Rejection and the records of the other requests are still offered.
 //
 // So the two faults leave the whole batch undelivered, and a Rejection speaks for the records of
 // the request it answered and for no others. A sink never kills a record it has not offered.
-// Which records share a request is decided by the byte arithmetic below and not by the sender,
+// Which records share a request is decided by the byte arithmetic below and not by the receiver,
 // so a receiver that wants to refuse one record of a request answers 2xx with a "rejected" list:
-// a 4xx in the refusal band kills every record of the request it answered.
+// a 422 kills every record of the request it answered.
+//
+// statusOf has the reasoning for the band, including why the default for an unrecognised 4xx is
+// halt and which statuses were weighed for the refusal band and left out.
 //
 // The client's CheckRedirect returns http.ErrUseLastResponse, so a 3xx comes back as the
 // response and the next request still goes to the configured endpoint rather than to one the
@@ -241,7 +248,7 @@ func (h *HTTP) Deliver(ctx context.Context, t tenancy.ID, recs []record.Record) 
 			Detail: detailNoCredential,
 		}
 	}
-	docs, result := h.marshalAll(recs)
+	docs, result := h.marshalAll(t, recs)
 	var chunk [][]byte
 	var ids []string
 	size := bodyFraming
@@ -283,13 +290,19 @@ func (h *HTTP) Deliver(ctx context.Context, t tenancy.ID, recs []record.Record) 
 }
 
 // marshalAll turns every record into its document, under the configured wire name. The entry of a
-// record that cannot be sent is nil, and its rejection is in the result: a record the format
-// refuses, which is Lawang's own defect and not the receiver's, and one whose document alone
-// cannot fit a request.
-func (h *HTTP) marshalAll(recs []record.Record) ([][]byte, DeliveryResult) {
+// record that cannot be sent is nil, and its rejection is in the result: a record that is not
+// this tenant's, a record the format refuses, which is Lawang's own defect and not the
+// receiver's, and one whose document alone cannot fit a request.
+func (h *HTTP) marshalAll(t tenancy.ID, recs []record.Record) ([][]byte, DeliveryResult) {
 	docs := make([][]byte, len(recs))
 	var result DeliveryResult
 	for i, r := range recs {
+		// Before the record is marshalled, because a record that is not this tenant's has
+		// no business being turned into bytes that go out under this tenant's credential.
+		if rejection, wrong := rejectUnsealed(r, t); wrong {
+			result.Rejected = append(result.Rejected, rejection)
+			continue
+		}
 		doc, err := json.Marshal(h.names.rename(r))
 		switch {
 		case err != nil:
@@ -378,6 +391,9 @@ func (h *HTTP) send(ctx context.Context, token string, chunk [][]byte, ids []str
 // empty list and have every record of the batch marked delivered with the refused ones lost and
 // nothing in last_error. The member is matched by its exact spelling rather than by
 // encoding/json's case-insensitive rule, so "Rejected" is a member this sink does not know.
+//
+// The member's value must be a JSON list, and null is not one: {"rejected":null} is unreadable
+// and not an empty list, for the same reason.
 func rejectionsFrom(answer []byte, ids []string, status int) ([]Rejection, error) {
 	trimmed := bytes.TrimSpace(answer)
 	if len(trimmed) == 0 {
@@ -393,6 +409,15 @@ func rejectionsFrom(answer []byte, ids []string, status int) ([]Rejection, error
 		if len(members) == 0 {
 			return nil, nil
 		}
+		return nil, unreadableFault(status)
+	}
+	// The member has to be a JSON list. encoding/json reads the literal null into a slice as
+	// an empty one with no error, so without this line {"rejected":null} meant "every record
+	// was taken", which is the one direction the strict answer exists to refuse: believing an
+	// answer the sink did not understand. A serializer that writes an absent list as null is
+	// ordinary, and a receiver that has refused nothing has an empty body and [] to say so.
+	// Anything else in the member (a string, a number, an object) fails the decode below.
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return nil, unreadableFault(status)
 	}
 	var rejected []struct {
@@ -446,9 +471,49 @@ type statusVerdict struct {
 	refused outbox.Cause
 }
 
-// statusOf is what the sink does about a status outside 2xx, and it is the whole of the rule:
-// the cases below are the statuses named in architecture section 11, and anything else is
-// retried. TestTheStatusTable walks it, status by status from 100 to 599.
+// statusOf is what the sink does about a status outside 2xx, and it is the whole of the rule.
+// TestTheStatusTable walks it, status by status from 100 to 599.
+//
+// # Why an unrecognised 4xx halts
+//
+// Under the frozen protocol, a receiver that wants to refuse records answers 2xx with a
+// "rejected" list. So the band that kills records on a 4xx only ever serves a receiver that does
+// not follow the protocol, and whatever its default is, is what an unforeseen status does to a
+// tenant's records. It used to be "kill every record of the request". That dead-lettered both
+// records of a two record batch on 404, 405, 406, 410, 411, 421 and 431, permanently and
+// quietly, with last_error reading "sink rejected the record (status NNN)": an endpoint typo
+// destroyed a tenant's records, a receiver that takes only GET on that path did the same, and a
+// 431 made the loss per-tenant, decided by the length of one tenant's bearer token in front of a
+// proxy with a small header buffer. Nothing halted, so nothing told an operator to look.
+//
+// The default is now the other way, which is this project's fail-closed rule and the same trade
+// already taken for the strict 2xx body: a non-conformant receiver stalls loudly instead of
+// dead-lettering silently, and the records are still there when an operator has fixed it. It
+// also covers every 4xx nobody has thought of, which an enumeration never can.
+//
+// # The refusal band
+//
+// 422 alone. It is the one status HTTP defines as a verdict on the content of the request rather
+// than on the request message: the syntax is correct and the server could not process the
+// instructions it carried (RFC 9110 section 15.5.21). Each of the nearest candidates was weighed
+// and left out:
+//
+//   - 400 is a verdict on the request message, and a receiver refusing this protocol's version
+//     answers it (ADR 13), so it would kill records for a mismatch no record caused.
+//   - 409 is a conflict with the state of the target resource, which is the endpoint and not a
+//     record. It names no record, and it is what a receiver answers on a lost race, which is
+//     retryable rather than fatal. The per-record conflict this format can have, an id that
+//     arrives again with different content, is reported by a conformant receiver in a
+//     "rejected" list.
+//   - 404, 405, 406, 410, 411, 415, 421 and 431 are all verdicts on the request target, the
+//     method, the Accept header, the resource's existence, Content-Length, the media type, the
+//     authority or the header fields. None of them is about a record.
+//   - 413 and 414 are the request's size and URL, which an operator fixes with MaxRequestBytes
+//     or with the endpoint.
+//
+// Even inside the band, a 422 kills every record of the request it answered, because which
+// records share a request is this sink's byte arithmetic and not the receiver's choice. That is
+// why the protocol asks a receiver to answer 2xx with a "rejected" list instead.
 func statusOf(status int, code string) statusVerdict {
 	switch {
 	case status == http.StatusUnauthorized, status == http.StatusForbidden:
@@ -457,32 +522,23 @@ func statusOf(status int, code string) statusVerdict {
 			Action: ActionHalt,
 			Cause:  outbox.NewCause(outbox.ClassSinkUnauthorized).WithStatus(status).WithCode(code),
 		}}
-	case status == http.StatusBadRequest,
-		status == http.StatusRequestEntityTooLarge,
-		status == http.StatusRequestURITooLong,
-		status == http.StatusUnsupportedMediaType,
-		status == http.StatusUpgradeRequired:
-		// A verdict on the request this sink built and not on anything in it: its size, its
-		// URL, its media type, or the protocol version a receiver does not speak. Treating
-		// these as the receiver refusing the records dead-lettered every record of every
-		// chunk of every batch on that endpoint, permanently and quietly, for a mismatch an
-		// operator fixes by lowering MaxRequestBytes or upgrading a receiver. Halting leaves
-		// the row prepared and loses nothing.
-		//
-		// The line is drawn at the statuses HTTP defines as a verdict on the request
-		// message. Every other 4xx stays below, because the protocol's own instruction to a
-		// receiver that wants to refuse records is to answer 2xx with a "rejected" list.
+	case status == http.StatusRequestTimeout, status == http.StatusTooManyRequests:
+		// Both ask for the same bytes again later.
+	case status == http.StatusUnprocessableEntity:
+		// The whole refusal band: the receiver refused the content of the request, and the
+		// same bytes come back the same way.
+		return statusVerdict{
+			refused: outbox.NewCause(outbox.ClassSinkRejected).WithStatus(status).WithCode(code),
+		}
+	case status >= 400 && status <= 499:
+		// A verdict on the request this sink built, not on anything in it. An operator
+		// changes a number, a credential, an endpoint or a receiver, and until then the
+		// ladder would only send the same request again. Halting leaves the row prepared
+		// and loses nothing.
 		return statusVerdict{fault: &Fault{
 			Action: ActionHalt,
 			Cause:  outbox.NewCause(outbox.ClassSinkRefused).WithStatus(status).WithCode(code),
 		}}
-	case status == http.StatusRequestTimeout, status == http.StatusTooManyRequests:
-		// Both ask for the same bytes again later.
-	case status >= 400 && status <= 499:
-		// The receiver refused what was sent, and the same bytes come back the same way.
-		return statusVerdict{
-			refused: outbox.NewCause(outbox.ClassSinkRejected).WithStatus(status).WithCode(code),
-		}
 	}
 	return statusVerdict{fault: &Fault{
 		Action: ActionRetry,

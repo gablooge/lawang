@@ -112,6 +112,12 @@ func (s *Stub) Deliver(_ context.Context, t tenancy.ID, recs []record.Record) (D
 	}
 	var result DeliveryResult
 	for _, r := range recs {
+		// A record sealed for another tenant would otherwise be filed under this one, and
+		// a receiver that keeps tenants apart by the credential cannot tell.
+		if rejection, wrong := rejectUnsealed(r, t); wrong {
+			result.Rejected = append(result.Rejected, rejection)
+			continue
+		}
 		doc, err := json.Marshal(s.names.rename(r))
 		if err != nil {
 			result.Rejected = append(result.Rejected, Rejection{
