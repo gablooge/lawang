@@ -1062,7 +1062,8 @@ internal/
   tenancy/            tenant context and RLS binding
   store/              pgx pool, preflight, transaction helpers, migrate
   testdb/             a real Postgres for integration tests, as the application role
-  outbox/             accept insert, FIFO-head claim, retry ladder, dead letters
+  outbox/             accept insert, FIFO-head claim, retry ladder, the records of a delivery,
+                      dead letters per row and per record, halt and replay
   ingress/            the /ingress/{provider} HTTP edge: raw body, size cap, handshake
   hub/                the subscription table, verify, resolve owner, accept, park
   pipeline/           normalize, gate, ledger, supersede, mask, deliver
