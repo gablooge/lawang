@@ -1,0 +1,376 @@
+package pipeline
+
+import (
+	"bytes"
+	"cmp"
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/gablooge/lawang/internal/pipeline/pipelinedb"
+	"github.com/gablooge/lawang/internal/provider"
+	"github.com/gablooge/lawang/internal/record"
+	"github.com/gablooge/lawang/internal/tenancy"
+)
+
+// queriesOn is the typed queries over one transaction.
+func queriesOn(tx pgx.Tx) *pipelinedb.Queries { return pipelinedb.New(tx) }
+
+// admission is what the ledger decided about one record.
+type admission uint8
+
+const (
+	// admitNone: the ledger could not answer at all, because the database did not. It always
+	// comes back with an error, and it is the zero value so that a decision is never counted by
+	// accident.
+	admitNone admission = iota
+	// admitPrepare: a record nobody has seen, linked to its entity's newest record and written to
+	// the ledger. It goes to the sink.
+	admitPrepare
+	// admitSkip: an id the ledger already holds, in a shape that says nothing is wrong.
+	admitSkip
+	// admitStale: a record older than what the entity already has prepared.
+	admitStale
+	// admitScopeReturned: the A, B, back to A case of ADR 4 decision 7. It comes back with
+	// ErrScopeReturned, and the decision is counted as well as refused because ADR 4 asks for both.
+	admitScopeReturned
+	// admitVersionUnordered: two versions of one entity that carry no order this stage can read.
+	// It comes back with ErrVersionNotComparable, and is counted for the same reason.
+	admitVersionUnordered
+)
+
+// ledger is the ledger stage for one tenant and one provider, over one transaction.
+type ledger struct {
+	q        *pipelinedb.Queries
+	tenant   tenancy.ID
+	provider string
+	// versions is the spelling this provider declared for its versions, as the registry
+	// validated it. It travels with the delivery rather than being asked of the provider again,
+	// so a provider that changes its answer after start-up cannot change how a stored delivery
+	// is ordered. The zero value orders nothing, which is what fails a delivery closed.
+	versions provider.VersionOrder
+}
+
+// lockEntities takes the advisory lock of every entity in the delivery, once each, in a sorted
+// order.
+//
+// Sorted, because a delivery can carry several entities (a comment and the task it hangs under),
+// and two transactions that took the same two locks in opposite orders would deadlock. Sorting
+// gives every transaction in the program one order, so they can only ever queue.
+func (l ledger) lockEntities(ctx context.Context, recs []record.Record) error {
+	for _, k := range entityKeys(recs) {
+		if err := l.q.LockEntity(ctx, pipelinedb.LockEntityParams{
+			TenantID: l.tenant.String(), Provider: l.provider, ExternalID: k,
+		}); err != nil {
+			return fmt.Errorf("pipeline: lock the entity: %w", err)
+		}
+	}
+	return nil
+}
+
+// entityKeys is the entities of a delivery, each once, in the order their locks are taken.
+//
+// The order is what matters and it is why this is a function of its own: two transactions that
+// took the locks of the same two entities in opposite orders would deadlock, and one sorted order
+// for every caller in the program is what turns that into queueing. Sorting also makes
+// slices.Compact drop every repeat, so a delivery that carries two versions of one entity, or an
+// entity twice, locks it once.
+func entityKeys(recs []record.Record) []string {
+	keys := make([]string, 0, len(recs))
+	for _, r := range recs {
+		keys = append(keys, r.ExternalID)
+	}
+	slices.Sort(keys)
+	return slices.Compact(keys)
+}
+
+// admit decides what happens to one record, and writes the ledger row when it is to be delivered.
+//
+// The order of the questions is ADR 4, decision 7, and each one rules out a shape the next must
+// not be asked about:
+//
+//  1. Is this id already prepared? If not, it is a new record and only the chain's direction is
+//     left to settle.
+//  2. Is it still its entity's newest record? A re-drain of the newest record, a backfill that
+//     overlaps the live feed and a provider that sent one version twice all stop here, as a skip.
+//  3. Is the newest record in a different scope? A late re-send of an old version is not, because
+//     a record hydrated at drain time carries the scope the entity is in now. What is left is an
+//     entity that moved back into a scope it already had, or a stale record built from a webhook
+//     body in the scope the entity has left. Those want opposite treatments and the ledger cannot
+//     tell them apart, so it dead-letters rather than guess, which is the whole point of the rule:
+//     the alternative is skipping, and skipping leaves the record at the sink in the scope the
+//     entity has left, with nothing reported.
+//
+// The rule also catches A, B, C, B. It cannot see delete-then-restore with an unchanged version
+// (the head's scope is the same, so question 3 says no), which fails closed and which only the
+// normalizer's rule protects; v0.1 sends no deletes, and the item that ships them settles it.
+func (l ledger) admit(ctx context.Context, r record.Record) (record.Record, admission, error) {
+	head, haveHead, err := l.head(ctx, r.ExternalID)
+	if err != nil {
+		return record.Record{}, admitNone, err
+	}
+	known, isHead, err := l.known(ctx, r.ID)
+	if err != nil {
+		return record.Record{}, admitNone, err
+	}
+	if known {
+		// ADR 4 decision 7's three conditions, written as the ADR states them so that the two can
+		// be read against each other. "known" is the first.
+		//
+		// The second, !isHead, is EQUIVALENT to what follows it and is here for the reading. When
+		// this record is its entity's head, the head row and this row are the same row, so the
+		// third condition compares a scope with itself and is false anyway: a record id hashes the
+		// external id, so a ledger row with this id can belong to no other entity. Taking !isHead
+		// out changes no answer, and a mutation of it survives every test in this package. It stays
+		// because the rule it implements is stated as three conditions and a reader has to be able
+		// to check the code against the document line by line.
+		if !isHead && haveHead && head.Scope != r.Visibility.Scope {
+			return record.Record{}, admitScopeReturned, fmt.Errorf(
+				"%w: %w: tenant %s, provider %s, entity %s, prepared in scope %s while the entity's newest record is %s in scope %s",
+				ErrDeadLetter, ErrScopeReturned,
+				l.tenant, l.provider, r.ExternalID, r.Visibility.Scope, head.RecordID, head.Scope)
+		}
+		// A re-drain of the newest record, a backfill that overlaps the live feed, or a late
+		// re-send of an older version whose entity has not moved. The sink already has this record,
+		// under this very id.
+		return record.Record{}, admitSkip, nil
+	}
+
+	// A record nobody has prepared. The only question left is which way the link points.
+	//
+	// The chain is ordered by the provider's version, which a normalizer promises never goes
+	// backwards for one external id (ADR 4). What that promise means for a string the format calls
+	// opaque is not something this stage can work out: it reads the spelling the provider declared
+	// (provider.VersionOrder, validated at registration) and compares under that, and two versions
+	// the declared order cannot read are refused rather than guessed at, because guessing is how
+	// an older record takes the head and the scope access is decided on with it. ADR 12 decision 1
+	// says which part of that is proved here and which part is the provider's promise.
+	//
+	// Two records of one entity that carry the SAME version are ordered by arrival instead: that
+	// is the move decision 7 is about, and the second of them supersedes the first. Arrival is a
+	// weak order (ADR 12 decision 1 says where it is not an order at all), which is why it decides
+	// only this one case.
+	if haveHead {
+		order, ok := compareVersions(l.versions, r.Version, head.Version)
+		if !ok {
+			return record.Record{}, admitVersionUnordered, fmt.Errorf(
+				"%w: %w: tenant %s, provider %s, entity %s, the incoming version is %q and the entity's newest is %q, and the provider declares %s versions",
+				ErrDeadLetter, ErrVersionNotComparable,
+				l.tenant, l.provider, r.ExternalID, r.Version, head.Version, l.versions)
+		}
+		if order < 0 {
+			return record.Record{}, admitStale, nil
+		}
+	}
+	supersedes := pgtype.Text{}
+	if haveHead {
+		supersedes = pgtype.Text{String: head.RecordID, Valid: true}
+		if err := l.q.DemoteEntityHead(ctx, pipelinedb.DemoteEntityHeadParams{
+			TenantID: l.tenant.String(), Provider: l.provider, ExternalID: r.ExternalID,
+		}); err != nil {
+			return record.Record{}, admitNone, fmt.Errorf("pipeline: demote the entity head: %w", err)
+		}
+		r.Supersedes = record.Ref(head.RecordID)
+	}
+	if err := l.q.InsertLedgerEntry(ctx, pipelinedb.InsertLedgerEntryParams{
+		TenantID:   l.tenant.String(),
+		RecordID:   r.ID,
+		Provider:   l.provider,
+		ExternalID: r.ExternalID,
+		Version:    r.Version,
+		Scope:      r.Visibility.Scope,
+		Supersedes: supersedes,
+	}); err != nil {
+		return record.Record{}, admitNone, fmt.Errorf("pipeline: write the ledger row: %w", err)
+	}
+	return r, admitPrepare, nil
+}
+
+// compareVersions orders two versions of one entity under the spelling their provider declared,
+// and says whether they can be ordered at all.
+//
+// A version is opaque to a sink, but not to this stage: ADR 4 makes "monotonic per external_id" a
+// promise the provider's normalizer makes to the pipeline, and this is the stage that uses it.
+// What that promise means for a particular string is not something this function can work out, and
+// ADR 12 decision 1 is now explicit that it never could. It reads the order the provider declared
+// (provider.VersionOrder, validated at registration) and does exactly what that order says:
+//
+//   - VersionOrderDecimal: both versions must be one run of decimal digits, and they are ordered
+//     by the NUMBER they spell, whatever their length, with leading zeros counting for nothing.
+//     Proved, not promised: a version that is not a digit run is refused.
+//   - VersionOrderLexical: both versions must be the SAME NUMBER OF BYTES, and they are ordered by
+//     their bytes. The fixed width is proved here; that the byte order is the value order is the
+//     provider's promise and nothing in this program can check it. That is why it is declared once
+//     by a provider author reading provider.VersionOrder, and not inferred from two strings.
+//   - VersionOrderBase64: both versions must decode as base64, under either RFC 4648 alphabet and
+//     padded or not, to the same number of bytes, and they are ordered by those bytes. What that
+//     proves is the alphabet and the width, which is the whole reason it is a separate order:
+//     base64's ASCII order is NOT its value order ('z' is value 51 and '0' is value 52, while
+//     ASCII puts 'z' above '0'), so a changeKey or an ETag compared as characters sorts backwards
+//     at every carry. What it still RESTS ON is the provider's promise that the decoded bytes are
+//     most significant first, which provider.VersionOrder states as "big-endian": comparing bytes
+//     is the value order only for a big-endian value, and nothing here can see the layout of a
+//     payload it decodes. A little-endian counter declared as base64 gets the same unsafe half
+//     that a misdeclared lexical version gets, and ADR 12 decision 3 says so beside the lexical
+//     residual.
+//   - Anything else, VersionOrderUnset included, orders nothing (ok is false).
+//
+// Every refusal is the point of the function. Guessing an order for two strings whose order this
+// program does not know is how an older record takes the head, superseding a newer record at the
+// sink and taking the scope that access is decided on with it, which is the failure this whole
+// item exists to prevent. The refusal fails closed: the head does not move, nothing is delivered,
+// and the operator is told which two versions could not be ordered and under which declared order.
+//
+// The order this returns is total on the pairs it accepts, so it cannot disagree with itself
+// between two calls: a number, a byte comparison over equal lengths and a byte comparison over
+// equal-length decodings are all total.
+func compareVersions(order provider.VersionOrder, v, head string) (int, bool) {
+	switch order {
+	case provider.VersionOrderDecimal:
+		if isDecimal(v) && isDecimal(head) {
+			return compareDecimal(v, head), true
+		}
+	case provider.VersionOrderLexical:
+		// The width is the only half of this order that can be checked, so it is checked. A
+		// provider whose version changed width is not using the fixed-width encoding it declared,
+		// and its two versions have no order here.
+		if v != "" && len(v) == len(head) {
+			return strings.Compare(v, head), true
+		}
+	case provider.VersionOrderBase64:
+		a, okA := decodeBase64(v)
+		b, okB := decodeBase64(head)
+		if okA && okB && len(a) == len(b) {
+			return bytes.Compare(a, b), true
+		}
+	case provider.VersionOrderUnset:
+	}
+	return 0, false
+}
+
+// base64URLToStd rewrites the two characters that are all the URL-safe alphabet is: RFC 4648
+// section 5 is section 4 with 62 spelled "-" instead of "+" and 63 spelled "_" instead of "/".
+var base64URLToStd = strings.NewReplacer("-", "+", "_", "/")
+
+// decodeBase64 decodes s to the bytes it stands for, under either RFC 4648 alphabet and padded or
+// not, and reports whether s is base64 at all.
+//
+// It normalises rather than detecting, and the difference is not cosmetic. Detecting the alphabet
+// from the string was the first implementation, and it refused pairs a provider never meant to be
+// ambiguous: a 30 byte value (the width of a real Graph changeKey) URL-safe encoded contains no
+// "-" and no "_" often enough that 40% of random pairs came out under two different detected
+// alphabets and were dead-lettered, although one provider had encoded both the same way. That is
+// availability lost to a question that was never a real one.
+//
+// It was never a real one because the alphabet is not a fact about a string. Every byte a provider
+// could mean is reachable in both spellings, and the two spellings differ in exactly two
+// characters whose sets are DISJOINT: "-" and "_" against "+" and "/". So a string holding
+// neither stands for one value under either reading, a string holding one set has exactly one
+// reading, and a string holding both has none and is refused below. That is what makes the
+// normalisation total on everything it accepts and injective on the value: it never guesses, and
+// two different values can never be read as one.
+//
+// That is also why this is normalised here instead of being declared. A fourth constant beside
+// VersionOrderBase64 would make every provider author answer a question the disjointness above
+// has already answered, and getting it wrong would not be unsafe, only brittle: a URL-safe string
+// declared standard does not decode to something else, it does not decode at all, and the
+// delivery becomes a dead letter. The declaration would cost a public contract and buy an
+// availability risk. Contrast VersionOrderLexical, where the declaration buys the one fact this
+// program genuinely cannot see.
+//
+// What stays refused is what is genuinely unreadable: a string holding characters from both
+// alphabets at once, which no encoder emits and which therefore stands for no value, and anything
+// that is not base64 under either. Padding is likewise a spelling and not a value, so "AAA=" and
+// "AAA" decode to the same two bytes rather than being two alphabets.
+func decodeBase64(s string) (decoded []byte, ok bool) {
+	if s == "" {
+		return nil, false
+	}
+	urlSafe := strings.ContainsAny(s, "-_")
+	standard := strings.ContainsAny(s, "+/")
+	if urlSafe && standard {
+		// Neither RFC 4648 alphabet spells this, so it is not one base64 value, and translating it
+		// into one would be inventing the value rather than reading it.
+		return nil, false
+	}
+	if urlSafe {
+		s = base64URLToStd.Replace(s)
+	}
+	// The padding sniff and the decoder disagree about whitespace, which is worth knowing when a
+	// provider wraps a version in it: Go's decoders skip "\r" and "\n", HasSuffix does not. The
+	// measured shapes, which go both ways rather than only refusing: "AAAA\n" has no trailing
+	// "=", so it decodes as unpadded and is accepted; "AA==\n" picks RawStdEncoding and is then
+	// refused for its "="; "AA=\n=" DOES end in "=", so it picks StdEncoding, which skips the
+	// newline and accepts it; " AAAA" and "AAAA " are refused, because a space is skipped by
+	// neither. No encoder emits any of them. The disagreement costs nothing either way, because
+	// every whitespace shape that is accepted decodes to the same bytes as its clean spelling, so
+	// two spellings of one value stay one value and nothing reorders. It is left as it is. The
+	// failure the refused shapes produce looks alphabet-shaped and is padding-shaped.
+	enc := base64.RawStdEncoding
+	if strings.HasSuffix(s, "=") {
+		enc = base64.StdEncoding
+	}
+	b, err := enc.DecodeString(s)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// compareDecimal orders two runs of decimal digits by the number they spell. Leading zeros are not
+// part of a number, so "009" and "9" are one version, which arrival order then decides between.
+func compareDecimal(a, b string) int {
+	a, b = strings.TrimLeft(a, "0"), strings.TrimLeft(b, "0")
+	if len(a) != len(b) {
+		return cmp.Compare(len(a), len(b))
+	}
+	return strings.Compare(a, b)
+}
+
+// isDecimal reports whether s is one non-empty run of decimal digits and nothing else.
+func isDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := range len(s) {
+		if !isDigit(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// head is the entity's newest prepared record, if it has one.
+func (l ledger) head(ctx context.Context, externalID string) (pipelinedb.EntityHeadRow, bool, error) {
+	row, err := l.q.EntityHead(ctx, pipelinedb.EntityHeadParams{
+		TenantID: l.tenant.String(), Provider: l.provider, ExternalID: externalID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return pipelinedb.EntityHeadRow{}, false, nil
+	case err != nil:
+		return pipelinedb.EntityHeadRow{}, false, fmt.Errorf("pipeline: read the entity head: %w", err)
+	}
+	return row, true, nil
+}
+
+// known reports whether the ledger already holds this record id, and whether that row is still its
+// entity's newest.
+func (l ledger) known(ctx context.Context, recordID string) (known, isHead bool, err error) {
+	rowIsHead, err := l.q.LedgerEntry(ctx, pipelinedb.LedgerEntryParams{
+		TenantID: l.tenant.String(), RecordID: recordID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, false, nil
+	case err != nil:
+		return false, false, fmt.Errorf("pipeline: read the ledger: %w", err)
+	}
+	return true, rowIsHead, nil
+}

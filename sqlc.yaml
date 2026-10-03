@@ -37,3 +37,17 @@ sql:
             go_type: string
           - db_type: timestamptz
             go_type: time.Time
+  - engine: postgresql
+    schema: migrations
+    queries: internal/pipeline/queries.sql
+    gen:
+      go:
+        package: pipelinedb
+        out: internal/pipeline/pipelinedb
+        sql_package: pgx/v5
+        omit_unused_structs: true
+        overrides:
+          - db_type: tenant_id
+            go_type: string
+          - db_type: timestamptz
+            go_type: time.Time

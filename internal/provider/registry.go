@@ -19,6 +19,14 @@ var ErrDuplicateKey = errors.New("provider: key registered twice")
 // ErrNilProvider reports a nil in the list handed to NewRegistry.
 var ErrNilProvider = errors.New("provider: nil provider")
 
+// ErrNoVersionOrder reports a provider whose VersionOrder is not one this program knows.
+//
+// It is refused at registration and not at the first delivery, because the alternative is a
+// process that starts, accepts deliveries and dead-letters every entity that changes twice. The
+// zero value lands here, which is the point: declaring how a version is spelled is not optional,
+// and a provider author who has not thought about it finds out at start-up (see VersionOrder).
+var ErrNoVersionOrder = errors.New("provider: the provider declares no version order")
+
 // Registry is the set of providers this process serves. It is built once, at startup, from a list
 // known at compile time, and it never changes afterwards: there is no Add, so every read of it is
 // safe from any number of goroutines with no lock, which is what the accept path needs.
@@ -35,14 +43,23 @@ type Registry struct {
 // Entry is one provider in a Registry, together with the key the registry validated and keeps.
 // The zero Entry names no provider: its Key is empty and its Provider is nil.
 type Entry struct {
-	key string
-	p   Provider
+	key      string
+	versions VersionOrder
+	p        Provider
 }
 
 // Key is the provider key as this program spells it: validated at registration, and the string to
 // hand to the outbox, the ledger and every record. It is never the string a caller looked up with,
 // even when the two hold the same bytes.
 func (e Entry) Key() string { return e.key }
+
+// VersionOrder is how this provider spells a record's version, validated at registration and kept
+// here. internal/pipeline reads it through the Entry and never by calling the provider again, for
+// the same reason it does that with Key: a provider that changes its answer after start-up must
+// not be able to change how a delivery already stored is ordered.
+//
+// The zero Entry answers VersionOrderUnset, which orders nothing.
+func (e Entry) VersionOrder() VersionOrder { return e.versions }
 
 // Provider is the registered provider. Backlog item B08 calls Hydrate and Normalize through it:
 // the drain path has the outbox row's provider key and needs the provider itself, while the
@@ -57,8 +74,8 @@ func (e Entry) WebhookSource() (WebhookSource, bool) {
 }
 
 // NewRegistry validates every provider and returns the registry, or the first thing wrong with
-// the list. It refuses a nil provider, a key that record.ValidProviderKey refuses, and a key
-// registered twice.
+// the list. It refuses a nil provider, a key that record.ValidProviderKey refuses, a key
+// registered twice, and a provider that declares no version order (ErrNoVersionOrder).
 //
 // The key grammar is not written down here. It is ADR 3's, and record.ValidProviderKey owns it,
 // because the same string is the first segment of every scope id and of every external id: a
@@ -83,7 +100,14 @@ func NewRegistry(providers ...Provider) (*Registry, error) {
 		if _, dup := r.byKey[key]; dup {
 			return nil, fmt.Errorf("%w: %q", ErrDuplicateKey, key)
 		}
-		r.byKey[key] = Entry{key: key, p: p}
+		// Fail closed at start-up. A provider that has not said how its versions are spelled
+		// cannot have its entities ordered, and the honest place to say so is here and not on the
+		// first entity that changes twice in production.
+		order := p.VersionOrder()
+		if !order.Valid() {
+			return nil, fmt.Errorf("%w: %q declares %s", ErrNoVersionOrder, key, order)
+		}
+		r.byKey[key] = Entry{key: key, versions: order, p: p}
 	}
 	return r, nil
 }
