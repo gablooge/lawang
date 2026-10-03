@@ -22,9 +22,16 @@ clean, permission-stamped record delivered exactly once to your memory, search, 
 > rather than guessing), and masks addresses, telephone numbers and bank accounts with the map from
 > placeholder to value kept locally. The three sinks are built as well: `http`, a strict `stub`
 > that refuses whatever the format refuses and remembers what it holds, and `jsonl` files for
-> development. **No provider is
+> development. The worker drain joins them up: it claims outbox rows across tenants, works each
+> one under its own tenant, commits the ledger rows and the records it prepared together,
+> delivers them, and records what came back, down to the single record a sink refused while the
+> rest of the batch landed. A crash between its two commits re-delivers what the first one
+> stored instead of losing it, a failing sink walks the retry ladder and parks, a sink that
+> refuses the request itself stalls without killing anything, and a replay brings a dead letter
+> back. **No provider is
 > registered yet**, so every `/ingress/{provider}` segment is a 404 until ClickUp lands, and
-> nothing drains the outbox: the worker is the next item. The design
+> `lawang worker` is not wired up yet either: the drain is a package, and the command needs the
+> per-tenant sink configuration that the vault and the operator API bring. The design
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in
 > [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the
