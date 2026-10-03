@@ -124,6 +124,12 @@ func TestTheCountersSurviveARefusalTakenBeforeTheLedger(t *testing.T) {
 // TestADatabaseThatCannotBeReachedIsNotADeadLetter. Everything this stage refuses by name is
 // about the record; a database that is not answering is about this deployment, and the row must
 // go back on the ladder rather than die.
+//
+// A cancelled context fails on the first statement, which is the tenant-binding check, so this
+// is where the classification is caught for that check in particular: "the transaction is not
+// bound" is a dead letter and "the database did not answer the question" is not, and the two
+// arrive at the same line. The ledger's and the masker's own classifications have their own
+// tests below.
 func TestADatabaseThatCannotBeReachedIsNotADeadLetter(t *testing.T) {
 	t.Parallel()
 	e := setup(t, pipeline.Options{})
@@ -325,19 +331,32 @@ var (
 // error would pass just as happily with the sorting gone.
 func TestEntityLocksAreTakenInOneOrder(t *testing.T) {
 	t.Parallel()
-	forward := []record.Record{{ExternalID: "fake:task:b"}, {ExternalID: "fake:task:a"}, {ExternalID: "fake:task:c"}}
-	backward := []record.Record{{ExternalID: "fake:task:c"}, {ExternalID: "fake:task:a"}, {ExternalID: "fake:task:b"}}
-	want := []string{"fake:task:a", "fake:task:b", "fake:task:c"}
+	// The keys as the database handed them back for two deliveries carrying the same entities.
+	// They come back in no particular order, and in particular not in the order of the external
+	// ids they were computed from: the point of the change on issue #10 is that the order is
+	// the key's, so that the thing sorted and the thing locked are the same value.
+	forward := []int64{7, -3, 9}
+	backward := []int64{9, 7, -3}
+	want := []int64{-3, 7, 9}
 
-	for _, recs := range [][]record.Record{forward, backward} {
-		if got := pipeline.EntityKeys(recs); !slices.Equal(got, want) {
-			t.Errorf("EntityKeys = %v, want %v: two deliveries of the same entities must lock in one order", got, want)
+	for _, keys := range [][]int64{forward, backward} {
+		if got := pipeline.LockOrder(slices.Clone(keys)); !slices.Equal(got, want) {
+			t.Errorf("LockOrder(%v) = %v, want %v: two deliveries of the same entities must lock in one order", keys, got, want)
 		}
 	}
-	// One entity twice, which a delivery carrying two versions of it produces, is one lock.
+	// A negative key is not an edge case to skip: hashtextextended returns a signed 64 bit
+	// value, so half the keys there are sort below zero, and a sort that treated them as
+	// unsigned would order two deliveries differently.
+	if got := pipeline.LockOrder([]int64{-1, 1}); !slices.Equal(got, []int64{-1, 1}) {
+		t.Errorf("LockOrder of a negative and a positive key = %v, want the negative first", got)
+	}
+	// Two entities whose keys collide are one lock, and so is one entity named twice.
+	if got := pipeline.LockOrder([]int64{5, 5}); !slices.Equal(got, []int64{5}) {
+		t.Errorf("LockOrder of a collision = %v, want one lock", got)
+	}
 	twice := []record.Record{{ExternalID: "fake:task:a"}, {ExternalID: "fake:task:a"}}
-	if got := pipeline.EntityKeys(twice); !slices.Equal(got, []string{"fake:task:a"}) {
-		t.Errorf("EntityKeys = %v, want one key", got)
+	if got := pipeline.EntityIDs(twice); !slices.Equal(got, []string{"fake:task:a"}) {
+		t.Errorf("EntityIDs = %v, want one entity: a delivery carrying two versions asks for one key", got)
 	}
 }
 

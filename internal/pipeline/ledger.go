@@ -57,35 +57,57 @@ type ledger struct {
 	versions provider.VersionOrder
 }
 
-// lockEntities takes the advisory lock of every entity in the delivery, once each, in a sorted
-// order.
+// lockEntities takes the advisory lock of every entity in the delivery, once each, in one order.
 //
-// Sorted, because a delivery can carry several entities (a comment and the task it hangs under),
-// and two transactions that took the same two locks in opposite orders would deadlock. Sorting
-// gives every transaction in the program one order, so they can only ever queue.
+// A delivery can carry several entities (a comment and the task it hangs under), and two
+// transactions that took the same two locks in opposite orders would deadlock. One order for
+// every transaction in the program is what turns that into queueing.
+//
+// The order is the lock KEY's, ascending, which is why the keys are asked of Postgres first (one
+// round trip for the delivery) and the locks are then taken one by one in the order lockOrder
+// puts them in. The thing sorted and the thing locked have to be the same value: sorting the
+// external ids while locking a 64 bit hash of them left a hash collision able to invert the
+// order between two deliveries, which is a deadlock and not a wait (EntityLockKeys in
+// queries.sql, and ADR 12 decision 1).
 func (l ledger) lockEntities(ctx context.Context, recs []record.Record) error {
-	for _, k := range entityKeys(recs) {
-		if err := l.q.LockEntity(ctx, pipelinedb.LockEntityParams{
-			TenantID: l.tenant.String(), Provider: l.provider, ExternalID: k,
-		}); err != nil {
+	ids := entityIDs(recs)
+	if len(ids) == 0 {
+		return nil
+	}
+	keys, err := l.q.EntityLockKeys(ctx, pipelinedb.EntityLockKeysParams{
+		TenantID: l.tenant.String(), Provider: l.provider, ExternalIds: ids,
+	})
+	if err != nil {
+		return fmt.Errorf("pipeline: the entity lock keys: %w", err)
+	}
+	for _, key := range lockOrder(keys) {
+		if err := l.q.LockEntityKey(ctx, key); err != nil {
 			return fmt.Errorf("pipeline: lock the entity: %w", err)
 		}
 	}
 	return nil
 }
 
-// entityKeys is the entities of a delivery, each once, in the order their locks are taken.
-//
-// The order is what matters and it is why this is a function of its own: two transactions that
-// took the locks of the same two entities in opposite orders would deadlock, and one sorted order
-// for every caller in the program is what turns that into queueing. Sorting also makes
-// slices.Compact drop every repeat, so a delivery that carries two versions of one entity, or an
-// entity twice, locks it once.
-func entityKeys(recs []record.Record) []string {
-	keys := make([]string, 0, len(recs))
+// entityIDs is the entities of a delivery, each once, as the external ids their lock keys are
+// asked for. The order here is not the lock order and nothing rests on it: it exists only so
+// that a delivery carrying two versions of one entity asks for one key and locks it once.
+func entityIDs(recs []record.Record) []string {
+	ids := make([]string, 0, len(recs))
 	for _, r := range recs {
-		keys = append(keys, r.ExternalID)
+		ids = append(ids, r.ExternalID)
 	}
+	slices.Sort(ids)
+	return slices.Compact(ids)
+}
+
+// lockOrder is the order the entity locks of one delivery are taken in: by the lock key itself,
+// ascending, each key once.
+//
+// It is a function of its own because the order is the whole of the deadlock argument, and this
+// is the one place that decides it. Two deliveries carrying the same entities produce the same
+// keys in whatever order the database returned them, and come out of here in the same order,
+// whatever their external ids sort like. Compact needs the sort it follows, which it has.
+func lockOrder(keys []int64) []int64 {
 	slices.Sort(keys)
 	return slices.Compact(keys)
 }

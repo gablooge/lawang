@@ -121,6 +121,28 @@ superseding X and one orphaned in the middle of the chain, with no constraint vi
 one delivery are taken in sorted order, so two deliveries carrying the same entities can queue but
 cannot deadlock.
 
+**Sorted by the lock key, which is the value that is locked** (changed in B10, issue #10). The
+first version of this sorted the external ids and locked `hashtextextended` of them, which is a
+64 bit hash, so a collision broke the order the sorting exists to create: with external ids
+`A < B < C` and `hash(A) = hash(C)`, a delivery carrying `{A, B}` took the two locks in the
+opposite order to one carrying `{B, C}`, and that is a deadlock and not a wait. At 64 bits it
+would not have happened, and the retry ladder would have carried the aborted transaction if it
+had, but the sentence "two entities whose keys collide only wait for each other" was not true
+while the thing sorted and the thing locked were different values. The keys of a delivery are
+now asked of Postgres in one statement and sorted as keys (`EntityLockKeys` and `lockOrder` in
+`internal/pipeline`), which costs one round trip per delivery and makes the sentence true.
+
+**The order between this lock and the outbox's.** Postgres has one advisory-lock namespace, a
+64 bit key with no classid split, and two modules take locks in it: `internal/outbox` over
+(tenant, ordering key), and this one over (tenant, provider, external id). For any transaction
+that ever holds both, the order is **the ordering-key lock first, then the entity locks**,
+ascending by key. Nothing in the drain holds both today (B10's step 6 takes only entity locks
+and its step 7 only the ordering key's), and the rule is written down here, and in a comment in
+both `queries.sql` files, because the next thing that works an outbox row and a chain in one
+transaction (a reconciliation pass, a repair, a batch finisher) would otherwise pick an order
+by accident, and the two orders deadlock against each other with nothing in either module to
+show it.
+
 ### 2. The chain is per entity, and the ledger holds what was prepared
 
 `record_ledger` has one row per record id, keyed `(tenant_id, record_id)`, and a partial unique
@@ -416,8 +438,9 @@ telephone number and an IBAN, in `Title` and `Text` only.
 - **The A, B, A window stays open until an operator acts.** That is ADR 4's decision, not a new
   one: the dead letter and the counter are what make it visible, and the record stays at the sink
   in the scope the entity has left until the dead letter is dealt with.
-- **The entity advisory lock is one statement per entity per delivery**, and it makes a second
-  delivery of one entity wait rather than fail. It is cheap and it is not free.
+- **The entity advisory lock is one statement per entity per delivery, plus one for the whole
+  delivery** (the statement that asks for the keys, since B10), and it makes a second delivery
+  of one entity wait rather than fail. It is cheap and it is not free.
 - **The external id's byte bound is stricter than the format's**, so a record the format allows can
   be refused here. Nothing a provider mints comes near it, and the refusal is by name.
 - **A degraded record's scope is a contract and not an enforcement.** The pipeline cannot compare a

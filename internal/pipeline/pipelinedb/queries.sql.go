@@ -65,6 +65,47 @@ func (q *Queries) EntityHead(ctx context.Context, arg EntityHeadParams) (EntityH
 	return i, err
 }
 
+const entityLockKeys = `-- name: EntityLockKeys :many
+SELECT DISTINCT hashtextextended($1::text || chr(31) || $2::text || chr(31) || e, 0) AS lock_key
+  FROM unnest($3::text[]) AS e
+`
+
+type EntityLockKeysParams struct {
+	TenantID    string
+	Provider    string
+	ExternalIds []string
+}
+
+// The advisory lock key of each entity of one delivery, in one round trip. The caller sorts them
+// and takes them in that order (pipeline.lockOrder), which is what LockEntityKey below is for.
+//
+// The key is what is sorted AND what is locked, which is the point of computing it here rather
+// than locking one entity at a time. The locks used to be taken in the order of the external
+// ids while the lock itself was over a 64 bit hash of them, so a hash collision broke the order
+// the sorting exists to create: with external ids A < B < C and hash(A) = hash(C), a delivery
+// carrying {A, B} took the two locks in the opposite order to one carrying {B, C}, which is a
+// deadlock and not a wait. Sorting the hashes makes that unwritable instead of improbable, and
+// two entities whose keys collide now really do only wait for each other.
+func (q *Queries) EntityLockKeys(ctx context.Context, arg EntityLockKeysParams) ([]int64, error) {
+	rows, err := q.db.Query(ctx, entityLockKeys, arg.TenantID, arg.Provider, arg.ExternalIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var lock_key int64
+		if err := rows.Scan(&lock_key); err != nil {
+			return nil, err
+		}
+		items = append(items, lock_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertLedgerEntry = `-- name: InsertLedgerEntry :exec
 INSERT INTO record_ledger
   (tenant_id, record_id, provider, external_id, version, scope, supersedes, is_head)
@@ -127,16 +168,9 @@ func (q *Queries) LedgerEntry(ctx context.Context, arg LedgerEntryParams) (bool,
 	return is_head, err
 }
 
-const lockEntity = `-- name: LockEntity :exec
-SELECT pg_advisory_xact_lock(
-  hashtextextended($1::text || chr(31) || $2::text || chr(31) || $3::text, 0))
+const lockEntityKey = `-- name: LockEntityKey :exec
+SELECT pg_advisory_xact_lock($1::bigint)
 `
-
-type LockEntityParams struct {
-	TenantID   string
-	Provider   string
-	ExternalID string
-}
 
 // Serializes the readers and writers of one entity's supersede chain. The pipeline reads the head,
 // demotes it and inserts a new head, and two transactions doing that for one entity at once can
@@ -162,16 +196,25 @@ type LockEntityParams struct {
 // defense, for the shapes the ordering key does not cover: one entity reached through two
 // subscriptions of one tenant, and a reconciliation pass running beside the live feed.
 //
-// Two entities whose lock strings hash alike do NOT merely wait for each other, which is worth
-// writing down because the sorting above is what keeps it harmless. The sort is over the external
-// id and the lock is over its 64 bit hash, so a collision breaks the order the sort exists to
-// create: with external ids A < B < C and hash(A) = hash(C), a delivery carrying {A, B} takes the
-// two locks in the opposite order to one carrying {B, C}, and that is a deadlock rather than a
-// wait. At 64 bits it will not happen, and the retry ladder would carry the aborted transaction if
-// it did. Sorting by the hash instead of by the external id is what would make it impossible, and
-// that is B10's (issue #10), which owns the lock key.
-func (q *Queries) LockEntity(ctx context.Context, arg LockEntityParams) error {
-	_, err := q.db.Exec(ctx, lockEntity, arg.TenantID, arg.Provider, arg.ExternalID)
+// Two entities whose keys collide only wait for each other, which is harmless. That sentence is
+// true because the thing sorted and the thing locked are now the same value: see EntityLockKeys.
+//
+// # The order between this lock and the outbox's
+//
+// Postgres has ONE advisory lock namespace, a 64 bit key with no classid split, and two modules
+// take locks in it: internal/outbox over (tenant, ordering key), and this one over (tenant,
+// provider, external id). The order between them, for any transaction that ever holds both, is
+// **the outbox's ordering-key lock first, then the entity locks**, ascending by key.
+//
+// Nothing in the drain holds both today. The worker prepares a delivery in a transaction that
+// takes only entity locks, and finishes it in a later transaction that takes only the ordering
+// key's (internal/outbox, finishIn). The rule is written down because the next thing that works
+// an outbox row and a chain in one transaction (a reconciliation pass, a repair, a batch
+// finisher) would otherwise pick an order by accident, and the two orders deadlock against each
+// other with nothing in either module to see. ADR 12, decision 1 states it beside this
+// paragraph.
+func (q *Queries) LockEntityKey(ctx context.Context, lockKey int64) error {
+	_, err := q.db.Exec(ctx, lockEntityKey, lockKey)
 	return err
 }
 

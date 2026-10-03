@@ -94,3 +94,30 @@ func Bind(ctx context.Context, tx pgx.Tx, id ID) error {
 	}
 	return nil
 }
+
+// ErrNoTenantBound reports a transaction with no tenant bound to it. Every tenant-scoped table
+// reads as empty and refuses writes in one, so a caller that meant to do a tenant's work in it
+// would write nothing and read nothing, with no error from the database to say why.
+var ErrNoTenantBound = errors.New("tenancy: no tenant is bound to this transaction")
+
+// Current is the tenant bound to tx, which is what every row-level security policy compares
+// against, read back from the database rather than from whatever the caller believes.
+//
+// It is for a stage that is handed a transaction it did not open and must not take the caller's
+// word for what is bound to it (internal/pipeline.Prepare). It costs one round trip, which is
+// the price of the question being asked of the server and not of a Go value.
+//
+// It cannot narrow a cross-tenant helper-role transaction and does not pretend to: in one of
+// those, the role's own permissive policy admits every tenant whatever is bound, so the answer
+// here says nothing about what the transaction can see. RoleTx hands out a transaction Bind
+// refuses for that reason, and a caller that needs to be sure asks Bind, not this.
+func Current(ctx context.Context, tx pgx.Tx) (ID, error) {
+	var bound *string
+	if err := tx.QueryRow(ctx, "SELECT current_tenant()").Scan(&bound); err != nil {
+		return "", fmt.Errorf("tenancy: current tenant: %w", err)
+	}
+	if bound == nil {
+		return "", ErrNoTenantBound
+	}
+	return Parse(*bound)
+}
