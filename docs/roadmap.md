@@ -65,7 +65,7 @@ deregisters the provider-side webhook; no table contains token material (checked
 scans the database after a full connect); the local vault refuses to start in production without a
 key.
 
-### M3 · Slack, the second provider (S)
+### M3 · Slack, the second provider (M)
 
 v0.1.0 ships two providers. Outlook, Teams and HubSpot were cut from this release on 2026-10-03,
 to hold the release date rather than for any reason of design, and they are the first entry under
