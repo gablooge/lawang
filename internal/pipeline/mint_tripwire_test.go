@@ -240,12 +240,12 @@ func packageFiles(t *testing.T) []srcFile {
 	return files
 }
 
-// mintFindings parses the files and returns one sentence for each thing it looks for and finds: a
-// mint that is missing, that has the wrong signature, or whose body reaches outside itself or
-// never calls ids.NewUnpredictable; a call of the mint that computes its argument; a forbidden
-// import, a dot import or a go:linkname; a .Value read that is not on valueReadsAllowed; an
-// internal/ids reference count other than one; a secretKind that is no longer a plain string; and
-// a file that does not parse.
+// mintFindings parses the files and returns one sentence for each thing it looks for and finds.
+// What those sentences are is deliberately not written out here. Read the cases of
+// TestTheMintScanSeesEveryWayTheValueCouldGetIn instead: that table is the list, its says strings
+// tie a case to the sentence the rule it is about produces, and make check runs it. A list here
+// would be a second copy that nothing checks, which is how the universal that stood here and then
+// the enumeration that replaced it were each false.
 func mintFindings(files []srcFile) []string {
 	fset := token.NewFileSet()
 	var findings []string

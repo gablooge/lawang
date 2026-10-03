@@ -83,7 +83,9 @@ CREATE TABLE redaction_map (
   token         text        NOT NULL CHECK (token <> ''),
   kind          text        NOT NULL CHECK (kind IN ('email', 'phone', 'iban')),
   -- What was masked, exactly as it stood in the text. Bounded because it is a column of a unique
-  -- index and because the masker's own patterns are bounded well below this.
+  -- index, and 512 is far above the longest of the three things the masker knows: RFC 5321 caps a
+  -- deliverable address at 256 bytes. The masker's email pattern does not enforce that, so the
+  -- masker drops an over-long candidate itself (maxSecretBytes) instead of reaching this CHECK.
   value         text        NOT NULL CHECK (value <> '' AND octet_length(value) <= 512),
   -- Written every time the value is seen again. The upsert has to write something on conflict in
   -- order to RETURN the token the value already has, and this is the column worth writing: it is

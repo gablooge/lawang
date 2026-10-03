@@ -40,8 +40,14 @@ type foundSecret struct {
 var ErrMaskedTooLong = errors.New("pipeline: masking made the field longer than the format allows")
 
 // maxSecretBytes is the longest value the masker will keep. It is the redaction_map.value CHECK,
-// and every pattern below is bounded well under it; a candidate longer than this is not one of
-// the three things the masker knows.
+// and a candidate longer than this is not one of the three things the masker knows: RFC 5321 caps
+// a deliverable path at 256 bytes, and a telephone number and an IBAN are shorter again.
+//
+// The patterns do not enforce it. phoneRe and ibanRe are bounded by their own construction, but
+// emailRe is not: its local part and its domain repetition both repeat without a limit, and a
+// match of 613 bytes comes out of 600 "a" followed by "@example.test". So appendMatches drops an
+// over-long candidate rather than letting the CHECK refuse the insert later, and that guard is
+// live, not dead.
 const maxSecretBytes = 512
 
 // An email address, conservatively. The local part is the characters that are common in real

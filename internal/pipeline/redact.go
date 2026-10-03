@@ -80,8 +80,9 @@ func token(k secretKind) (string, error) {
 	return "[" + string(k) + ":" + id + "]", nil
 }
 
-// maskRecords replaces every email address, telephone number and IBAN in the title and the text of
-// each record with a token, and records what each token stands for in the redaction map.
+// maskRecords replaces every email address, telephone number and IBAN it recognizes in the title
+// and the text of each record with a token, and records what each token stands for in the
+// redaction map.
 //
 // It is one statement for the whole delivery however many values were found, because the scan runs
 // over every record first and the upsert takes arrays.
