@@ -17,6 +17,7 @@ func TestCauseText(t *testing.T) {
 		"provider unavailable (status 429, code slow.1)":   outbox.NewCause(outbox.ClassProviderUnavailable).WithStatus(429).WithCode("slow.1"),
 		"sink rejected the record (code Bad_Shape-2)":      outbox.NewCause(outbox.ClassSinkRejected).WithCode("Bad_Shape-2"),
 		"sink refused the credential (status 401)":         outbox.NewCause(outbox.ClassSinkUnauthorized).WithStatus(401).WithCode(""),
+		"sink refused the request (status 413)":            outbox.NewCause(outbox.ClassSinkRefused).WithStatus(413),
 		"the sink's answer could not be read (status 200)": outbox.NewCause(outbox.ClassSinkUnreadable).WithStatus(200),
 		"vault unavailable":                                outbox.NewCause(outbox.ClassVaultUnavailable).WithStatus(0),
 		"internal error":                                   outbox.NewCause(outbox.ClassInternal).WithStatus(99).WithStatus(600).WithStatus(-1),

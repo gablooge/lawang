@@ -58,10 +58,16 @@ func TestTheStatusTable(t *testing.T) {
 	cases := map[int]want{
 		401: {action: sink.ActionHalt, class: "sink refused the credential (status 401)"},
 		403: {action: sink.ActionHalt, class: "sink refused the credential (status 403)"},
-		400: {refused: true, class: "sink rejected the record (status 400)"},
+		// A verdict on the request Lawang built, not on anything in it: its size, its URL,
+		// its media type or its protocol version. An operator changes a number or a
+		// receiver, and until then the ladder would only repeat the same request.
+		400: {action: sink.ActionHalt, class: "sink refused the request (status 400)"},
+		413: {action: sink.ActionHalt, class: "sink refused the request (status 413)"},
+		414: {action: sink.ActionHalt, class: "sink refused the request (status 414)"},
+		415: {action: sink.ActionHalt, class: "sink refused the request (status 415)"},
+		426: {action: sink.ActionHalt, class: "sink refused the request (status 426)"},
 		404: {refused: true, class: "sink rejected the record (status 404)"},
 		409: {refused: true, class: "sink rejected the record (status 409)"},
-		413: {refused: true, class: "sink rejected the record (status 413)"},
 		422: {refused: true, class: "sink rejected the record (status 422)"},
 		499: {refused: true, class: "sink rejected the record (status 499)"},
 		408: {action: sink.ActionRetry, class: "sink unavailable (status 408)"},
@@ -115,6 +121,8 @@ func TestALiveAnswerIsClassifiedTheSameWay(t *testing.T) {
 	for status, want := range map[int]sink.Action{
 		401: sink.ActionHalt,
 		403: sink.ActionHalt,
+		413: sink.ActionHalt,
+		426: sink.ActionHalt,
 		500: sink.ActionRetry,
 		503: sink.ActionRetry,
 		422: sink.ActionUnset,
@@ -284,6 +292,20 @@ func TestAnAnswerThatDoesNotSayWhatLandedIsRetried(t *testing.T) {
 		"an id that was not sent": `{"rejected":[{"id":"rec_00000000000000000000000000000001"}]}`,
 		"the same id twice":       fmt.Sprintf(`{"rejected":[{"id":%q},{"id":%q}]}`, known.ID, known.ID),
 		"an empty id":             `{"rejected":[{"id":""}]}`,
+		// A non-empty body that carries no member the sink knows. This is the hole the
+		// maintainer closed on issue #9: a receiver that means to refuse one record and
+		// misspells the member, or writes it for a later version of the protocol, had
+		// every record of the batch marked delivered and the refused one lost with no
+		// dead letter and nothing in last_error.
+		"the member misspelled":        fmt.Sprintf(`{"refused":[{"id":%q}]}`, known.ID),
+		"a member from another layer":  `{"accepted":1}`,
+		"the member in the wrong case": fmt.Sprintf(`{"Rejected":[{"id":%q}]}`, known.ID),
+		"an object inside an object":   `{"result":{"rejected":[]}}`,
+		// JSON that is not an object at all cannot carry the member.
+		"a list":   `[]`,
+		"a string": `"ok"`,
+		"a number": `12`,
+		"null":     `null`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -410,9 +432,6 @@ func TestAnEmptyAnswerMeansEverythingLanded(t *testing.T) {
 		"200 and an empty list": func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = io.WriteString(w, `{"rejected":[]}`)
 		},
-		"200 and a field it does not know": func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = io.WriteString(w, `{"accepted":1}`)
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -456,11 +475,124 @@ func TestTheRequestCarriesTheTenantsCredentialAndNoTenantField(t *testing.T) {
 	if accept != "application/json" {
 		t.Errorf("Accept %q", accept)
 	}
-	if !strings.HasPrefix(body, `{"records":[`) || !strings.HasSuffix(body, `]}`) {
+	if !strings.HasPrefix(body, `{"v":1,"records":[`) || !strings.HasSuffix(body, `]}`) {
 		t.Errorf("body %q is not the batch shape", body)
 	}
 	if strings.Contains(body, tenantA.String()) {
 		t.Errorf("the body carries the tenant id")
+	}
+	// The version is read as a number and not as a prefix, because what a receiver decodes is
+	// the member and not the spelling.
+	var envelope struct {
+		V       *int              `json:"v"`
+		Records []json.RawMessage `json:"records"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("the posted body does not decode: %v", err)
+	}
+	if envelope.V == nil || *envelope.V != sink.ProtocolVersion {
+		t.Errorf("v %v, want %d", envelope.V, sink.ProtocolVersion)
+	}
+	if len(envelope.Records) != 1 {
+		t.Errorf("the request carried %d records, want 1", len(envelope.Records))
+	}
+}
+
+// TestAVerdictOnTheRequestHaltsAndKillsNoRecord is should-fix 5 of the round 2 review. These
+// statuses say something about the request this sink built, its size, its URL, its media type
+// or its protocol version, and nothing about any record in it. Treating them as the receiver
+// refusing the records dead-lettered every record of every chunk of every batch on that
+// endpoint, permanently and quietly, with last_error reading "sink rejected the record
+// (status 413)". The configuration mismatch behind it (a MaxRequestBytes larger than the
+// receiver's body cap, or a receiver that speaks a later version of the protocol) is for an
+// operator to fix, so it halts and nothing is marked delivered.
+func TestAVerdictOnTheRequestHaltsAndKillsNoRecord(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{400, 413, 414, 415, 426} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			t.Parallel()
+			recs := []record.Record{
+				rec(t, tenantA, func(r *record.Record) { r.Version = "1" }),
+				rec(t, tenantA, func(r *record.Record) { r.Version = "2" }),
+			}
+			s := serving(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}, sink.HTTPConfig{})
+			result, err := s.Deliver(context.Background(), tenantA, recs)
+			f := fault(t, err)
+			if f.Action != sink.ActionHalt {
+				t.Errorf("action %v, want halt: a record the receiver said nothing about must not be killed", f.Action)
+			}
+			if want := fmt.Sprintf("sink refused the request (status %d)", status); f.Cause.String() != want {
+				t.Errorf("cause %q, want %q", f.Cause.String(), want)
+			}
+			if len(result.Rejected) != 0 {
+				t.Errorf("rejected %+v, want none", result.Rejected)
+			}
+		})
+	}
+}
+
+// TestAReceiverThatSpeaksALaterVersionLosesNoRecord: the one interaction between the version in
+// the request and the band above. A receiver that does not speak v answers 426 (or 400), and
+// under the old band that permanently dead-lettered every record of every chunk for a mismatch
+// no record caused. The batch is split here, so the second request is the one refused.
+func TestAReceiverThatSpeaksALaterVersionLosesNoRecord(t *testing.T) {
+	t.Parallel()
+	recs := make([]record.Record, 4)
+	for i := range recs {
+		recs[i] = rec(t, tenantA, func(r *record.Record) { r.Version = fmt.Sprint(i) })
+	}
+	limit := 2*len(doc(t, recs[0])) + 16 + 32
+
+	var (
+		mu       sync.Mutex
+		requests int
+		seen     []int
+	)
+	s := serving(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read: %v", err)
+			return
+		}
+		var envelope struct {
+			V int `json:"v"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			t.Errorf("the posted body does not decode: %v", err)
+			return
+		}
+		mu.Lock()
+		requests++
+		n := requests
+		seen = append(seen, envelope.V)
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		// A receiver that only speaks v2 refuses v1 by the status the protocol names.
+		w.WriteHeader(http.StatusUpgradeRequired)
+	}, sink.HTTPConfig{MaxRequestBytes: limit})
+
+	result, err := s.Deliver(context.Background(), tenantA, recs)
+	f := fault(t, err)
+	if f.Action != sink.ActionHalt {
+		t.Errorf("action %v, want halt", f.Action)
+	}
+	if len(result.Rejected) != 0 {
+		t.Errorf("rejected %+v, want none: a version the receiver will not speak is no record's fault", result.Rejected)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, v := range seen {
+		if v != sink.ProtocolVersion {
+			t.Errorf("a request carried v %d, want %d", v, sink.ProtocolVersion)
+		}
+	}
+	if len(seen) != 2 {
+		t.Errorf("%d requests, want the sink to stop at the one that was refused", len(seen))
 	}
 }
 
@@ -577,14 +709,16 @@ func TestARecordLargerThanOneRequestIsRejectedBeforeAnythingIsSent(t *testing.T)
 }
 
 // TestTheRecordThatDoesNotFitIsMeasuredWithTheFraming: a document never travels on its own, it
-// goes inside {"records":[ ... ]}, so what has to fit MaxRequestBytes is the document plus the
-// 14 bytes of framing. The band between the two is narrow and the whole of the difference, so
-// the test sits on both sides of it: one byte more room than the document needs and the record
-// goes, one byte less and it is a rejection with nothing sent.
+// goes inside {"v":1,"records":[ ... ]}, so what has to fit MaxRequestBytes is the document plus
+// the 20 bytes of framing. The band between the two is narrow and the whole of the difference,
+// so the test sits on both sides of it: one byte more room than the document needs and the
+// record goes, one byte less and it is a rejection with nothing sent. The literal is written out
+// here rather than taken from the package, so that a change to the envelope has to be made twice
+// and is seen once.
 func TestTheRecordThatDoesNotFitIsMeasuredWithTheFraming(t *testing.T) {
 	t.Parallel()
 	r := rec(t, tenantA)
-	const framing = len(`{"records":[`) + len(`]}`)
+	const framing = len(`{"v":1,"records":[`) + len(`]}`)
 	for name, c := range map[string]struct {
 		limit    int
 		rejected bool
@@ -639,19 +773,25 @@ func TestABatchWhoseRecordsAreAllRejectedSendsNothing(t *testing.T) {
 
 // TestAFaultOnTheFirstRequestOfASplitBatchStopsTheRest: on a Fault nothing counts as delivered,
 // so there is no reason to go on sending, and the worker re-sends the whole batch.
+//
+// The batch opens with a record the format refuses, so marshalAll has put a Rejection in the
+// result before the first request is built. That is what makes the zero-value assertion below
+// able to fail: without it the result is empty whatever Deliver does with it, and the check is
+// satisfied by the handler rather than by the code.
 func TestAFaultOnTheFirstRequestOfASplitBatchStopsTheRest(t *testing.T) {
 	t.Parallel()
 	recs := make([]record.Record, 4)
 	for i := range recs {
 		recs[i] = rec(t, tenantA, func(r *record.Record) { r.Version = fmt.Sprint(i) })
 	}
+	batch := append([]record.Record{{}}, recs...)
 	requests := 0
 	s := serving(t, func(w http.ResponseWriter, _ *http.Request) {
 		requests++
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}, sink.HTTPConfig{MaxRequestBytes: len(doc(t, recs[0])) + 64})
 
-	result, err := s.Deliver(context.Background(), tenantA, recs)
+	result, err := s.Deliver(context.Background(), tenantA, batch)
 	f := fault(t, err)
 	if f.Action != sink.ActionRetry {
 		t.Errorf("action %v, want retry", f.Action)
@@ -660,7 +800,7 @@ func TestAFaultOnTheFirstRequestOfASplitBatchStopsTheRest(t *testing.T) {
 		t.Errorf("%d requests, want the first one only", requests)
 	}
 	if len(result.Rejected) != 0 {
-		t.Errorf("the result carries %+v, want the zero value", result.Rejected)
+		t.Errorf("the result carries %+v, want the zero value: the rejection the format made before the fault goes with it", result.Rejected)
 	}
 }
 
@@ -678,14 +818,38 @@ func TestAnErrorBodyThatIsNotJSONCarriesNoCode(t *testing.T) {
 	}
 }
 
-// TestAnEmptyBatchSendsNothing.
+// TestAnEmptyBatchSendsNothing, and asks nothing of the vault either. The early return is
+// before the credential lookup, which is the one observable difference between keeping it and
+// deleting it: without it a batch with no records in it fails for a tenant whose vault is down,
+// and the worker puts a row with nothing to deliver back on the ladder. Mutation C8 of the
+// round 2 review deleted the early return and the package stayed green, which is what the
+// second case below is here for.
 func TestAnEmptyBatchSendsNothing(t *testing.T) {
 	t.Parallel()
-	reached := false
-	s := serving(t, func(http.ResponseWriter, *http.Request) { reached = true }, sink.HTTPConfig{})
-	result, err := s.Deliver(context.Background(), tenantA, nil)
-	if err != nil || len(result.Rejected) != 0 || reached {
-		t.Fatalf("Deliver of an empty batch: %v, %+v, request sent %v", err, result, reached)
+	for name, token := range map[string]func(context.Context, tenancy.ID) (string, error){
+		"a vault that answers":  tokenFor("token"),
+		"a vault that is down":  func(context.Context, tenancy.ID) (string, error) { return "", errors.New("vault is down") },
+		"a vault with no token": func(context.Context, tenancy.ID) (string, error) { return "", nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			for _, batch := range [][]record.Record{nil, {}} {
+				reached := false
+				asked := false
+				s := serving(t, func(http.ResponseWriter, *http.Request) { reached = true },
+					sink.HTTPConfig{Token: func(ctx context.Context, tn tenancy.ID) (string, error) {
+						asked = true
+						return token(ctx, tn)
+					}})
+				result, err := s.Deliver(context.Background(), tenantA, batch)
+				if err != nil || len(result.Rejected) != 0 || reached {
+					t.Fatalf("Deliver of an empty batch: %v, %+v, request sent %v", err, result, reached)
+				}
+				if asked {
+					t.Errorf("the vault was asked for a credential for a batch with nothing in it")
+				}
+			}
+		})
 	}
 }
 
@@ -733,8 +897,15 @@ func TestASinkURLSecretNeverLeaves(t *testing.T) {
 		r.Text = strings.Repeat("x", 4096)
 	})
 
-	// Every way a delivery can go wrong, against an endpoint whose query string holds the
-	// marker. A receiver that echoes the request URL back is a real thing for a 404.
+	// The attempts below drive every place http.go builds a Fault or a Rejection, against an
+	// endpoint whose query string holds the marker. A receiver that echoes the request URL
+	// back is a real thing for a 404. The places, so that a tenth one added to http.go is
+	// visibly missing from this list rather than silently unreached: the no-credential
+	// refusal, the status halt, the status retry, the per-request refusal, the unreadable
+	// answer, the transport failure, the 2xx "rejected" list, the record that is too large and
+	// the record the format refuses. The tenth, the NewRequestWithContext branch, is
+	// unreachable from a caller that passes a context, and its Detail is a constant of this
+	// package that carries nothing from the request.
 	endpointOf := func(base string) string { return base + "/deliver?api_key=" + marker }
 	echoing := `{"code":"see https://sink.example/deliver?api_key=` + marker + `"}`
 
@@ -744,6 +915,10 @@ func TestASinkURLSecretNeverLeaves(t *testing.T) {
 		handler  http.HandlerFunc
 		cfg      sink.HTTPConfig
 		recs     []record.Record
+		// token replaces the marker-bearing token function. It is how the one failure path
+		// that holds the endpoint and the credential at once, the refusal at the top of
+		// Deliver, is reached at all: every other attempt's Token succeeds.
+		token func(context.Context, tenancy.ID) (string, error)
 		// wantRejections is how many Rejection entries the attempt has to produce, and
 		// wantFault whether it has to fail. One of the two is always set.
 		wantRejections int
@@ -756,6 +931,16 @@ func TestASinkURLSecretNeverLeaves(t *testing.T) {
 		}
 	}
 	attempts := []attempt{
+		{
+			name:     "no credential, which is the one refusal that holds the endpoint and the token at once",
+			endpoint: endpointOf, wantFault: true,
+			handler: func(http.ResponseWriter, *http.Request) {
+				t.Errorf("a request was sent without a credential")
+			},
+			token: func(context.Context, tenancy.ID) (string, error) {
+				return "", errors.New("vault is down at " + marker)
+			},
+		},
 		{name: "401", endpoint: endpointOf, handler: status(401), wantFault: true},
 		{name: "500", endpoint: endpointOf, handler: status(500), wantFault: true},
 		{name: "an answer that cannot be read", endpoint: endpointOf, wantFault: true, handler: func(w http.ResponseWriter, _ *http.Request) {
@@ -802,6 +987,9 @@ func TestASinkURLSecretNeverLeaves(t *testing.T) {
 			cfg := a.cfg
 			cfg.Endpoint = a.endpoint(srv.URL)
 			cfg.Token = tokenFor(tokenMarker)
+			if a.token != nil {
+				cfg.Token = a.token
+			}
 			s := newHTTP(t, cfg)
 			batch := a.recs
 			if batch == nil {
@@ -912,8 +1100,10 @@ func TestTheCauseCarriesOnlyACodeThatLooksLikeOne(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+			// 422 and not 400: 400 is a verdict on the request and halts, and this test
+			// is about the code that travels with a refusal of the records.
 			s := serving(t, func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(http.StatusBadRequest)
+				w.WriteHeader(http.StatusUnprocessableEntity)
 				_, _ = io.WriteString(w, body)
 			}, sink.HTTPConfig{})
 			result, err := s.Deliver(context.Background(), tenantA, []record.Record{rec(t, tenantA)})
@@ -923,7 +1113,7 @@ func TestTheCauseCarriesOnlyACodeThatLooksLikeOne(t *testing.T) {
 			if len(result.Rejected) != 1 {
 				t.Fatalf("rejected %+v, want the one record sent", result.Rejected)
 			}
-			if want := "sink rejected the record (status 400, code withheld)"; result.Rejected[0].Cause.String() != want {
+			if want := "sink rejected the record (status 422, code withheld)"; result.Rejected[0].Cause.String() != want {
 				t.Errorf("cause %q, want %q", result.Rejected[0].Cause.String(), want)
 			}
 		})
@@ -938,6 +1128,7 @@ func TestEveryStatusFaultCauseIsOneOfTheOutboxClasses(t *testing.T) {
 		outbox.NewCause(outbox.ClassSinkUnavailable).String():  true,
 		outbox.NewCause(outbox.ClassSinkRejected).String():     true,
 		outbox.NewCause(outbox.ClassSinkUnauthorized).String(): true,
+		outbox.NewCause(outbox.ClassSinkRefused).String():      true,
 		outbox.NewCause(outbox.ClassSinkUnreadable).String():   true,
 		outbox.NewCause(outbox.ClassVaultUnavailable).String(): true,
 		outbox.NewCause(outbox.ClassInternal).String():         true,
@@ -1045,6 +1236,13 @@ func TestARefusalOfOneRequestLeavesTheOtherRequestsOfTheBatchAlone(t *testing.T)
 // finding. A credential the receiver will not take is about the delivery and not about any
 // record, so nothing in the batch counts as delivered, no record is refused, and the whole
 // batch goes again once an operator has fixed the credential.
+//
+// The first request is answered 200 with a "rejected" list naming one of its two records, so by
+// the time the second request is refused the result already holds a Rejection. Without one the
+// result would be empty whatever Deliver returned, and the zero-value assertion would be
+// satisfied by the handler rather than by the code: the round 2 review proved exactly that by
+// changing both of Deliver's error returns to "return result, err" and watching the suite stay
+// green.
 func TestAHaltOnALaterRequestDeliversNothingAndRefusesNothing(t *testing.T) {
 	t.Parallel()
 	recs := make([]record.Record, 6)
@@ -1056,17 +1254,33 @@ func TestAHaltOnALaterRequestDeliversNothingAndRefusesNothing(t *testing.T) {
 	var (
 		mu       sync.Mutex
 		requests int
+		refused  int
 	)
-	s := serving(t, func(w http.ResponseWriter, _ *http.Request) {
+	s := serving(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read: %v", err)
+			return
+		}
+		ids := batchIDs(t, body)
 		mu.Lock()
 		requests++
 		n := requests
 		mu.Unlock()
-		if n == 1 {
-			w.WriteHeader(http.StatusNoContent)
+		if n != 1 {
+			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		w.WriteHeader(http.StatusUnauthorized)
+		// The first request lands, and the receiver refuses one of the two records in it.
+		// That Rejection is in the result before the halt arrives.
+		if len(ids) == 0 {
+			t.Errorf("the first request carried no records")
+			return
+		}
+		mu.Lock()
+		refused++
+		mu.Unlock()
+		_, _ = fmt.Fprintf(w, `{"rejected":[{"id":%q,"code":"unsupported_kind"}]}`, ids[0])
 	}, sink.HTTPConfig{MaxRequestBytes: limit})
 
 	result, err := s.Deliver(context.Background(), tenantA, recs)
@@ -1075,10 +1289,13 @@ func TestAHaltOnALaterRequestDeliversNothingAndRefusesNothing(t *testing.T) {
 		t.Errorf("action %v, want halt", f.Action)
 	}
 	if len(result.Rejected) != 0 {
-		t.Errorf("the result carries %+v, want the zero value", result.Rejected)
+		t.Errorf("the result carries %+v, want the zero value: the Rejection the first request produced goes with it", result.Rejected)
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	if refused != 1 {
+		t.Fatalf("the receiver refused %d records on the first request, want 1: with none the assertion above cannot fail", refused)
+	}
 	if requests != 2 {
 		t.Errorf("%d requests, want the sink to stop at the one that was refused", requests)
 	}

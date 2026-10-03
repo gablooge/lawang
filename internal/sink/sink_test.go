@@ -207,20 +207,24 @@ func TestNamesValidate(t *testing.T) {
 	}
 }
 
-// TestADetailIsAlwaysThisPackagesOwnPhrase: every Detail a Fault or a Rejection carries is one
-// of the phrases written in this package, so no text from a sink reaches a log line through one.
-//
-// The claim is about every Detail the package assigns, so the test reads the package's own
-// source rather than a list someone keeps by hand, which is what round 1 found this test was
-// doing. Three things are checked there:
+// TestADetailIsAlwaysThisPackagesOwnPhrase reads the package's own source, rather than a list
+// someone keeps by hand, and holds three things:
 //
 //   - the detail* constants and sink.FaultDetails are the same set, so a thirteenth constant
 //     that is not in the list fails here instead of passing unnoticed;
-//   - every Detail: in a composite literal is a plain identifier, never a string literal, a
-//     call or anything concatenated, which is how remote text would get in;
+//   - every "Detail:" key in a composite literal takes a plain identifier, never a string
+//     literal, a call or anything concatenated, which is how remote text would get in;
 //   - every identifier used that way is either one of those constants or a variable assigned
 //     only from them, or from transportDetail, whose own test holds every phrase it returns
 //     against the list.
+//
+// What the walk reads is the "Detail:" key, and that is the whole of its claim. A Detail written
+// any other way is outside it: "f.Detail = x" on the line after the literal is an ast.AssignStmt
+// over an ast.SelectorExpr and never reaches the ast.KeyValueExpr branch below, and an unkeyed
+// composite literal is the same gap. Mutation 9a of the round 2 review wrote a Detail that way
+// and this test passed. TestASinkURLSecretNeverLeaves is what catches those, by searching what a
+// failed delivery actually produces on every path it drives, and that division is deliberate:
+// this test reads a shape, that one reads behaviour.
 func TestADetailIsAlwaysThisPackagesOwnPhrase(t *testing.T) {
 	t.Parallel()
 	if len(sink.FaultDetails) == 0 {

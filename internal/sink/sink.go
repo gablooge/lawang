@@ -54,7 +54,26 @@ type Sink interface {
 }
 
 // DeliveryResult is what one batch came to, and it covers every record in it: a record not named
-// in Rejected was taken.
+// in Rejected was taken. It is meaningful only beside a nil error (see Fault).
+//
+// The ids of a batch have to be distinct for that sentence to mean anything. One id sent twice,
+// in two requests of which one is refused, comes back both named in Rejected and, through its
+// other copy, counted as taken. Nothing in the branch produces such a batch: pipeline.Prepared
+// holds one row per record and a sealed id is one version of one entity in one scope.
+//
+// # What B10 still needs, and does not have
+//
+// internal/outbox cannot express a per-record dead letter yet. Every transition takes a Claimed,
+// which is one outbox row and one delivery: MarkDelivered(ctx, c), MarkDead(ctx, c, cause),
+// Fail(ctx, c, ladder, cause). One delivery carries several records (pipeline.Prepared.Records)
+// and dead_reason is a column on the row, so "dead-letter each Rejection and mark the rest
+// delivered" has no API behind it. B10 can mark the row delivered, which loses the dead letter
+// and the refused record with it, or kill the row, which kills the records that landed.
+//
+// This is older than the two-answer contract: Rejected predates it and architecture section 11
+// has promised a per-record dead letter since before B04. It is written here, on B10's backlog
+// line and on issue #10 so that the outbox API B10 needs is a decision someone makes on purpose
+// rather than a corner cut at the keyboard.
 type DeliveryResult struct {
 	// Rejected names the records that did not get through, one entry each. Every other record
 	// of the batch landed, so each of these dead-letters on its own (architecture section 11).
@@ -106,9 +125,14 @@ func (a Action) String() string {
 }
 
 // Fault is a delivery that did not happen, in the only form a sink reports one. It is about the
-// batch as a whole: a record the receiver refused is a Rejection in the DeliveryResult instead,
-// so a partly delivered batch that then faults still names the records the receiver refused and
-// still leaves the records it never saw alive.
+// batch as a whole: a record the receiver refused is a Rejection in the DeliveryResult instead.
+//
+// A Fault comes with the zero DeliveryResult, and that is the whole of it. A batch sent in
+// several requests, where an early one named refused records and a later one faulted, hands back
+// no Rejection at all: nothing in the batch counts as delivered, so the whole batch goes again
+// and the records the receiver refused are offered again and named again on the next attempt.
+// Reading the Rejected list beside a non-nil error is therefore always wrong, and what makes it
+// safe is that the records the fault never offered are still alive.
 //
 // It carries an Action, an outbox.Cause and a Detail, and it wraps nothing: errors.Unwrap of a
 // Fault is nil, and a transport error is read for its classification and then dropped. That is

@@ -923,22 +923,58 @@ a `Detail` that is one of the package's own phrases. It wraps nothing: the error
 a `*url.Error` whose text quotes the request URL, and a sink URL's query string is where many
 receivers carry their API key.
 
-**`http`** posts `{"records":[<record document>, ...]}` to a configured endpoint, with
-`Content-Type: application/json`, `Accept: application/json` and the tenant's bearer token in an
-`Authorization` header. The tenant is in no field: at a sink it is established by the per-tenant
-credential ([section 4](#4-trust-model)), and a tenant with no credential is a refusal, not a
-default. A 2xx answer may name the records the receiver refused,
-`{"rejected":[{"id":"rec_...","code":"..."}]}`; an empty body means every record was taken, and
-an answer that names an id that was not sent, or that does not parse, leaves the sink unable to
-say what landed, so nothing is marked delivered and the batch is sent again. A status outside 2xx
-is classified: 401 and 403 halt and 408, 429 and everything that is not a 4xx retries, both of
-them faults about the delivery; any other 4xx is the receiver refusing what was sent, which is a
-verdict on the records of that one request, so each of them comes back as a `Rejection` carrying
-the status and the receiver's code. Redirects are not followed, so a receiver cannot send the
-next request, with its credential, somewhere else. The sink sends at most `MaxRequestBytes`
-(8 MiB by default) in one request and splits a batch to stay under it, and it reads at most
-64 KiB of an answer, one byte more than the limit so that it can tell a complete answer from one
-it cut short.
+**`http`** posts records to a configured endpoint. This is the **frozen wire protocol** of v1,
+written for a receiver author; [ADR 13](adr/0013-sink-wire-protocol.md) records the decision
+behind the two strict parts of it and what they cost.
+
+*The request.* `POST` to the endpoint, with `Content-Type: application/json`,
+`Accept: application/json`, the tenant's bearer token in an `Authorization` header, and a body of
+
+```json
+{"v":1,"records":[<record document>, ...]}
+```
+
+`v` is the version of this protocol. The tenant is in no field: at a sink it is established by
+the per-tenant credential ([section 4](#4-trust-model)), and a tenant with no credential is a
+refusal, not a default. The sink sends at most `MaxRequestBytes` (8 MiB by default) in one
+request and splits a batch into as many requests as that takes.
+
+*The answer, on a 2xx.* The batch landed. An empty body, whitespace, or `{}` means every record
+was taken. Any other body **must** be a JSON object carrying a `rejected` member, spelled exactly
+that way:
+
+```json
+{"rejected":[{"id":"rec_...","code":"..."}]}
+```
+
+Anything else is **unreadable**: a body that does not parse, a body that is not a JSON object, a
+body that is a JSON object with members but none of them `rejected`, an id that was not in the
+request, and an id named twice. Unreadable means nothing is marked delivered and the batch is
+sent again. The cost is deliberate: a receiver that answers 200 with its own bookkeeping and no
+`rejected` member fails loudly rather than having its refused records silently marked delivered.
+The sink reads at most 64 KiB of an answer, one byte more than the limit so that it can tell a
+complete answer from one it cut short.
+
+*The answer, on anything else.* Three bands, and the first two are faults about the delivery, so
+nothing in the batch counts as delivered and the whole batch goes again:
+
+- **halt**, a verdict on the request and not on anything in it: the credential (401, 403) and the
+  request message itself, its size (413), its URL (414), its media type (415) and its protocol
+  version (400, 426). An operator changes a number, a credential or a receiver; the ladder would
+  only send the same request again.
+- **retry**: 408, 429 and everything that is not a 4xx.
+- **a refusal of the records of that one request**: every other 4xx. Each record in that request
+  comes back as a `Rejection` carrying the status and the receiver's code, and the records of the
+  other requests are still offered.
+
+**A receiver that wants to refuse one record answers 2xx with a `rejected` list.** A 4xx in the
+third band kills every record of the request it answered, and which records share a request is
+decided by the sender's byte arithmetic and not by the receiver. **A receiver that does not speak
+`v` answers 426** (400 is read the same way), which halts and kills nothing: a version no record
+caused must not dead-letter any record.
+
+Redirects are not followed, so a receiver cannot send the next request, with its credential,
+somewhere else.
 
 **`stub`** is the strict test double of principle 5. It decodes every document with
 `internal/record`'s strict decoder, which the agreement tests hold equal to the schema, and adds
@@ -1071,10 +1107,11 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Hydration fails | degradable | deliver a minimal record, the change is still tracked |
 | Normalizer fails | non-retryable | dead-letter with the reason; fix and replay |
 | Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands. A sink reports it as a `Rejection` and never as a whole-batch action, so a record is never killed without having been offered |
-| Sink rejects a whole request of a batch that was split across several (any 4xx that is not 401, 403, 408 or 429) | non-retryable | each record of that request dead-letters as its own `Rejection`; the other requests of the batch are still sent and keep their own outcome |
+| Sink rejects a whole request of a batch that was split across several (any 4xx that is not 400, 401, 403, 408, 413, 414, 415, 426 or 429) | non-retryable | each record of that request dead-letters as its own `Rejection`; the other requests of the batch are still sent and keep their own outcome |
+| Sink refuses the request itself rather than anything in it: its size (413), its URL (414), its media type (415) or its protocol version (400, 426) | halt | the row stays prepared, nothing is marked delivered and **no record is dead-lettered**: none of these says anything about a record, and an operator lowers `MaxRequestBytes` or upgrades a receiver. Dead-lettering them killed every record of every chunk of every batch on that endpoint, permanently, with `last_error` reading "sink rejected the record (status 413)" |
 | Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered, including anything an earlier request of the same batch landed, so the whole batch is sent again once an operator has fixed it; ops is alerted |
 | Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; nothing is marked delivered, including anything an earlier request of the same batch landed, and replay is always safe because a sink is idempotent on the record id |
-| Sink answers 2xx and does not say what it did with the batch (the answer does not parse, or names a record that was not sent) | retryable | nothing is marked delivered and the whole batch is sent again: a sink that is idempotent on the record id loses nothing by a repeat, and a guess here loses a record |
+| Sink answers 2xx and does not say what it did with the batch (the answer does not parse, is not a JSON object, carries members but none of them `rejected`, or names a record that was not sent or names one twice) | retryable | nothing is marked delivered and the whole batch is sent again: a sink that is idempotent on the record id loses nothing by a repeat, and a guess here loses a record |
 | Vault unreachable | fail closed | retry on the ladder; nothing is delivered unverified |
 | Accept path out of time (a saturated pool, a slow database) | retryable | 503 with a `Retry-After`, nothing stored |
 
