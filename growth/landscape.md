@@ -425,8 +425,9 @@ All pages in this section were read on **2026-10-04** unless a line says otherwi
   receiving provider webhooks. INFER: isolation is by collection and by whose credentials made
   the connection. NOT VERIFIED: whether the code carries source ACLs for any connector. Its
   source was not read.
-- **Choose it instead when** you want a ready retrieval layer for agents over many apps, and
-  "each user or tenant has their own collection" is enough access control.
+- **Choose it instead when** you want a ready retrieval layer for agents over many apps, and a
+  separate collection per user or per tenant is enough access control. (That sentence is this
+  review's reading of the documentation, not a quotation from it.)
 
 ### PipesHub
 
@@ -723,17 +724,20 @@ That is Mode 4 work, and only when what it describes runs.
 
 ## 8. Trust signals that comparable projects show first
 
-What a visitor sees before scrolling. Read 2026-09-19 and spot-checked 2026-10-04. Star counts
+What a visitor sees before scrolling. The layouts were read 2026-09-19; the one quotation in the
+table, OpenFGA's production statement, was re-confirmed on 2026-10-04 because it is a claim about
+another project's production use, and the rest of this table is description rather than
+quotation. Star counts
 have been removed from this file: they are the fastest-moving numbers in it, nothing in
 `positioning.md` rests on any of them, and re-reading six of them on every pass buys nothing.
 
 | Project | First screen |
 |---|---|
-| OpenFGA (Apache 2.0) | Badges: release, Go reference, Go Report Card, coverage, CII Best Practices, OpenSSF Scorecard, SLSA 3, FOSSA. A production statement ("Used in production by Auth0 FGA since December 2021"). Supported storage versions (PostgreSQL 14+, MySQL 8). Docker quickstart. <https://github.com/openfga/openfga> |
+| OpenFGA (Apache 2.0) | Badges: release, Go reference, Go Report Card, coverage, CII Best Practices, OpenSSF Scorecard, SLSA 3, FOSSA, Artifact Hub, Docker pulls. A production statement, quoted exactly: "Used in production by Auth0 FGA since December 2021". Supported storage versions (PostgreSQL 14+, MySQL 8, SQLite in beta). Docker quickstart. <https://github.com/openfga/openfga> |
 | River (MPL-2.0) | CI badge, Go reference, one sentence that says what it is, then working code, then the core idea about transactional enqueueing. <https://github.com/riverqueue/river> |
 | Onyx | Demo animation and one install command. <https://github.com/onyx-dot-app/onyx> |
 | PipesHub | Tagline and one install command. <https://github.com/pipeshub-ai/pipeshub-ai> |
-| Nango | Badges (stars, license, downloads), "What is Nango?", "How it works". <https://github.com/NangoHQ/nango> |
+| Nango | Badges (stars, license, downloads), then sections introducing what Nango is and how it works. <https://github.com/NangoHQ/nango> |
 | Convoy | CI badges, container images, links to docs and community chat. <https://github.com/frain-dev/convoy> |
 | Bedrock ACL documentation | Not a README, but the best model found for security honesty: a boxed statement of what the feature is **not**, a "Failure behavior" section, and a "Your responsibilities" list. <https://docs.aws.amazon.com/bedrock/latest/userguide/kb-managed-acl.html> |
 
