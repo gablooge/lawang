@@ -596,6 +596,7 @@ Three deterministic keys, minted in exactly one package (`internal/ids`) so the 
 | accept | `delivery_id = blake3(provider, raw_body)`, unique per tenant | an identical re-send is an accept no-op |
 | record | `id = "rec_" + blake3(provider, external_id, version, scope, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
 | subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates, and the row keeps its id |
+| subscription | unique on `(tenant, provider, external_id)` where the registration id is not empty | a registration id identifies one row of a tenant, so a delivery that names it has one candidate of that tenant and is never parked as an ambiguous owner on a registrar's mistake (ADR 15, decision 3) |
 
 Parts are joined with a `0x1F` separator so `("ab","c")` never collides with `("a","bc")`. A part
 that is empty or itself contains `0x1F` is refused with an error rather than hashed: an empty tenant

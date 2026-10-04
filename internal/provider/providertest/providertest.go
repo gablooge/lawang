@@ -57,6 +57,17 @@ type Case struct {
 // Three more are here because they are the same mistake one step further: a bidirectional
 // override (which reorders the text around it in a log line or a sink's UI), bytes that are not
 // UTF-8, and a value longer than the field holds.
+//
+// # Why the bad bytes travel with an invisible character
+//
+// A case is only a case if it reaches the normalizer as it is written here, and bytes that are
+// not UTF-8 do not survive every transport: encoding/json rewrites them to U+FFFD on the way
+// into a payload, which is also exactly what the cleaners produce, so a provider whose transport
+// is JSON (which is all of them so far) would pass that case whether it cleaned or not. The
+// zero-width space and the line break in that case are what give it teeth everywhere: they
+// travel through JSON unchanged and are still refused. The bad bytes stay for the provider whose
+// transport does carry them. TestEveryCaseSurvivesAJSONTransport is what holds every case to
+// this, so the next one added cannot quietly be decoration.
 func Cases() []Case {
 	return []Case{
 		{"a zero-width space in the name", "ben\u200bjamin", "an ordinary title"},
@@ -69,7 +80,7 @@ func Cases() []Case {
 		{"a folded title", "benjamin", "first line\r\n  second line"},
 		{"a line separator in the title", "benjamin", "first\u2028second"},
 		{"a title that is only whitespace", "benjamin", " \t "},
-		{"bytes that are not UTF-8", "ben\xffjamin", "ti\xfftle"},
+		{"bytes that are not UTF-8", "ben\xffja\u200bmin", "ti\xfft\nle"},
 		{"a name and a title over the limit", strings.Repeat("n", record.MaxAuthor+10), strings.Repeat("t", record.MaxTitle+10)},
 	}
 }

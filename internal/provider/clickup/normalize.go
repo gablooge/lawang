@@ -232,6 +232,14 @@ func (o Object) commentRecord() (record.Record, error) {
 	if err != nil {
 		return record.Record{}, err
 	}
+	// Unreachable today, and kept for the same reason scopeFor's is, which is written out there:
+	// a check standing behind another one silently stops being exercised, so it is named rather
+	// than left as a branch nobody can explain. api.comment returns only a comment whose ID
+	// equals the id it was asked for, that id is d.commentID(), and parseDelivery has already
+	// held it to validID. Object's fields are unexported, so Hydrate is the only route here.
+	// What it guards is identity: this id becomes the record's external id, where Seal checks
+	// the provider prefix and the character class and not this grammar, so a second colon or a
+	// slash would travel rather than be refused.
 	if !validID(o.comment.ID) {
 		return record.Record{}, fmt.Errorf("%w: the comment the API returned has no usable id", ErrBadObject)
 	}
@@ -296,6 +304,12 @@ func version(ms int64) string { return strconv.FormatInt(ms, 10) }
 // The record format wants a year between 1000 and 9999 and refuses anything else, so a time
 // outside that is refused here, by name, rather than as a sealing failure three stages later.
 // Epoch milliseconds count no leap second, so a second 60 cannot arrive through this function.
+//
+// Only the upper half can be reached today, and the lower half is kept rather than dropped:
+// every millisecond value that gets here came through epochMillis, whose digit rule refuses a
+// leading minus, so the year is at least 1970 and no test can tell "y < 1000" from its absence.
+// It is the shape of the bound written down, and the thing that would reach it is a second
+// caller, which is exactly when a half-written bound costs something.
 func occurredAt(ms int64) (time.Time, error) {
 	t := time.UnixMilli(ms).UTC()
 	if y := t.Year(); y < 1000 || y > 9999 {

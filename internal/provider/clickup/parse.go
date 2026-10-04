@@ -94,16 +94,44 @@ type delivery struct {
 	History   []historyItem `json:"history_items"`
 }
 
-// historyItem is one entry of history_items: when the change happened, which field it was, and,
-// for a comment event, the comment it is about. Only the comment's id is read, because the rest
-// of what a webhook says about a comment is also in the API's answer, and the API's shape is the
-// documented one.
+// historyItem is one entry of history_items: when the change happened and, for a comment event,
+// the comment it is about. Only the comment's id is read, because the rest of what a webhook
+// says about a comment is also in the API's answer, and the API's shape is the documented one.
 type historyItem struct {
-	Date    string `json:"date"`
-	Field   string `json:"field"`
+	Date    historyDate `json:"date"`
 	Comment *struct {
 		ID string `json:"id"`
 	} `json:"comment"`
+}
+
+// historyDate is a history item's date, read leniently: one that cannot be read is skipped and
+// never refuses the delivery.
+//
+// This is the same argument the delivery struct makes above, applied to a value rather than to a
+// field name. The dates contribute the event time, which moves a version and is an optimisation
+// (ADR 15, decision 4); they are not identity, and a delivery carrying NO history at all is
+// already accepted, falling back to the task's own date_updated. So refusing the whole delivery
+// over one unreadable date would buy nothing the lenient path does not already give, and would
+// cost every delivery of a workspace, permanently, the day ClickUp ships a history item type
+// whose date is absent, null or a JSON number. Identity (event, webhook_id, task_id, a comment
+// event's comment id) stays strictly refused.
+type historyDate struct {
+	ms int64
+	ok bool
+}
+
+// UnmarshalJSON reads a date that is epoch milliseconds as a decimal string, and records "no
+// readable date" for anything else, including null, a number and an object. It returns no error
+// on purpose: the decoder's error would be the whole delivery's, which is the failure this type
+// exists to prevent.
+func (h *historyDate) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		if ms, err := epochMillis(s); err == nil {
+			h.ms, h.ok = ms, true
+		}
+	}
+	return nil
 }
 
 // keys is the smallest part of a body the hub needs: the webhook's own id. It is decoded on its
@@ -160,9 +188,9 @@ func (p *Provider) Parse(body []byte) ([]provider.Change, error) {
 // one place that does, so Parse and Hydrate cannot disagree about what a delivery says.
 //
 // The second result is the event time: the newest history item's date, in epoch milliseconds, or
-// zero when the delivery carries no history. It is what makes a version move on a change the
-// task's own date_updated does not move on, a move between lists above all (ADR 4, decision 7,
-// and ADR 15).
+// zero when the delivery carries no history and none it can read (see historyDate). It is what
+// makes a version move on a change the task's own date_updated does not move on, a move between
+// lists above all (ADR 4, decision 7, and ADR 15).
 func parseDelivery(body []byte) (delivery, int64, error) {
 	var d delivery
 	if err := decode(body, &d); err != nil {
@@ -181,11 +209,9 @@ func parseDelivery(body []byte) (delivery, int64, error) {
 	}
 	var at int64
 	for _, h := range d.History {
-		ms, err := epochMillis(h.Date)
-		if err != nil {
-			return delivery{}, 0, err
+		if h.Date.ok {
+			at = max(at, h.Date.ms)
 		}
-		at = max(at, ms)
 	}
 	if handled[d.Event] == subjectComment {
 		if id := d.commentID(); !validID(id) {

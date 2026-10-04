@@ -35,8 +35,17 @@ var ErrBadRegistration = errors.New("clickup: bad registration")
 //     (tenant, provider, resource) updates the row in place instead of adding another. So a
 //     tenant cannot end up with two ClickUp rows for one workspace, which is exactly what
 //     [ADR 11](../../../docs/adr/0011-hub-resolution.md) decision 5 requires of a registration
-//     design, and the reason no unique index was added for it
-//     ([ADR 15](../../../docs/adr/0015-clickup-provider.md)).
+//     design.
+//
+// # What this function cannot do, and what does it instead
+//
+// It is given one registration and cannot see the others, so the two states that would make a
+// delivery unresolvable are not its to refuse. The table refuses both: UNIQUE (tenant_id,
+// provider, resource) makes a second registration of one workspace replace the first, and
+// subscriptions_one_registration_per_tenant (migration 00006) refuses a second row of one tenant
+// carrying one webhook id, which would otherwise make both rows candidates for every delivery
+// that names it, both verify, and the delivery park for ever
+// ([ADR 15](../../../docs/adr/0015-clickup-provider.md), decision 3).
 //
 // The consequence for the registrar: Lawang creates ONE ClickUp webhook per workspace per
 // tenant, at workspace level with no list, folder or space filter, and any narrowing of what is

@@ -1,6 +1,7 @@
 package providertest_test
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -28,6 +29,46 @@ func TestEveryCaseIsRefusedUncleanedAndAcceptedCleaned(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Every case still has teeth after a JSON round trip, which is the one thing the test above
+// cannot see.
+//
+// It checks the Case value against the format directly, and a provider does not: the value goes
+// into that provider's payload and comes back out of its decoder before the normalizer ever
+// reads it. encoding/json rewrites a byte that is not UTF-8 to U+FFFD on the way in, and the
+// cleaners produce U+FFFD for the same byte, so a case whose only hostile content is bad bytes
+// arrives already cleaned and is passed by a normalizer that cleans nothing. That was true of
+// the "bytes that are not UTF-8" case: with record.CleanDisplay removed from the first real
+// provider, six of the twelve cases failed and that one passed.
+//
+// Every provider's transport is JSON today, so this is the transport to hold the cases to.
+func TestEveryCaseSurvivesAJSONTransport(t *testing.T) {
+	for _, c := range providertest.Cases() {
+		t.Run(c.Name, func(t *testing.T) {
+			display, title := throughJSON(t, c.Display), throughJSON(t, c.Title)
+			if _, err := sealable(display, title).Seal("fake", tenancy.ID("tenant_x")); err == nil {
+				t.Errorf("the format accepts this case after a JSON round trip (%q, %q), so it cannot "+
+					"catch a provider whose transport is JSON and whose normalizer cleans nothing",
+					display, title)
+			}
+		})
+	}
+}
+
+// throughJSON is what a provider's payload does to a value: marshalled into a document and read
+// back out of it.
+func throughJSON(t *testing.T, s string) string {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var back string
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	return back
 }
 
 // sealable is a record that is complete but for the two fields under test.

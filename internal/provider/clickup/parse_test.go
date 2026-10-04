@@ -96,12 +96,6 @@ func TestParseRefuses(t *testing.T) {
 		{"a comment event with no comment id", `{"event":"taskCommentPosted","task_id":"a","webhook_id":"w","history_items":[{"id":"1","date":"1","field":"comment"}]}`},
 		{"a comment event with an empty comment id", `{"event":"taskCommentPosted","task_id":"a","webhook_id":"w","history_items":[{"id":"1","date":"1","field":"comment","comment":{"id":""}}]}`},
 		{"a comment event with a bad comment id", `{"event":"taskCommentPosted","task_id":"a","webhook_id":"w","history_items":[{"id":"1","date":"1","field":"comment","comment":{"id":"a:b"}}]}`},
-		{"a history date that is not a number", `{"event":"taskUpdated","task_id":"a","webhook_id":"w","history_items":[{"id":"1","date":"yesterday"}]}`},
-		{"a history date that is negative", `{"event":"taskUpdated","task_id":"a","webhook_id":"w","history_items":[{"id":"1","date":"-1"}]}`},
-		// Nineteen digits fits the length bound and not an int64, which is the one way past the
-		// digit check and into strconv's own refusal.
-		{"a history date larger than an int64", `{"event":"taskUpdated","task_id":"a","webhook_id":"w","history_items":[{"id":"1","date":"9999999999999999999"}]}`},
-		{"a history date of twenty digits", `{"event":"taskUpdated","task_id":"a","webhook_id":"w","history_items":[{"id":"1","date":"12345678901234567890"}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			changes, err := p.Parse([]byte(tc.body))
@@ -113,6 +107,47 @@ func TestParseRefuses(t *testing.T) {
 			}
 			if changes != nil {
 				t.Error("returned changes beside the error")
+			}
+		})
+	}
+}
+
+// A history item whose date this package cannot read is SKIPPED, and the delivery goes on. The
+// dates contribute the event time, which is an optimisation and never identity, and a delivery
+// carrying no history at all is already accepted and falls back to the task's own date_updated.
+// So refusing the whole delivery over one of them would buy nothing the lenient path does not,
+// and would dead-letter every delivery of a workspace, permanently, the day ClickUp ships a
+// history item type whose date is shaped differently.
+//
+// The last case is the other half: a date that CAN be read is still read, so the leniency did
+// not simply throw the event time away.
+func TestAHistoryDateThatCannotBeReadIsSkipped(t *testing.T) {
+	// api_task.json's date_updated, which is what the version falls back to.
+	const updated = "1791100000000"
+	const later = "1791100000001"
+	for _, tc := range []struct{ name, history, want string }{
+		{"a null date", `[{"id":"1","date":null}]`, updated},
+		{"no date at all", `[{"id":"1","field":"name"}]`, updated},
+		{"a date that is a JSON number", `[{"id":"1","date":` + later + `}]`, updated},
+		{"a date that is an object", `[{"id":"1","date":{"ms":"` + later + `"}}]`, updated},
+		{"a date that is not a number", `[{"id":"1","date":"yesterday"}]`, updated},
+		{"a date that is negative", `[{"id":"1","date":"-1"}]`, updated},
+		// Nineteen digits fits the length bound and not an int64, which is the one way past the
+		// digit check and into strconv's own refusal.
+		{"a date larger than an int64", `[{"id":"1","date":"9999999999999999999"}]`, updated},
+		{"a date of twenty digits", `[{"id":"1","date":"12345678901234567890"}]`, updated},
+		{"a readable date beside one that is not", `[{"id":"1","date":null},{"id":"2","date":"` + later + `"}]`, later},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _ := newHydrating(t)
+			body := []byte(`{"event":"taskUpdated","task_id":"86a1b2",` +
+				`"webhook_id":"7fa3ec74-0000-4000-8000-000000000001","history_items":` + tc.history + `}`)
+			if _, err := p.Parse(body); err != nil {
+				t.Fatalf("Parse refused the delivery over a history date: %v", err)
+			}
+			records := normalized(t, p, body)
+			if got := records[0].Version; got != tc.want {
+				t.Errorf("version = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -169,7 +204,10 @@ func TestDeliveryKeysRefuses(t *testing.T) {
 		{"no webhook id", `{"event":"taskUpdated","task_id":"a"}`},
 		{"an empty webhook id", `{"event":"taskUpdated","task_id":"a","webhook_id":""}`},
 		{"a webhook id with a control character", "{\"webhook_id\":\"w\u0001\"}"},
-		{"a webhook id that is too long", `{"webhook_id":"` + strings.Repeat("w", 129) + `"}`},
+		// One past maxID, which is the boundary a bound is got wrong at. The longer one stays
+		// because a key the hub would refuse by its own bound must die here first.
+		{"a webhook id one byte too long", `{"webhook_id":"` + strings.Repeat("w", 65) + `"}`},
+		{"a webhook id that is far too long", `{"webhook_id":"` + strings.Repeat("w", 129) + `"}`},
 		{"not utf8", "{\"webhook_id\":\"\xff\"}"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

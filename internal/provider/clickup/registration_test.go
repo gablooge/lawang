@@ -214,8 +214,12 @@ func TestTwoTenantsResolveToThemselves(t *testing.T) {
 	}
 }
 
-// SubscriptionFor refuses a registration that could not resolve a delivery, or that would be a
-// second row for one workspace.
+// SubscriptionFor refuses a registration that could not resolve a delivery.
+//
+// It cannot refuse a registration that would be a second row for one workspace, or a second row
+// for one webhook id: it is given one registration and cannot see the others. The table is what
+// refuses those, and TestOneWorkspaceIsOneSubscriptionRow and
+// TestTwoWorkspacesOfOneTenantCannotShareAWebhookID are where they are held.
 func TestSubscriptionForRefuses(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -281,5 +285,55 @@ func TestSubscriptionForBuildsTheRowTheAcceptPathNeeds(t *testing.T) {
 	}
 	if keys.Workspace != sub.Workspace {
 		t.Errorf("a delivery carries workspace %q and the row records %q", keys.Workspace, sub.Workspace)
+	}
+}
+
+// Two rows of one tenant cannot carry one webhook id, because both would be candidates for every
+// delivery that names it, both would verify, and the hub would park the delivery for ever.
+//
+// This is the shape ADR 11 decision 5 feared, reached by the one route ClickUp leaves open. Not
+// two rows for one workspace: the upsert on (tenant, provider, resource) makes that impossible.
+// Two workspaces recorded against one webhook, which a registrar produces by recreating a webhook
+// before the row it replaced was written, or by being handed the wrong workspace id.
+// `subscriptions_one_registration_per_tenant` refuses it at the table, so the mistake is an error
+// the registrar sees at once rather than a workspace that silently receives nothing for ever.
+func TestTwoWorkspacesOfOneTenantCannotShareAWebhookID(t *testing.T) {
+	t.Parallel()
+	e := setupRegistration(t)
+	e.register(tenantA, workspace, webhook1, secretA)
+
+	second, err := clickup.SubscriptionFor(tenantA, "9000000002", webhook1, secretA)
+	if err != nil {
+		t.Fatalf("SubscriptionFor: %v", err)
+	}
+	if stored, err := e.subs.Register(e.ctx, second); err == nil {
+		t.Fatalf("stored a second row for one webhook id: %+v", stored)
+	}
+
+	rows := e.rows()
+	if len(rows) != 1 {
+		t.Fatalf("the table holds %d rows, want 1: %+v", len(rows), rows)
+	}
+	// The point of refusing it: the delivery still resolves to its one owner.
+	if got := e.deliver(webhook1, secretA); got != ingress.Stored {
+		t.Errorf("verdict = %s, want stored", got)
+	}
+}
+
+// Two tenants may still name one webhook id, and that is not Lawang's to rule out: ClickUp's id
+// space is not this deployment's to make unique across accounts, and the hub already decides such
+// a delivery on the secrets, routing it when one verifies and parking it when both do. The
+// constraint above is per tenant for exactly that reason.
+func TestTwoTenantsMayNameOneWebhookID(t *testing.T) {
+	t.Parallel()
+	e := setupRegistration(t)
+	e.register(tenantA, workspace, webhook1, secretA)
+	e.register(tenantB, "9000000002", webhook1, secretB)
+
+	if got := e.deliver(webhook1, secretA); got != ingress.Stored {
+		t.Errorf("tenant A's delivery: %s, want stored", got)
+	}
+	if got := e.deliver(webhook1, secretB); got != ingress.Stored {
+		t.Errorf("tenant B's delivery: %s, want stored", got)
 	}
 }

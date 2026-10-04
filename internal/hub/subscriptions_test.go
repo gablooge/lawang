@@ -245,6 +245,44 @@ func TestASubscriptionWithNoDeliveryKeyIsRefusedByTheTable(t *testing.T) {
 	}
 }
 
+// TestOneRegistrationIDIsOneRowPerTenant. Two rows of one tenant carrying one registration id are
+// both candidates for every delivery that names it, and one registration has one secret, so both
+// verify and the hub parks the delivery as an ambiguous owner, permanently. They are two rows for
+// two resources, so the table's other uniqueness does not reach them;
+// `subscriptions_one_registration_per_tenant` is what does (ADR 15, decision 3).
+//
+// The row with no registration id at all is the reason the index is partial: a provider that
+// sends none leaves the column empty, and without the predicate the second such row of a tenant
+// would collide with the first.
+func TestOneRegistrationIDIsOneRowPerTenant(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	e.register(tenantA, "W1", "", "S1", secretA)
+
+	_, err := e.sub.Register(e.ctx, provider.Subscription{
+		Tenant: tenantA, Provider: fake.DefaultKey, Resource: "W2", External: "S1", Secret: secretA,
+	})
+	if err == nil {
+		t.Error("stored a second row of one tenant for one registration id")
+	}
+
+	// Two rows of one tenant that record no registration id are not a collision: neither is ever
+	// selected by one, and each is found by its own workspace.
+	e.register(tenantA, "W3", "WS3", "", secretA)
+	e.register(tenantA, "W4", "WS4", "", secretA)
+}
+
+// TestTwoTenantsMayRegisterOneRegistrationID. A provider's id space is not this deployment's to
+// make unique across accounts, and the hub decides two tenants' rows on their secrets anyway
+// (TestTwoTenantsOnOneWorkspaceWithDifferentSecretsRouteToTheOwner). So the uniqueness above is
+// per tenant, like the table's other one.
+func TestTwoTenantsMayRegisterOneRegistrationID(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	e.register(tenantA, "W1", "", "S1", secretA)
+	e.register(tenantB, "W1", "", "S1", secretB)
+}
+
 // TestTheCandidateLookupUsesAnIndex. The lookup runs once per delivery, on the accept path, so it
 // must not read the table. The plan is asked for on a table with enough rows that a sequential
 // scan would be the cheaper plan if the index were missing or unusable.

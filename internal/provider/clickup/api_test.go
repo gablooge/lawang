@@ -37,6 +37,15 @@ func (noToken) Token(context.Context, tenancy.ID) (string, error) {
 	return "", errors.New("nothing stored for this tenant")
 }
 
+// emptyToken is the other way a vault can say nothing, and the one no interface forbids: an
+// empty string with no error. A row present with an empty ciphertext, a decrypt that yields
+// nothing, or a B13 seam written to return the zero value for "not set" all produce it, and the
+// Token contract cannot rule it out. Without this double, Hydrate's empty-token guard survives
+// its own deletion, because noToken never gets that far.
+type emptyToken struct{}
+
+func (emptyToken) Token(context.Context, tenancy.ID) (string, error) { return "", nil }
+
 // fakeAPI is a stand-in for ClickUp's API: it answers the two calls this package makes, counts
 // them, and records what it was asked. It refuses a request with no Authorization header, which
 // is what ClickUp does, so a provider that forgot the credential fails here rather than passing.
@@ -180,6 +189,29 @@ func TestHydrateRefusesATenantWithNoToken(t *testing.T) {
 	}
 	if n := len(api.seen()); n != 0 {
 		t.Errorf("made %d requests without a token", n)
+	}
+}
+
+// A vault that answers with an empty string and no error is a refusal too, and it is the shape
+// a guard is invisible against: every OTHER kind of missing token already errors, so the test
+// that proves this one is the test that produces exactly ("", nil).
+//
+// Fail closed (CLAUDE.md: "a missing tenant, secret, key or identity is a refusal, never a
+// default"). Without it the request goes out with an empty Authorization header, ClickUp answers
+// 401, and the delivery spends its whole retry ladder on an ErrAPI that says nothing about the
+// real cause.
+func TestHydrateRefusesAnEmptyToken(t *testing.T) {
+	p, api := newHydrating(t, func(o *clickup.Options) { o.Tokens = emptyToken{} })
+	changes, err := p.Parse(fixture(t, "webhook_task_updated.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Hydrate(context.Background(), testTenant, changes[0])
+	if !errors.Is(err, clickup.ErrNoToken) {
+		t.Fatalf("Hydrate: %v, want ErrNoToken", err)
+	}
+	if n := len(api.seen()); n != 0 {
+		t.Errorf("made %d requests with an empty token", n)
 	}
 }
 
