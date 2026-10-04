@@ -30,12 +30,15 @@ const maxID = 64
 // digits is what an int64 holds, so a longer run is refused here rather than overflowing.
 //
 // The arm is not redundant with strconv.ParseInt below, and removing it changes answers.
-// ParseInt refuses an over-long VALUE; this arm refuses an over-long STRING, which is the wider
-// set, because leading zeros are legal to ParseInt. Delete the arm and
-// "00000000000001791100000000" parses to 1791100000000, where today it is refused as a time
-// that is not epoch milliseconds. Nothing between the wire and here bounds the length of that
-// string (json.Unmarshal into a string, historyDate.UnmarshalJSON, digits), so a padded run of
-// any width arrives straight from a webhook body or an API response.
+// ParseInt refuses an over-long VALUE; this arm refuses an over-long STRING. Neither set of
+// refusals contains the other, so neither check can stand in for the other. This arm refuses
+// "00000000000001791100000000", which ParseInt reads as 1791100000000 because leading zeros are
+// legal to it, so deleting the arm would accept that time where today it is refused. ParseInt
+// refuses "9999999999999999999", which is nineteen digits and so inside this arm's bound;
+// TestAHistoryDateThatCannotBeReadIsSkipped has it as "a date larger than an int64".
+// Nothing between the wire and here bounds the length of that string (json.Unmarshal into a
+// string, historyDate.UnmarshalJSON, digits), so a padded run of any width arrives straight from
+// a webhook body or an API response.
 //
 // Two cases pin it, one per path: TestAHistoryDateThatCannotBeReadIsSkipped's "a zero-padded
 // date of twenty-six digits" and TestNormalizeRefuses's "a task with a zero-padded date_updated
@@ -257,9 +260,21 @@ func (d delivery) externalID() (string, error) {
 	case subjectComment:
 		return Key + ":comment:" + d.commentID(), nil
 	default:
-		// Unreachable: parseDelivery refuses an event that is not handled. It is here because a
-		// thirteenth event added to handled with no subject must fail closed and not fall
-		// through to "it is probably a task".
+		// Reached, and not through parseDelivery, which does refuse an event that is not
+		// handled. Normalize calls this on an Object it never parsed, so the zero Object
+		// arrives here: its event is "" and handled[""] is the zero subject. The line is
+		// covered, by TestNormalizeRefuses's "an object from somewhere else", and the count
+		// profile puts it at 1 for that subtest alone.
+		//
+		// Falling through to "it is probably a task" would not change an answer today, and
+		// that is the whole reason to say what refuses it instead of calling the arm dead.
+		// With this arm returning the task form, the package's tests are still green: the
+		// zero Object is refused one check later by externalID != c.ExternalID in Normalize,
+		// and a change whose external id were "clickup:task:" would be refused the check
+		// after that, by validID on the task id. No change can carry that id anyway, because
+		// validID refuses an empty task id upstream. So the arm's value is that a thirteenth
+		// event added to handled with no subject is refused here, by name, instead of being
+		// read as a task by a caller that has no reason to doubt it.
 		return "", badDelivery("the event has no subject")
 	}
 }
