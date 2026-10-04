@@ -1,7 +1,14 @@
 # Candidate `good first issue` items
 
-Read on 2026-09-20, against `main` at commit `905a23d` (the merge of the rename), in a clean
-worktree.
+Written on 2026-09-20 against `main` at commit `905a23d` (the merge of the rename), and
+**re-verified on 2026-10-04 against `main` at commit `cae7cac`**, which is eleven backlog items and
+one scope cut later. Every candidate below was checked again in the code on that second date.
+Candidates 1 to 5 still hold. Candidate 6's count of decision records had gone stale and is
+corrected. Candidates 1, 2 and 3 carried smaller errors, also corrected.
+
+Candidates are written against durable landmarks (a link text, a function name, a filename) rather
+than line numbers or counts, because a line number is the first thing to rot. Re-check the date
+above before opening any of these as an issue.
 
 These are drafts. **Nothing here has been opened as an issue.** The maintainer decides which ones
 become issues, in their own words.
@@ -19,7 +26,8 @@ means" at the end.
 
 ## 1. The README's link to the extension points lands in the wrong place
 
-**Files:** `README.md` (line 73), plus a new test.
+**Files:** `README.md` (the one line that links to `docs/architecture.md#extension-points`), plus a
+new test.
 
 `README.md` links to `docs/architecture.md#extension-points`. The heading in that file is
 `## 7. Extension points`, whose anchor is `#7-extension-points`. There is no HTML anchor named
@@ -58,9 +66,12 @@ variables, the exit codes and the word `help`, but not the command list. A comma
 
 **Smallest version that helps:** a test that reads the `Commands:` block of the usage text, takes
 the first word of each line, and for each one calls `run` with that word and an empty environment.
-The exit code must not be 2 and the output must not contain `unknown command`. Two of the commands
-(`serve`, `worker`, `migrate`) refuse to start without configuration, which is exit 1: that is the
-expected result, and it is different from "I do not know this word".
+The exit code must not be 2 and the output must not contain `unknown command`. All three of
+`serve`, `worker` and `migrate` exit 1 rather than 2, for two different reasons: `serve` and
+`migrate` refuse to start without configuration, and `worker` returns `errNotBuilt` ("not built
+yet, see docs/backlog.md") because the command is still a stub, which
+`TestRunStubbedRolesExitNonZero` pins. Exit 1 is the expected result in both cases, and it is
+different from "I do not know this word".
 
 **Done when:** the test passes today; it fails when a line is removed from the usage text; it fails
 when a case is removed from the `switch`. Say in the pull request which of those two you tried.
@@ -79,14 +90,19 @@ wants a fast loop, and a container start costs seconds on every run.
 
 **Smallest version that helps:** in `internal/testdb`, `NewRaw` and `NewRawCluster` skip the test
 when `testing.Short()` is true, with a message saying why. Add a `Makefile` target
-(`make test-short`, running `go test -short ./...`) and one line in `CONTRIBUTING.md`.
+(`make test-short`, running `go test -short ./...`) and one line in the contributing guide.
 
 **Watch out for:** `make check` and CI must keep running the full suite. `-short` is for a
-developer's own loop, never for the check that says a change is ready.
+developer's own loop, never for the check that says a change is ready. Also, there is no
+`CONTRIBUTING.md` at the repository root yet: it exists only as `growth/drafts/CONTRIBUTING.md`.
+If this is opened as an issue before that file is moved into place, say so in the issue, or the
+first person to pick it up will spend their time hunting for a file that is not there. The code
+and `Makefile` parts stand on their own and can be done first.
 
 **Done when:** `go test -short ./...` starts no container and every skipped test says why;
 `make test` and CI are unchanged; the skip is in one place, so a new integration test gets the
-behaviour for free.
+behaviour for free; and the contributing guide mentions `make test-short`, once that guide exists
+at the root.
 
 **Size:** S.
 
@@ -123,7 +139,8 @@ This repository has a standing rule: never an em dash (the character U+2014), an
 code, comments, SQL and documents. Today the rule is enforced by the review agent, which runs on
 the maintainer's machine. An outside contributor has no way to check their change before they
 submit it, and will find out only from a review finding. There are zero em dashes in the
-repository right now (checked 2026-09-20), so the check would be green from the first day.
+repository right now (U+2014 searched over every tracked file on `main` at `cae7cac`, 2026-10-04),
+so the check would be green from the first day.
 
 **Smallest version that helps:** a `Makefile` target that lists the repository's tracked text files
 and fails if any contains U+2014, printing the file and line. Wire it into `make check`, so a
@@ -145,17 +162,23 @@ names the file and the line, and is green on `main`.
 **Files:** `docs/adr/0000-template.md` (new), `docs/adr/README.md`.
 
 `docs/adr/README.md` says "one short file per settled decision" and that a record "states the
-decision, why, and what it costs". Three records exist (0001, 0002, 0010) and they share a shape,
-but the shape is written down nowhere. Someone who wants to contribute a decision has to reverse
-engineer it from the three files.
+decision, why, and what it costs". The records in `docs/adr/` share a shape, but the shape is
+written down nowhere. Someone who wants to contribute a decision has to reverse engineer it from
+the files. There is no `0000-template.md`.
 
-**Smallest version that helps:** read the three records, take the sections they have in common, and
-write `0000-template.md` with those headings and one sentence under each saying what belongs there.
-Add a row to the table in `docs/adr/README.md` marking it as a template, not a decision, so nobody
-mistakes 0000 for a real record.
+The set grows, so this candidate deliberately gives no count. Read whatever is in `docs/adr/` on
+the day you pick this up. The later records are the longer and harder ones (the scope id format,
+the record format, hub resolution, the ledger with supersede and masking, the sink wire protocol,
+prepared records, the ClickUp provider), and a template built from only the earliest two or three
+will not fit them.
 
-**Done when:** a person who has read only the template can write a record that looks like the three
-that exist; the index says plainly that 0000 is a template.
+**Smallest version that helps:** read every record in `docs/adr/`, take the sections they have in
+common, and write `0000-template.md` with those headings and one sentence under each saying what
+belongs there. Add a row to the table in `docs/adr/README.md` marking it as a template, not a
+decision, so nobody mistakes 0000 for a real record.
+
+**Done when:** a person who has read only the template can write a record that looks like the
+existing ones, including the long ones; the index says plainly that 0000 is a template.
 
 **Size:** S.
 
