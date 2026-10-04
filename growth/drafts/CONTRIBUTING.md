@@ -201,7 +201,7 @@ from outside the project is not. Measured from this repository's own pull reques
 | Kind of pull request | First review | Opened to merged |
 |---|---|---|
 | A backlog item, in queue order. Ten so far | 16 to 103 minutes, every one of them | 4 hours 34 minutes to 12 days. The two slowest are #48 and #49, and the reason is below |
-| Everything else. Seven so far | 16 minutes to 15 days. Three were read within eight hours (#33, #44, #51), three waited two weeks (#35, #45, #46), and #34 was merged with no review posted at all | #33, #34, #44 and #51 merged inside a day. The three that waited are still open |
+| Everything else. Seven so far | 16 minutes to 15 days. Three were read within eight hours (#33, #44, #51), three waited two weeks (#35, #45, #46), and #34 was merged with no review posted at all | #33, #34, #44 and #51 merged inside a day. #46 merged 14 days 8 hours after it was opened, on the day its first review arrived. #35 and #45 are still open |
 
 So the honest recent range for a pull request from outside the queue is **days to weeks**, and the
 longest wait on record is the one a contributor would be in. One person maintains this in their
@@ -210,12 +210,13 @@ measurement of the past, not a commitment about the future, and it may get bette
 
 **What the second row really measures**, because the label is wider than the thing. It is not
 "not a backlog item". Four pull requests outside the queue were handled as fast as anything in it.
-The three that waited two weeks (#35 waited 15 days, #45 and #46 waited 14 days each, and all
-three were still open on 2026-10-04) are documentation and growth branches, opened within two days
-of each other, and they were parked while the queue ran. The split is between what the maintainer
-was working on at the time and what was parked. Your pull request will in practice be the parked
-kind, which is why days to weeks is the number to plan for, but the mechanism is attention and not
-a rule about labels.
+The three that waited two weeks (#35 waited 15 days, #45 and #46 waited 14 days each) are
+documentation and growth branches, opened within two days of each other, and they were parked
+while the queue ran. #46 then merged an hour after its first review finally arrived, which is the
+shape of the whole row: the wait is until somebody sits down, and after that it is quick. So the
+split is between what the maintainer was working on at the time and what was parked. Your pull
+request will in practice be the parked kind, which is why days to weeks is the number to plan for,
+but the mechanism is attention and not a rule about labels.
 
 **And the eleven days in the first row are not a stacking delay.** #48 was opened on
 2026-09-21T01:23:45Z, first reviewed 41 minutes later, approved at 03:04:26Z, and approved again
