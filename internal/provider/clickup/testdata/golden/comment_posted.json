@@ -1,0 +1,68 @@
+[
+  {
+    "format": "lawang.record/v1",
+    "id": "rec_bcf9845e8d1e1357ba296d412185f6ce",
+    "op": "upsert",
+    "source": "clickup",
+    "kind": "task",
+    "external_id": "clickup:task:86a1b2",
+    "version": "1791100000000",
+    "supersedes": null,
+    "occurred_at": "2026-10-04T07:46:40Z",
+    "title": "placeholder task name, edited",
+    "text": "A placeholder description. Reach the placeholder owner at owner@example.invalid.",
+    "author": {
+      "id": "183",
+      "display": "placeholder-author"
+    },
+    "container": {
+      "kind": "list",
+      "id": "901100"
+    },
+    "visibility": {
+      "scope": "clickup:list:901100",
+      "audience": "group"
+    },
+    "origin": {
+      "automation": false,
+      "untrusted": false
+    },
+    "edges": {
+      "reply_parent": null
+    },
+    "meta": {}
+  },
+  {
+    "format": "lawang.record/v1",
+    "id": "rec_1d7813f509162e6ddf1c64ea329f0fe6",
+    "op": "upsert",
+    "source": "clickup",
+    "kind": "message",
+    "external_id": "clickup:comment:648893191",
+    "version": "1791100600000",
+    "supersedes": null,
+    "occurred_at": "2026-10-04T07:56:40Z",
+    "title": "",
+    "text": "A placeholder comment. Ring the placeholder desk on +1 555 0100.",
+    "author": {
+      "id": "184",
+      "display": "placeholder-commenter"
+    },
+    "container": {
+      "kind": "task",
+      "id": "86a1b2"
+    },
+    "visibility": {
+      "scope": "clickup:list:901100",
+      "audience": "group"
+    },
+    "origin": {
+      "automation": false,
+      "untrusted": false
+    },
+    "edges": {
+      "reply_parent": "clickup:task:86a1b2"
+    },
+    "meta": {}
+  }
+]

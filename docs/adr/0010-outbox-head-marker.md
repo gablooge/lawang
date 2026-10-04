@@ -265,7 +265,9 @@ The repair, for one key, as an administrator (or bound to the tenant as the appl
 
 ```sql
 BEGIN ISOLATION LEVEL READ COMMITTED; -- a plain BEGIN inherits the session default
-SELECT pg_advisory_xact_lock(hashtextextended('<tenant>' || chr(31) || '<ordering key>', 0));
+-- The high bit is the outbox's half of the one advisory-lock namespace (ADR 12 decision 1).
+SELECT pg_advisory_xact_lock(
+         hashtextextended('<tenant>' || chr(31) || '<ordering key>', 0) | (-9223372036854775808)::bigint);
 UPDATE lawang.outbox SET is_head = true
  WHERE id = (SELECT id FROM lawang.outbox
               WHERE tenant_id = '<tenant>' AND ordering_key = '<ordering key>'

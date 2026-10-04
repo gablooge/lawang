@@ -44,6 +44,12 @@ One binary, two roles, one database.
 
 Other subcommands: `migrate`, `connect <provider>`, `reconcile <tenant> <provider>`, `version`.
 
+**`lawang worker` is not wired up yet** (as of B10). The drain is a package, `internal/worker`,
+used by its tests and by B12, and the command exits with "not built yet": a drain needs a sink
+per tenant, and that configuration arrives with the vault (B13) and the operator API (B14).
+This table describes the role the command will have, and everything else in this document
+describes the drain as it is built.
+
 There is **no message broker**. The only queue is the `outbox` table. Retries and the dead-letter
 queue are row states, not topics, so replaying a dead letter is an `UPDATE`, not a re-publish.
 
@@ -197,6 +203,57 @@ already understands. Four to eight concurrent accepts of a few milliseconds each
 deliveries a second, which is far past what v0.1 needs; an operator who needs more raises
 `pool_max_conns` in `LAWANG_DATABASE_URL` (see [section 4](#4-trust-model)).
 
+**Resolving the owner is `internal/hub`, and it is two transactions.** The edge hands it the
+registry entry and the delivery, and it does five things in order.
+
+1. **Delivery keys.** `WebhookSource.DeliveryKeys` reads the provider's own identifiers out of the
+   body: a workspace, team, portal or account id, and the id of the registration itself. They are
+   parsed from unauthenticated bytes, before any tenant exists, so they are held to what a lookup
+   can use (at most 256 bytes each, storable text) and used for nothing but narrowing. A delivery
+   with no key at all is **not** looked up: finding its owner would mean verifying every
+   subscription there is, which is work a stranger could ask for with an empty body, so it is
+   parked.
+2. **Candidates, under `lawang_resolver`, in a transaction that does nothing else.** One equality
+   probe per key the delivery carries, each on its own index of the subscriptions table, for at
+   most `hub.DefaultMaxCandidates` (32) rows plus one; the candidate set is the union of what they
+   return. It is a union and not a choice between them because a subscription may be registered
+   with a workspace id, with the registration's own id, or with both, and which of those a delivery
+   carries is the provider's business: asking only the rows one key selects would leave a tenant
+   with a claim on the delivery out of the set, and "exactly one verified" cannot be told from "the
+   one we asked verified". Each probe also filters on the other key, so a key that both the
+   delivery and the row carry must agree. That transaction commits before anything is verified: it
+   is cross-tenant for its whole life, and a bind inside it would narrow nothing (see
+   [section 4](#4-trust-model)).
+3. **Verification, once per candidate.** Constant time, over the exact raw bytes, with the same
+   `provider.Request` each time except that `Body` is copied per candidate, which turns that
+   field's rule into a guarantee for 0.9 microseconds at 8 KiB. `Verify` is called inside a
+   recover and under the accept path's own deadline: a provider that panics parks the delivery
+   instead of dropping the connection, and one that does not return is given up on, so the sender
+   gets the 503 the table above promises rather than nothing at all
+   ([section 7](#7-extension-points)).
+4. **The owner.** None verified is 401 and nothing stored. Exactly one is the tenant. **More than
+   one is refused** (principle 2), and so is a candidate set larger than the hub will verify,
+   because a set cut short could hide the second tenant that verifies.
+5. **The accept**, in a second transaction, under `TenantTx` bound to that tenant:
+   `outbox.Accept`, then 202, or 200 when the delivery id says this tenant already has it.
+
+**A delivery nobody can be shown to own is parked under the sentinel tenant** `_parked`
+(`tenancy.Sentinel`), which no tenant may have: the `tenants` table refuses that id, so no operator
+credential is ever issued for it. `outbox.Park` takes no tenant from its caller at all, which is
+what keeps a crafted delivery from reaching a real one. A parked row is stored `dead`, finished and
+not the head of its key, so no worker ever claims it, and `dead_reason` says why it was parked, in
+one of five fixed texts that B25 re-resolves by. A parked row keeps the delivery's own bytes for
+the reasons a sweep can settle later, and a short note (its length and the delivery id the bytes
+had) for the one it can never settle: a delivery whose keys the provider could not read is the
+park a stranger produces at will, with no credential, and nothing will ever read those bytes
+again. The details, and why the verification secret is a column of the subscription row rather
+than a vault entry, are in [ADR 11](adr/0011-hub-resolution.md).
+
+**An accepted delivery is ordered by the subscription it arrived on**, `{provider key}:{subscription
+id}`, because the hub does not parse a delivery and so cannot name an entity. That is coarser than
+one entity, which keeps the guarantee that two versions of one entity are never in flight together,
+and it costs parallelism: one subscription's deliveries drain one at a time (ADR 11).
+
 ### 3.2 Drain path (inside `worker`)
 
 1. Claim rows with `FOR UPDATE SKIP LOCKED`, only the **head** of each ordering key, so the
@@ -210,12 +267,51 @@ deliveries a second, which is far past what v0.1 needs; an operator who needs mo
 3. Parse the stored raw body into changes. One delivery can produce several records (a comment and
    its parent task, for example).
 4. Hydrate each change into the full object. On failure, degrade to a minimal record built from the
-   webhook body rather than dropping the change.
-5. Normalize, drop automation noise, compute the record id, skip ids already in the ledger, link
-   the supersede chain forward only, mask PII.
-6. Commit the ledger rows and the prepared records together, then deliver to the sink.
-7. Commit the delivered state. A crash between steps 6 and 7 re-drains the prepared records, and
-   the sink's idempotency turns the repeat into a no-op.
+   webhook body (`provider.Degrader`) rather than dropping the change. A degraded record derives
+   its scope from the same inputs, through the same function, as the hydrated one would, or one
+   version of one entity gets two ids; where the body does not carry what the scope is made of the
+   change cannot be degraded at all, and waits for hydration
+   ([ADR 4](adr/0004-record-format-v1.md) decision 7).
+5. Normalize, drop automation noise, compute the record id, check the record against the claimed
+   row's tenant (`record.SealedFor`), skip ids already in the ledger, link the supersede chain
+   forward only, mask PII.
+6. Commit the ledger rows and the prepared records together. The prepared records are rows of
+   their own (`outbox_record`, one per record of the delivery, holding the document the sink
+   receives), because the ledger holds what was **prepared** and so a second attempt that
+   derived the records again would skip every one of them
+   ([ADR 14](adr/0014-prepared-records.md)). Then deliver to the sink, outside the transaction.
+7. Commit the delivered state: the row `delivered`, every record the sink refused `dead` with
+   its own cause, and every other record of the delivery `delivered`, in one transaction. A
+   crash between steps 6 and 7 re-drains the prepared records, and the sink's idempotency turns
+   the repeat into a no-op. A row that is already `prepared` is delivered from what step 6
+   stored and is **not** prepared again: its ids are in the ledger, so re-deriving them would
+   skip every one.
+
+Steps 3 to 5 are `internal/pipeline` ([ADR 12](adr/0012-ledger-supersede-masking.md)), in two
+calls, because step 4 talks to a provider's API and steps 5 and 6 hold a transaction, and those
+must not be one span (see [section 10](#10-design-principles-learned-the-hard-way)). `Normalize`
+does 3, 4 and the gate outside any transaction; `Prepare` does the rest inside the transaction the
+worker opened in step 2, so the worker can commit the ledger rows with everything else it stores.
+Everything `Prepare` refuses is classified once: an error that wraps `pipeline.ErrDeadLetter` is
+one the same bytes will produce again, and anything else goes back on the retry ladder.
+
+**Three outcomes, and a fourth that nobody writes.** A failed attempt is one of three things,
+and the difference between them is what is destroyed. **Retry** puts the row on the backoff
+ladder, which dead-letters it at the end of it: everything that may work next time. **Dead
+letter** parks it at once: only what the same bytes will refuse again, which is
+`pipeline.ErrDeadLetter`. **Halt** leaves the row exactly where it is, claimable again after a
+pause, and does not walk the ladder: the sink refusing the request itself rather than its
+contents (section 11), a tenant whose sink cannot be built, and any answer from a sink that its
+own contract does not allow. The last of those is the fail-closed default, because an
+unforeseen case must stall and not destroy, and a halt gives its attempt back so that it can
+never walk a row to its dead letter by accident.
+
+The fourth is a worker that dies or hangs: it writes nothing at all, so its lease expires and
+the row is claimed again, forever, holding every later version of its entity behind it.
+`attempts` is incremented by the claim and read by nothing else, so the drain compares it with
+the ladder **before it does any work**, and parks a row that has been claimed past the end of
+the ladder with no failure recorded (`dead_reason` "attempts exhausted without a recorded
+failure"). That is the only trace such a worker leaves.
 
 **Outbox row states.** `pending` to `prepared` (step 6) to `delivered` (step 7), or to `dead`. A
 claim is a **lease** (`lease_until` plus a `lease_token`), not a held lock, because the work spans
@@ -251,6 +347,19 @@ Different entities do not wait for each other (two keys that hash alike do, harm
 transaction that accepts several deliveries holds several of these locks until it commits, so it
 should accept in a stable key order or be ready to retry a deadlock.
 
+**One namespace, one order.** Postgres has a single advisory-lock namespace (a 64 bit key, with
+no classid split), and two modules take locks in it: the outbox over (tenant, ordering key),
+and `internal/pipeline` over (tenant, provider, external id) for the supersede chain. The rule
+for any transaction that ever holds both is **take every advisory lock ascending by key**
+([ADR 12](adr/0012-ledger-supersede-masking.md) decision 1). It is a total order with no
+premise attached, because the namespace is split by construction: the outbox sets the high bit
+of its key and the pipeline clears it, so an ordering-key value is always negative, an
+entity-key value is always non-negative, and ascending order puts the ordering key first by
+itself. Each module keeps 63 bits, and a collision within a module is a wait and not a
+deadlock. Nothing in the drain holds both today, since step 6 takes only entity locks and step
+7 only the ordering key's, but the rule is written down because the two orders deadlock against
+each other and nothing in either module would show it.
+
 The same lock keeps the head marker. The transitions that finish a row take it too, before
 anything else, so the writers of one key (accept, replay, delivered, dead) run strictly one
 after the other. Without that, an accept and a finish of the same entity can miss each other: the
@@ -278,6 +387,12 @@ treats it like any other late arrival of an old version. A row that died after s
 it (`prepared_at`) and is replayed as `prepared`, so it is delivered again but never prepared
 again.
 
+A **delivered** row is replayable too, and only while one of its records is a dead letter: that
+is the other half of the per-record dead letter, since a delivery whose batch held one refusal
+finished as delivered and the refused record would otherwise have nowhere to come back from.
+The replay brings those records back and the row with them, and the records that landed stay
+delivered and are not offered again. A delivered row with nothing dead in it is not replayable.
+
 The claim picks its rows on its statement snapshot and leases each on its latest version, so it
 re-checks on the locked row everything that can change in between: the marker, and `due_at` (the
 lease and the backoff). Both are columns of the locked row itself, so the re-check never compares
@@ -293,13 +408,24 @@ being able to read one back, and it cannot write `is_head`, so it can lease a he
 one. Payloads are read afterwards, as the application role bound to the claimed row's tenant.
 
 **What a failure leaves behind.** `last_error` and `dead_reason` are plain text that operators
-read and every backup carries, so they never hold token material, a URL, or text written by a
-remote system. The outbox does not take an error string at all. A failure is recorded as an
+read and every backup carries, so they never hold token material, a URL, or a sentence written
+by a remote system. The outbox does not take an error string at all. A failure is recorded as an
 `outbox.Cause`: one of the outbox's own classifications (section 11), the HTTP status, and the
 remote system's error code if it looks like one (short, and nothing but letters, digits, `_`, `-`
 and `.`), otherwise the word "withheld". The reason is the obvious call it rules out: the error
 of an HTTP client quotes the request URL, and the query string is where many sinks and providers
 carry their API key.
+
+**The error code is the one exception, and it is deliberate.** It is chosen by the receiver, or
+by a `Sink` implementation that is not one of this repository's, and `Cause.WithCode` is a shape
+filter and not a trust boundary: 64 bytes of that alphabet is a shape a bot token, a base64url
+run and a hex run all fit, so a caller that passes a secret as the code stores a secret. It is
+kept because a dead letter with the receiver's own code in it is the one an operator can act on,
+and nothing but the code is kept: a `Detail` is for a log line and never reaches a column, and a
+worker checks a `Detail` it did not build against `sink.KnownDetail` before it even logs one. A
+reader of this paragraph should not conclude that nothing a sink chose is written down. One
+thing is, by name, and `internal/worker`'s marker test names the attribute and the two columns
+it reaches.
 
 ### 3.3 Reconciliation
 
@@ -356,8 +482,10 @@ signs the URL must return `false`. That answers 401 for every delivery of that p
 loud and correct: the alternative is a signature checked against a URL Lawang made up, which
 passes or fails for reasons nobody can reason about. The operator's fix is one variable, and
 `ingress.New` names it in a warning at start so the fix is findable from the logs rather than only
-from the provider's dashboard. Refusing to start belongs to the hub (B07), which is the layer that
-knows which providers are registered and which of their schemes cover the URL.
+from the provider's dashboard. **The hub refuses to start** when a registered provider's scheme
+covers the URL and none is configured: it is handed the registry, so it knows which providers are
+registered, and a scheme says so by implementing `provider.URLSigner`. A deployment that could not
+accept one single delivery should not get as far as binding a socket.
 
 **Row-level security.** Every tenant-scoped table has RLS enabled and forced, with the policy keyed
 on a transaction-local setting. If the setting is missing, a query returns zero rows. Three roles:
@@ -370,6 +498,14 @@ on a transaction-local setting. If the setting is missing, a query returns zero 
 
 The resolver and worker roles are granted with `INHERIT FALSE` and entered explicitly with
 `SET LOCAL ROLE`, so the application role does not silently pick up their wider policies.
+
+The resolver's reach is written out, because it is the widest read in the program: `SELECT` on six
+columns of one table (`id`, `tenant_id`, `provider`, `workspace_id`, `external_id`, `secret`), no
+write of any kind, and nothing at all on any other table. It cannot read a subscription's
+`resource` or when it was created, it cannot see the outbox, and it cannot see the tenants table.
+The `secret` is the webhook verification secret, which is the one credential the accept path needs
+and is deliberately not a vault entry: the vault is keyed by tenant, and this is the path that does
+not know the tenant yet ([ADR 11](adr/0011-hub-resolution.md)).
 
 **A helper-role transaction is cross-tenant until it ends.** Permissive policies are ORed together,
 so once a helper role's policy applies (`TO lawang_worker USING (true)`, for example), binding a
@@ -459,7 +595,8 @@ Three deterministic keys, minted in exactly one package (`internal/ids`) so the 
 |---|---|---|
 | accept | `delivery_id = blake3(provider, raw_body)`, unique per tenant | an identical re-send is an accept no-op |
 | record | `id = "rec_" + blake3(provider, external_id, version, scope, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
-| subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates |
+| subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates, and the row keeps its id |
+| subscription | unique on `(tenant, provider, external_id)` where the registration id is not empty | two rows of one tenant cannot carry one registration id, so the by-registration probe returns at most one row per tenant (ADR 15, decision 3) |
 
 Parts are joined with a `0x1F` separator so `("ab","c")` never collides with `("a","bc")`. A part
 that is empty or itself contains `0x1F` is refused with an error rather than hashed: an empty tenant
@@ -470,6 +607,28 @@ a delivery is exempt because it is the last part. Test vectors for both recipes 
 The delivery id is unique **per tenant**, not globally, for the same reason the record id is salted
 (below): two tenants may connect one provider workspace, and reconciliation then synthesizes
 byte-identical deliveries for both. A global constraint would drop the second tenant's.
+
+The sentinel tenant that holds unattributable deliveries is a tenant for this key like any other,
+so a provider that re-sends a delivery nobody owns parks it once and gets 200 for every repeat.
+
+**What the registration-id index does and does not prevent.** It prevents exactly one state: two
+rows of one tenant and provider that both carry the *same non-empty* registration id, which no
+delivery naming that id could ever be resolved out of, because one registration has one secret and
+both rows would verify. It does **not** bound the candidate set, and so it does not retire the
+ambiguous-owner park. A delivery's candidates are the union of two probes
+([ADR 11](adr/0011-hub-resolution.md), decision 4), and the by-workspace probe returns rows whose
+registration id is empty, which is precisely what the index's predicate leaves out. One tenant can
+therefore still present two candidates: one row carrying the named registration id and one carrying
+only the workspace, or two rows carrying only the workspace. Both shapes are parked, and
+`TestARegistrationIDOnOneOfTwoRowsIsStillAmbiguous` and
+`TestTwoSubscriptionsOfOneTenantThatBothVerifyAreParked` in `internal/hub` hold them there. What
+keeps a registrar out of those shapes is the registration design (at most one row per provider
+workspace per tenant), not the table.
+
+A subscription's id is what an accepted delivery's **ordering key** is built from, so it has to
+outlive a re-registration: an updated row keeps its id, or the next delivery of that subscription
+would join a new queue beside the one still in flight in the old one
+([ADR 11](adr/0011-hub-resolution.md)).
 
 The **tenant** is part of the record id on purpose: two tenants can legitimately connect the same
 provider workspace, and without the salt the second tenant's records would dedupe away as
@@ -496,6 +655,33 @@ operator does then). This was decided by default and is the maintainer's to over
 A **new version is a new record.** Edits never overwrite; the new record carries `supersedes`, the
 id of the version it replaces. Supersede links only point forward, so a late-arriving old version
 can never claim to replace a newer one.
+
+What "forward" is decided by is [ADR 12](adr/0012-ledger-supersede-masking.md), and the short
+version is that the **provider declares how it spells a version and the pipeline does only what
+was declared**. ADR 4 calls `version` opaque to a sink, and the pipeline cannot read an order out
+of an opaque string: two versions in any fixed width encoding are the same length, and base64 (a
+Microsoft Graph `changeKey`, an Exchange ETag), a hash and a UUID are all fixed width and none of
+them sorts by value in ASCII. So `provider.VersionOrder` is a required method, validated at
+registration, and it is one of three: **decimal**, one run of digits ordered by the number it
+spells; **lexical**, a fixed width whose byte order is its value order (a ULID, Crockford base32,
+uppercase hex, an RFC 3339 timestamp in UTC); or **base64** of a fixed-width **big-endian** value,
+ordered by the bytes it decodes to. Decoding proves the alphabet and the width and not the layout,
+so base64 of a little-endian counter inverts the same way a misdeclared lexical version does; ADR
+12 decision 3 states both residuals.
+A version the declaration cannot read, and a provider that declares nothing, are **refused by
+name**, because guessing is how an older record supersedes a newer one at the sink and takes the
+scope access is decided on with it. For two records that carry the same version there is only
+arrival order, and that decides nothing else. A record older than its entity's newest
+is neither linked nor delivered: it is held back and counted, because the sink already has
+something newer and an unlinked older record would leave it holding two live versions of one
+entity.
+
+The chain is kept in the **ledger** (`record_ledger`), one row per record id that has been prepared
+for delivery, with exactly one row per `(tenant, provider, external_id)` marked as the entity's
+head. It is keyed per entity and never per scope, so a record that moves supersedes what it was in
+the old scope and the sink replaces it. A record that was skipped or held back is not written
+there: a row means prepared, and a later legitimate arrival of that version must not be mistaken
+for something already delivered.
 
 ---
 
@@ -628,6 +814,11 @@ type Provider interface {
 	Key() string                                                   // "slack"
 	Hydrate(ctx context.Context, t Tenant, c Change) (Hydrated, error)
 	Normalize(h Hydrated, c Change) ([]Record, error)
+	// How this provider spells Record.Version, so internal/pipeline can order two versions of
+	// one entity without inferring an order from the strings (ADR 12 decision 1). Decimal,
+	// lexical or base64 (of a big-endian value); the registry refuses anything else, the zero
+	// value included.
+	VersionOrder() VersionOrder
 }
 
 // Optional capabilities.
@@ -654,11 +845,40 @@ type Request struct {
 // Set or Del change what the candidates after it see: an intermittent signature failure on the
 // second candidate only. Get and Values read; Values returns a copy; nothing writes.
 type Header struct{ /* wraps the request's own map, copies nothing */ }
+// URLSigner marks a scheme whose signature covers Request.URL (HubSpot v3). A deployment that
+// registers one and configures no public base URL can accept none of its deliveries, so the hub
+// refuses to start rather than answer 401 to every one of them.
+type URLSigner interface {
+	WebhookSource
+	SignsPublicURL()
+}
+
 type Registrar interface {
 	Register(ctx context.Context, t Tenant, cred Credential) ([]Subscription, error)
 	Renew(ctx context.Context, s Subscription) (Subscription, error)
 	Deregister(ctx context.Context, s Subscription) error
 }
+
+// Subscription is one webhook registration Lawang owns, and the row a delivery's owner is
+// resolved from. Workspace and External are the delivery keys a delivery is looked up by; Secret
+// is what its deliveries are signed with, and it is the only credential the accept path needs
+// (ADR 11). It redacts the secret when it is printed or logged.
+type Subscription struct {
+	ID, Provider, Resource string
+	Tenant                 Tenant
+	Workspace, External    string // the provider's own ids, as they appear on a delivery
+	Secret                 []byte
+}
+// Degrader is the optional capability of a provider that can build a change's records from the
+// webhook body alone, when Hydrate could not reach its API. A degraded record MUST derive its
+// scope from the same inputs, through the same function, as Normalize does: the scope is hashed
+// into the record id, so two routes to it are two ids for one version of one entity. Where the
+// body does not carry what the scope is made of, Degrade returns ErrCannotDegrade and the
+// delivery waits for hydration. It never guesses a scope (ADR 4, decision 7).
+type Degrader interface {
+	Degrade(c Change) ([]Record, error)
+}
+
 type Reconciler interface {
 	ChangesSince(ctx context.Context, s Subscription, cursor Cursor, limit int) ([]Change, error)
 }
@@ -691,7 +911,21 @@ whose every record fails in `Seal`. It calls `Key()` exactly once, at registrati
 its own copy of the string from then on, which is what makes `outbox.Delivery.Provider` a constant
 of the program rather than a decoded path segment.
 
-**Three things a provider author has to know, which the hub (B07) is where they bite.**
+**A normalizer cleans before it seals, and the harness is what makes forgetting hard.** The
+record format refuses and never repairs ([ADR 4](adr/0004-record-format-v1.md) decision 9):
+`Seal` fails on an `author.display` holding an invisible or bidirectional-formatting character,
+and on a `title` that is not one line. Real data has both, so `internal/record` has one cleaner
+per cleanable field class (`CleanDisplay`, `CleanTitle`, `CleanText`), each bounded to its
+field's limit, and every normalizer calls the right one before it builds a record. Cleaning a
+title turns what the one-line rule refuses into a space and trims the result. **No identifier is
+ever cleaned**: removing a character from an external id, a version, an author id or a container
+id makes it a different id, so one entity would get two identities and be delivered twice; a
+sender-controlled identifier needs an injective encoding or a hash of its own. A fixture with a
+clean name passes whether a normalizer cleans or not, so the rule is held by
+`internal/provider/providertest`, a conformance harness of values real sources really send, which
+every provider's own tests run over its own payloads.
+
+**Three things a provider author has to know, and what the hub does about each.**
 
 - `Handshake` runs on **unauthenticated bytes, on every delivery**, not only on a challenge,
   because a challenge arrives before any subscription exists and nothing else can tell the two
@@ -700,33 +934,51 @@ of the program rather than a decoded path segment.
   only then parses. Slack and Microsoft Graph both allow this.
 - `Verify` **never errors and never panics**, and nothing in the type system can enforce it. A
   panic there is recovered per connection by `net/http` and the provider sees a dropped response
-  rather than a status. `Verify` runs once per candidate subscription, so B07's per-candidate loop
-  recovers around it: one provider's panic parks a delivery, it does not drop the connection.
+  rather than a status. `Verify` runs once per candidate subscription, so the hub's per-candidate
+  loop recovers around it and gives up on one that does not return: a provider that panics parks
+  the delivery rather than dropping the connection, and a provider that hangs is answered 503 with
+  a `Retry-After` rather than nothing at all. Neither is routed, because a candidate that did not
+  answer cannot be ruled out as the owner.
 - `Request` is handed to `Verify` **once per candidate**, and the same value each time. That is why
   `Request.Header` is this package's `Header` and not an `http.Header`: a provider that normalized
   a header in place would change what the candidates after it read, and the symptom would be a
   signature that fails for the second candidate only, in a tenant that happens to have two
   subscriptions on one workspace. The header is a guarantee, because the type has no mutating
   method and nothing is copied to get it. **`Request.Body` is a rule and not a guarantee**: it is a
-  `[]byte` that aliases the edge's own buffer, an implementation that normalizes it in place
-  changes what every later candidate verifies and what B07 stores in the outbox, and only a review
-  of the provider package catches that. Making it a guarantee belongs in B07's per-candidate loop,
-  where a copy per candidate costs 0.9 us for an 8 KiB delivery and 57 us at the 1 MiB cap against
-  a 200 ms target, and it is on [#7](https://github.com/gablooge/lawang/issues/7) with those
-  numbers.
+  `[]byte` that aliases the edge's own buffer, and an implementation that normalizes it in place
+  would change what every later candidate verifies and what is then stored in the outbox. The hub
+  makes it a guarantee where the candidate loop is: it hands each candidate its own copy, which
+  costs 0.9 us for an 8 KiB delivery and 57 us at the 1 MiB cap against a 200 ms target. The copy
+  also keeps a `Verify` that was given up on from writing to the same bytes the accept is storing.
 - The 503 the edge answers on a slow accept rests on `errors.Is(err, context.DeadlineExceeded)`.
-  Both error shapes pgx produces for a saturated pool match it today, but a statement cancelled
-  server side comes back as a `*pgconn.PgError` with SQLSTATE 57014 and no context error in its
-  chain, which would land on 500 where 503 with a `Retry-After` is the honest answer. B07 treats
-  `ctx.Err() != nil` after the call as the deadline case too.
+  Both error shapes pgx produces for a saturated pool match it, but a statement cancelled server
+  side comes back as a `*pgconn.PgError` with SQLSTATE 57014 and no context error in its chain,
+  which would land on 500 where 503 with a `Retry-After` is the honest answer. So the hub puts the
+  context's own error in front of anything that failed while the context was already done, and
+  keeps the original wrapped for the log.
 
 **What lands when.** `Provider` and `WebhookSource` are in `internal/provider` from B06, because
-the ingress edge is built on them. `Registrar`, `Reconciler` and `MemberSource` arrive with the
-items that decide the types they take, and not before: `Subscription` is B07's (the hub and the
-subscription table), `Credential` is B13's and B14's (the vault and `connect`), `Cursor` is B19's
-(reconciliation) and `ScopeMembers` is B23's (access sync). An interface written before its types
-are settled is a shape every later item has to rewrite, and the rewrite is not free once a
-provider package implements it.
+the ingress edge is built on them. `Subscription`, `Registrar` and `URLSigner` land with B07, which
+is the item that decides what a subscription is: the hub resolves deliveries against those rows and
+the subscriptions table stores them. `Degrader` lands with B08, which is the item that has a
+degraded path to take. `Reconciler` and `MemberSource` still wait for the items that
+decide the types they take: `Cursor` is B19's (reconciliation) and `ScopeMembers` is B23's (access
+sync). An interface written before its types are settled is a shape every later item has to
+rewrite, and the rewrite is not free once a provider package implements it.
+
+The first package to implement any of them is `internal/provider/clickup` (B11):
+`Provider` and `WebhookSource`, and deliberately not `Degrader`, because a ClickUp webhook body
+does not carry the list a task is in and a degraded record would need a guessed scope
+([ADR 15](adr/0015-clickup-provider.md)). It is **not registered in `cmd/lawang` yet**: hydration
+needs one API token per tenant, which the vault (B13) and `lawang connect` (B14) supply, so the
+registry is still built empty and every `/ingress/{provider}` is still a 404.
+
+`Credential` is the one exception, and it is deliberately not a shape yet. `Registrar` cannot be
+written without naming it, and what a credential holds is B13's decision (the vault) and B14's
+(`connect`), so it is declared the way `Hydrated` is, as an opaque type. Every signature that names
+it is stable from now on, and B13 gives it contents without touching one of them. What is already
+settled about it is where it may go: it is secret material, so it never reaches a log line, an
+error, a plain table or a record.
 
 Built-in implementations planned for v0.1:
 
@@ -736,7 +988,122 @@ Built-in implementations planned for v0.1:
 | Sink | `http` (the format above), `stub` (strict test double), `jsonl` (files, for development) |
 | Hydration | direct provider API clients; an MCP-backed hydrator is on the roadmap as an alternative |
 | Identity | email join (normalized, domain-restricted); replaceable |
-| Masking | conservative regex baseline (emails, phone numbers, IBANs); replaceable |
+| Masking | conservative regex baseline (emails, phone numbers, IBANs) in `internal/pipeline`, with the map from placeholder to value kept in `redaction_map` and never sent anywhere ([ADR 12](adr/0012-ledger-supersede-masking.md)); replaceable |
+
+### The three sinks (B09, `internal/sink`)
+
+All three marshal through `record.Record.MarshalJSON`, which validates the record and checks its
+seal, and all three apply the **wire name**: `sink.Names` maps an internal provider key to what
+this sink's receiver calls that source, and it replaces `source` alone. The scope id keeps the
+internal provider key in its first segment, because that is the join key with the membership
+message ([ADR 3](adr/0003-scope-id-format.md)), and so does the prefix of `external_id`, so
+`source` and the scope's first segment need not match.
+
+`Deliver` answers in one of exactly two ways, and nothing else. Either a `DeliveryResult`, which
+covers every record of the batch: the ones in `Rejected` were refused and dead-letter one by one,
+and every other record was taken. Or a `*sink.Fault`, with the zero `DeliveryResult`: nothing in
+the batch counts as delivered and the whole batch goes again, at once on `retry` and after an
+operator has fixed the credential on `halt`. The repeat costs nothing, because a sink is
+idempotent on the record id.
+
+So **a `Fault` is about the delivery and never about a record**, and a record's own fate is only
+ever a `Rejection`. There are therefore two actions and not three: a sink never asks the worker to
+kill a row, which is what keeps a batch that is sent in several requests honest. A receiver that
+refuses one request has said something about the records in that request and nothing about the
+records in the others, so each of those records comes back as a `Rejection` and the rest of the
+batch is still offered. Before this, a refusal of the second of three requests dead-lettered the
+whole batch: the records that had already landed, and the records the receiver was never offered.
+
+A `Fault` carries the `Action` for the worker, the `outbox.Cause` that goes into the outbox, and
+a `Detail` that is one of the package's own phrases. It wraps nothing: the error of `net/http` is
+a `*url.Error` whose text quotes the request URL, and a sink URL's query string is where many
+receivers carry their API key.
+
+**`http`** posts records to a configured endpoint. This is the **frozen wire protocol** of v1,
+written for a receiver author; [ADR 13](adr/0013-sink-wire-protocol.md) records the decision
+behind the two strict parts of it and what they cost.
+
+*The request.* `POST` to the endpoint, with `Content-Type: application/json`,
+`Accept: application/json`, the tenant's bearer token in an `Authorization` header, and a body of
+
+```json
+{"v":1,"records":[<record document>, ...]}
+```
+
+`v` is the version of this protocol. The tenant is in no field: at a sink it is established by
+the per-tenant credential ([section 4](#4-trust-model)), and a tenant with no credential is a
+refusal, not a default. The sink sends at most `MaxRequestBytes` (8 MiB by default) in one
+request and splits a batch into as many requests as that takes.
+
+*The answer, on a 2xx.* The batch landed. An empty body, whitespace, or `{}` means every record
+was taken. Any other body **must** be a JSON object carrying a `rejected` member, spelled exactly
+that way, **whose value is a JSON list**:
+
+```json
+{"rejected":[{"id":"rec_...","code":"..."}]}
+```
+
+Anything else is **unreadable**: a body that does not parse, a body that is not a JSON object, a
+body that is a JSON object with members but none of them `rejected`, a `rejected` that is not a
+list, an id that was not in the request, and an id named twice. Unreadable means nothing is
+marked delivered and the batch is sent again. The cost is deliberate: a receiver that answers
+200 with its own bookkeeping and no `rejected` member fails loudly rather than having its
+refused records silently marked delivered. The sink reads at most 64 KiB of an answer, one byte
+more than the limit so that it can tell a complete answer from one it cut short.
+
+**`{"rejected":null}` is unreadable.** `null` is not a list. A receiver that refused nothing
+answers with no body, or with `[]`. This is spelled out because a serializer that writes an
+absent list as `null` is ordinary, and reading it as an empty list would mark a whole batch
+delivered on an answer the sink did not understand.
+
+*The answer, on anything else.* Three bands, and the first two are faults about the delivery, so
+nothing in the batch counts as delivered and the whole batch goes again:
+
+- **halt**, a verdict on the request and not on anything in it: the credential (401, 403), and
+  **every other 4xx outside the two bands below, which is the default**. An operator changes a
+  credential, a number, an endpoint or a receiver; the ladder would only send the same request
+  again. Nothing is killed.
+- **retry**: 408, 429 and everything that is not a 4xx.
+- **a refusal of the records of that one request**: **422 alone**, the one status HTTP defines
+  as a verdict on the content of the request rather than on the request message. Each record in
+  that request comes back as a `Rejection` carrying the status and the receiver's code, and the
+  records of the other requests are still offered.
+
+**A receiver that wants to refuse one record answers 2xx with a `rejected` list, and that is the
+only way.** A 422 kills every record of the request it answered, and which records share a
+request is decided by the sender's byte arithmetic and not by the receiver. Any other 4xx halts
+and kills nothing: a receiver that refuses records with a bare 404 or 409 stops that tenant's
+deliveries until an operator looks, which is the fail-closed trade
+[ADR 13](adr/0013-sink-wire-protocol.md) records, in place of destroying the tenant's records
+quietly. **A receiver that does not speak `v` answers 426** (400 is read the same way), which
+halts and kills nothing: a version no record caused must not dead-letter any record.
+
+*What the sink requires of its caller.* Every record of a batch must be sealed for the tenant it
+is delivered under. The tenant is in no field of the envelope, so a record sealed for another
+tenant marshals to the same bytes and would go out under this tenant's credential. Each
+`Deliver` checks it with `record.SealedFor` rather than trusting the caller, and reports a
+record that fails as a `Rejection` with the internal code `wrong_tenant`, without sending,
+writing or storing it. `internal/pipeline` checks it too, where a batch is built.
+
+Redirects are not followed, so a receiver cannot send the next request, with its credential,
+somewhere else.
+
+**`stub`** is the strict test double of principle 5. It decodes every document with
+`internal/record`'s strict decoder, which the agreement tests hold equal to the schema, and adds
+what a receiver has that a validator does not: it refuses a record id it already holds whose
+content differs, comparing the documents without `meta`, which is not part of a record's content.
+That is the check ADR 4 decision 7's promise to a sink rests on, that one id never appears with
+two scopes. It also bounds a document before the decoder sees it (8 MiB by default), because
+nothing in the format bounds one once unknown fields are counted, and it walks the `supersedes`
+chain with a visited set, because a cycle across records is invisible to anything that validates
+one record at a time.
+
+**`jsonl`** appends one document per line to `<tenant>.jsonl` under a configured directory, owner
+only: it creates the directory 0700 with the files 0600, and refuses at start-up a directory
+that is already there with a wider mode, because the listing names one file per tenant and a
+group-writable one lets another user put a symbolic link where a tenant's file goes. The tenant
+is the file. The file is a log: a record delivered twice is written twice, and a
+reader folds it by `id`, taking the last line for an id.
 
 ---
 
@@ -752,9 +1119,10 @@ internal/
   tenancy/            tenant context and RLS binding
   store/              pgx pool, preflight, transaction helpers, migrate
   testdb/             a real Postgres for integration tests, as the application role
-  outbox/             accept insert, FIFO-head claim, retry ladder, dead letters
+  outbox/             accept insert, FIFO-head claim, retry ladder, the records of a delivery,
+                      dead letters per row and per record, halt and replay
   ingress/            the /ingress/{provider} HTTP edge: raw body, size cap, handshake
-  hub/                verify, resolve owner, accept
+  hub/                the subscription table, verify, resolve owner, accept, park
   pipeline/           normalize, gate, ledger, supersede, mask, deliver
   worker/             drain and sweeps as independent goroutines
   reconcile/          cursors and chunked replay
@@ -779,8 +1147,14 @@ until the shape has stopped moving.
 
 The worker runs each concern as its own goroutine under one cancellable context:
 
-- **Drain:** a small pool of goroutines, each claiming a batch with `SKIP LOCKED`. Adding worker
-  replicas adds drain capacity with no coordination. That holds because a poll costs what it
+- **Drain:** a small pool of goroutines, each claiming a batch with `SKIP LOCKED`. **The pool is
+  sized against the connection pool**, not against the CPU: every goroutine holds a database
+  connection for as long as a row's transaction lasts, and the sweeps of the same process share
+  that pool, so more drain goroutines than connections do not drain faster, they wait and
+  starve the sweeps. `internal/worker` defaults to at most `pool_max_conns - 1` goroutines and
+  refuses a configured pool that leaves the rest of the process nothing. `pool_max_conns`
+  travels in `LAWANG_DATABASE_URL`, and pgx's default is `max(4, NumCPU)`, which on a small
+  container is 4. Adding worker replicas adds drain capacity with no coordination. That holds because a poll costs what it
   returns (section 3.2): it reads neither the backlog nor the rows other replicas have in flight,
   so more pollers do not mean more scanning of the same waiting rows, and an idle poll is a few
   pages. What does not scale with replicas is one entity: its versions deliver one at a time by
@@ -807,9 +1181,9 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 
 1. **Verify signatures over the exact raw bytes.** Re-serialized JSON never matches the provider's
    HMAC. Compare in constant time, and treat a missing secret or signature as a plain `false`.
-2. **The tenant comes from an owned row, never from the payload.** When more than one tenant's
-   secret verifies the same delivery, refuse it. Routing to the first match is how data crosses
-   tenants.
+2. **The tenant comes from an owned row, never from the payload.** When more than one
+   subscription's secret verifies the same delivery, refuse it, whether those rows belong to two
+   tenants or to one (ADR 11, decision 5). Routing to the first match is how data crosses tenants.
 3. **Salt the record id with the tenant.** Two tenants sharing one provider workspace otherwise
    collapse into one id and the second tenant silently loses records.
 4. **The wire name is not the internal key.** What a sink calls a source is sink configuration.
@@ -845,12 +1219,22 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Body over the size cap | unstorable | 413, the body is never accumulated |
 | Body could not be read (a `Content-Length` that lies) | unstorable | 400, nothing stored |
 | Signature invalid | untrusted | 401, nothing stored |
-| Unknown workspace or ambiguous owner | unattributable | parked under a sentinel tenant, re-resolved periodically, deleted after retention |
+| Unknown workspace or ambiguous owner | unattributable | parked under the sentinel tenant `_parked` as `unattributable: no owner` or `unattributable: ambiguous owner`, **keeping the body as it arrived**, answered 2xx, re-resolved periodically (B25), deleted after retention |
+| A delivery the provider cannot read its own keys out of, or whose keys are ones no lookup can use (longer than the column, or unstorable text) | unattributable | parked as `unattributable: unreadable delivery`, answered 2xx: there is no signature claim to reject, so it is never a 401. This reason alone keeps a note of the delivery's length and id in place of the body, because no sweep can ever re-resolve it and anyone can send one |
+| A provider's `Verify` panics | unattributable | parked, answered 2xx: no candidate's answer can settle the owner, and the connection is not dropped |
+| A resolved delivery that can never be stored (an ordering key the table refuses) | unstorable | parked as poison, answered 2xx, so the provider does not retry what cannot work |
 | Hydration fails | degradable | deliver a minimal record, the change is still tracked |
 | Normalizer fails | non-retryable | dead-letter with the reason; fix and replay |
-| Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands |
-| Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered; ops is alerted |
-| Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; replay is always safe |
+| Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands. A sink reports it as a `Rejection` and never as a whole-batch action, so a record is never killed without having been offered. The records of a delivery are rows of their own, so the dead letter is per record and the row still finishes as delivered ([ADR 14](adr/0014-prepared-records.md)); replaying the row brings exactly the dead records back |
+| Sink rejects a whole request of a batch that was split across several (**422**, the whole refusal band) | non-retryable | each record of that request dead-letters as its own `Rejection`; the other requests of the batch are still sent and keep their own outcome |
+| Sink refuses the request itself rather than anything in it: **every 4xx that is not 401, 403, 408, 422 or 429**, which is the default for a status this sink does not recognise | halt | the row stays prepared, nothing is marked delivered and **no record is dead-lettered**: none of these says anything about a record, and an operator changes a credential, a number (`MaxRequestBytes`), the endpoint or the receiver; ops is alerted. Dead-lettering them killed every record of every chunk of every batch on that endpoint, permanently, with `last_error` reading "sink rejected the record (status NNN)", so an endpoint typo (404) or a large bearer token behind a small header buffer (431) destroyed a tenant's records quietly ([ADR 13](adr/0013-sink-wire-protocol.md)) |
+| Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered, including anything an earlier request of the same batch landed, so the whole batch is sent again once an operator has fixed it; ops is alerted |
+| A record in a batch is not sealed for the tenant it is being delivered under | non-retryable | that record dead-letters as its own `Rejection` with `internal error (code wrong_tenant)` and is not sent, written or stored; the rest of the batch goes. Both `internal/pipeline` and every `Deliver` check it, because the tenant is in no field of the envelope and nothing downstream can see the mistake |
+| Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; nothing is marked delivered, including anything an earlier request of the same batch landed, and replay is always safe because a sink is idempotent on the record id |
+| Sink answers 2xx and does not say what it did with the batch (the answer does not parse, is not a JSON object, carries members but none of them `rejected`, has a `rejected` that is not a list including `null`, or names a record that was not sent or names one twice) | retryable | nothing is marked delivered and the whole batch is sent again: a sink that is idempotent on the record id loses nothing by a repeat, and a guess here loses a record |
+| No sink can be built for the tenant (none is configured, or the vault did not answer) | fail closed | halt: nothing is delivered, nothing is killed, no attempt is charged, and the row is offered again after the halt pause. An operator connects a sink, or the vault comes back, and the next claim delivers |
+| A sink answers in a way the `Sink` contract does not allow: an error that is not a `*sink.Fault`, or a `Fault` with an action this version does not know | fail closed | halt. Nothing is known about what reached the receiver, so retrying would walk a ladder that ends in a dead letter and dead-lettering would destroy records over a bug of ours. An unforeseen case stalls, it does not destroy |
+| A claimed row whose worker dies or hangs, every time | unreported | the drain compares `attempts` with the ladder at claim time, before any work, and parks a row past the end of it as `attempts exhausted without a recorded failure`. Without it the row is taken over forever and every later version of its entity waits behind it |
 | Vault unreachable | fail closed | retry on the ladder; nothing is delivered unverified |
 | Accept path out of time (a saturated pool, a slow database) | retryable | 503 with a `Retry-After`, nothing stored |
 
@@ -870,5 +1254,5 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | Crypto | standard library `crypto/hmac`, `crypto/aes`, `crypto/cipher` |
 | Metrics | `github.com/prometheus/client_golang` |
 | Tests | standard `testing`, `testcontainers-go` for Postgres |
-| JSON Schema validation | `github.com/santhosh-tekuri/jsonschema/v6`, in tests only: pure Go, draft 2020-12, asserts formats on request, and the one module it builds with (`golang.org/x/text`) was already in the module graph. The `lawang` binary does not link it. Production code validates with `record.Validate`, which the tests hold equal to the schema. It becomes a runtime dependency only if the strict stub sink (B09) validates with the schema itself |
+| JSON Schema validation | `github.com/santhosh-tekuri/jsonschema/v6`, in tests only: pure Go, draft 2020-12, asserts formats on request, and the one module it builds with (`golang.org/x/text`) was already in the module graph. The `lawang` binary does not link it. Production code validates with `record.Validate`, which the tests hold equal to the schema. It stays test-only: the strict stub sink of B09 decodes with `internal/record`'s strict decoder instead of compiling the schema, which also gives it the three rules no schema can state |
 | MCP (later) | `github.com/modelcontextprotocol/go-sdk` |

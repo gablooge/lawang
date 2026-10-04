@@ -281,7 +281,7 @@ func (e *env) deliverAndHold(c outbox.Claimed) (commit func()) {
 	done := make(chan error, 1)
 	go func() {
 		done <- e.db.TenantTx(e.ctx, tenantA, func(tx pgx.Tx) error {
-			err := outbox.MarkDeliveredIn(e.ctx, tx, c)
+			err := outbox.MarkDeliveredIn(e.ctx, tx, c, nil)
 			marked <- err
 			if err != nil {
 				return err
@@ -391,7 +391,7 @@ func TestAcceptsOfOneKeyCommitInQueueOrder(t *testing.T) {
 
 	c1 := e.claimOne(v1)
 	e.claimNone("v1 is in flight, so v2 must wait behind it")
-	if err := e.ob.MarkDelivered(e.ctx, c1); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c1, nil); err != nil {
 		t.Fatal(err)
 	}
 	e.claimOne(second.id)
@@ -431,7 +431,7 @@ func TestNoVersionIsClaimableWhileAnEarlierOneIsStillToCommit(t *testing.T) {
 	}
 	c1 := e.claimOne(first.id)
 	e.claimNone("v1 is in flight, so v2 must wait behind it")
-	if err := e.ob.MarkDelivered(e.ctx, c1); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c1, nil); err != nil {
 		t.Fatal(err)
 	}
 	e.claimOne(second.id)
@@ -467,7 +467,7 @@ func TestReplayWaitsForAnOpenAcceptOfItsKey(t *testing.T) {
 	}
 	c2 := e.claimOne(v2)
 	e.claimNone("v2 is in flight, and the replayed v1 is behind it")
-	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c2, nil); err != nil {
 		t.Fatal(err)
 	}
 	e.claimOne(v1)
@@ -515,10 +515,10 @@ func TestAKeyNeverHasTwoHeads(t *testing.T) {
 	e.claimNone("v2 is in flight again")
 
 	// Finishing the head hands the marker to the earliest unfinished row of the key.
-	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c2, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.ob.MarkDelivered(e.ctx, e.claimOne("late")); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, e.claimOne("late"), nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -566,7 +566,7 @@ func TestClaimRechecksARowFinishedAfterItsSnapshot(t *testing.T) {
 			// nothing.
 			ctx, cancel := context.WithTimeout(e.ctx, 30*time.Second)
 			defer cancel()
-			if err := e.ob.MarkDelivered(ctx, slow); err != nil {
+			if err := e.ob.MarkDelivered(ctx, slow, nil); err != nil {
 				open()
 				t.Fatalf("the slow holder finishing inside the window: %v (a timeout means the paused claim already holds v1's row lock, and this test has lost its window)", err)
 			}
@@ -615,7 +615,7 @@ func TestClaimRechecksARowLeasedAfterItsSnapshot(t *testing.T) {
 				t.Errorf("v1 = attempts %d, lease %v, want the one lease of the first claimer", row.Attempts, row.LeaseUntil)
 			}
 			// The first claimer's token is still the row's: nobody wrote over it.
-			if err := e.ob.MarkDelivered(e.ctx, first); err != nil {
+			if err := e.ob.MarkDelivered(e.ctx, first, nil); err != nil {
 				t.Errorf("the first claimer delivering v1: %v", err)
 			}
 		})
@@ -690,7 +690,7 @@ func TestClaimLeasesARowReplayedOntoAnEmptyKeyAfterItsSnapshot(t *testing.T) {
 			}
 			e.checkHeads(admin)
 			e.claimNone("v1 is in flight")
-			if err := e.ob.MarkDelivered(e.ctx, got[0]); err != nil {
+			if err := e.ob.MarkDelivered(e.ctx, got[0], nil); err != nil {
 				t.Errorf("delivering v1 under the paused claim's lease: %v", err)
 			}
 		})
@@ -766,7 +766,7 @@ func TestClaimRechecksARowReplayedAfterItsSnapshot(t *testing.T) {
 				t.Errorf("Claim = %v, want nothing: v1 went to the back of its queue, and v2 is in flight", claimedIDs(got))
 			}
 			e.claimNone("v2 is in flight")
-			if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+			if err := e.ob.MarkDelivered(e.ctx, c2, nil); err != nil {
 				t.Fatal(err)
 			}
 			e.claimOne(v1)
@@ -811,7 +811,7 @@ func TestAFinishWaitsForAnOpenAcceptOfItsKey(t *testing.T) {
 			delivered := make(chan error, 1)
 			var finished atomic.Bool
 			go func() {
-				err := e.ob.MarkDelivered(e.ctx, c1)
+				err := e.ob.MarkDelivered(e.ctx, c1, nil)
 				finished.Store(true)
 				delivered <- err
 			}()
@@ -908,7 +908,7 @@ func TestAReplayWaitsForAnOpenFinishOfItsKey(t *testing.T) {
 // lease finishing the row once the obstacle is gone.
 func TestAFailedFinishIsNotALostLease(t *testing.T) {
 	finishers := map[string]func(*env, context.Context, outbox.Claimed) error{
-		"MarkDelivered": func(e *env, ctx context.Context, c outbox.Claimed) error { return e.ob.MarkDelivered(ctx, c) },
+		"MarkDelivered": func(e *env, ctx context.Context, c outbox.Claimed) error { return e.ob.MarkDelivered(ctx, c, nil) },
 		"MarkDead":      func(e *env, ctx context.Context, c outbox.Claimed) error { return e.ob.MarkDead(ctx, c, badShape) },
 		"Fail to dead": func(e *env, ctx context.Context, c outbox.Claimed) error {
 			return e.ob.Fail(ctx, c, outbox.Ladder{}, sink503)
@@ -1066,11 +1066,11 @@ func TestTheMarkerFollowsTheQueue(t *testing.T) {
 	heads("v1 replayed behind v2 and v3", map[string]bool{v1: false, v2: true, v3: false})
 
 	c2 := e.claimOne(v2)
-	if err := e.ob.MarkPrepared(e.ctx, c2); err != nil {
+	if err := e.prepare(e.ctx, c2); err != nil {
 		t.Fatal(err)
 	}
 	heads("v2 prepared", map[string]bool{v1: false, v2: true, v3: false})
-	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c2, nil); err != nil {
 		t.Fatal(err)
 	}
 	heads("v2 delivered", map[string]bool{v1: false, v2: false, v3: true})
@@ -1079,7 +1079,7 @@ func TestTheMarkerFollowsTheQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	heads("v3 dead", map[string]bool{v1: true, v2: false, v3: false})
-	if err := e.ob.MarkDelivered(e.ctx, e.claimOne(v1)); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, e.claimOne(v1), nil); err != nil {
 		t.Fatal(err)
 	}
 	heads("v1 delivered, nothing unfinished", map[string]bool{v1: false, v2: false, v3: false})

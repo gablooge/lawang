@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/gablooge/lawang/internal/outbox"
+	"github.com/gablooge/lawang/internal/outbox/outboxdb"
 	"github.com/gablooge/lawang/internal/store"
 	"github.com/gablooge/lawang/internal/tenancy"
 	"github.com/gablooge/lawang/internal/testdb"
@@ -112,6 +113,30 @@ func (e *env) claimNone(why string) {
 	e.t.Helper()
 	if got := e.claim(); len(got) != 0 {
 		e.t.Fatalf("Claim = %v, want nothing: %s", claimedIDs(got), why)
+	}
+}
+
+// prepare is PrepareIn in a transaction of its own, which is what a caller with nothing else to
+// commit would write. The worker's own transaction also holds the ledger rows of the same
+// delivery, which is why PrepareIn takes the transaction and does not open one.
+//
+// ctx is a parameter because one test prepares under a cancelled context.
+func (e *env) prepare(ctx context.Context, c outbox.Claimed, recs ...outbox.PreparedRecord) error {
+	e.t.Helper()
+	return e.db.TenantTx(ctx, c.Tenant(), func(tx pgx.Tx) error {
+		return e.ob.PrepareIn(ctx, tx, c, recs)
+	})
+}
+
+// doc is a stand-in for a record document: this package never looks inside one. The op and the
+// kind are stored beside it and are not read here either (record.Reopen is what compares them
+// with the document), so they are plausible constants and nothing depends on them.
+func doc(recordID string) outbox.PreparedRecord {
+	return outbox.PreparedRecord{
+		RecordID: recordID,
+		Document: []byte(`{"id":"` + recordID + `"}`),
+		Op:       "upsert",
+		Kind:     "message",
 	}
 }
 
@@ -253,16 +278,16 @@ func TestSecondVersionIsNotClaimableWhileTheFirstIsInFlight(t *testing.T) {
 	c1 := e.claimOne(v1)
 	e.claimNone("v1 is leased, so v2 must wait behind it")
 
-	if err := e.ob.MarkPrepared(e.ctx, c1); err != nil {
+	if err := e.prepare(e.ctx, c1); err != nil {
 		t.Fatal(err)
 	}
 	e.claimNone("v1 is prepared but not delivered, so v2 must still wait")
 
-	if err := e.ob.MarkDelivered(e.ctx, c1); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c1, nil); err != nil {
 		t.Fatal(err)
 	}
 	c2 := e.claimOne(v2)
-	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c2, nil); err != nil {
 		t.Fatal(err)
 	}
 	e.claimNone("everything is delivered")
@@ -309,7 +334,7 @@ func TestRetryKeepsThePreparedState(t *testing.T) {
 	e := setup(t)
 	v1 := e.accept(tenantA, "task:1", 1)
 	c := e.claimOne(v1)
-	if err := e.ob.MarkPrepared(e.ctx, c); err != nil {
+	if err := e.prepare(e.ctx, c); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.ob.Fail(e.ctx, c, outbox.Ladder{time.Hour}, sinkTimeout); err != nil {
@@ -339,7 +364,7 @@ func TestExhaustedLadderParksTheRowAndReplayRevivesIt(t *testing.T) {
 
 	// A dead letter does not hold its entity hostage.
 	c2 := e.claimOne(v2)
-	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c2, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -373,8 +398,8 @@ func TestAnExpiredLeaseIsTakenOverAndTheOldHolderIsShutOut(t *testing.T) {
 
 	// The first worker was only slow, not dead, and now comes back.
 	for name, err := range map[string]error{
-		"MarkPrepared":  e.ob.MarkPrepared(e.ctx, crashed),
-		"MarkDelivered": e.ob.MarkDelivered(e.ctx, crashed),
+		"MarkPrepared":  e.prepare(e.ctx, crashed),
+		"MarkDelivered": e.ob.MarkDelivered(e.ctx, crashed, nil),
 		"Fail":          e.ob.Fail(e.ctx, crashed, outbox.DefaultLadder, sink503),
 		"MarkDead":      e.ob.MarkDead(e.ctx, crashed, badShape),
 	} {
@@ -382,13 +407,13 @@ func TestAnExpiredLeaseIsTakenOverAndTheOldHolderIsShutOut(t *testing.T) {
 			t.Errorf("%s by the old holder: err = %v, want ErrLeaseLost", name, err)
 		}
 	}
-	if err := e.ob.MarkDelivered(e.ctx, takeover); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, takeover, nil); err != nil {
 		t.Errorf("the current holder: %v", err)
 	}
-	if err := e.ob.MarkDelivered(e.ctx, takeover); !errors.Is(err, outbox.ErrLeaseLost) {
+	if err := e.ob.MarkDelivered(e.ctx, takeover, nil); !errors.Is(err, outbox.ErrLeaseLost) {
 		t.Errorf("delivering twice: err = %v, want ErrLeaseLost", err)
 	}
-	if err := e.ob.MarkDelivered(e.ctx, outbox.Claimed{}); !errors.Is(err, outbox.ErrLeaseLost) {
+	if err := e.ob.MarkDelivered(e.ctx, outbox.Claimed{}, nil); !errors.Is(err, outbox.ErrLeaseLost) {
 		t.Errorf("a Claimed that never came from Claim: err = %v, want ErrLeaseLost", err)
 	}
 }
@@ -420,8 +445,8 @@ func TestAClaimedAimedAtAnotherTenantChangesNothing(t *testing.T) {
 
 	swapped := outbox.WithTenant(genuine, tenantB)
 	for name, err := range map[string]error{
-		"MarkPrepared":  e.ob.MarkPrepared(e.ctx, swapped),
-		"MarkDelivered": e.ob.MarkDelivered(e.ctx, swapped),
+		"MarkPrepared":  e.prepare(e.ctx, swapped),
+		"MarkDelivered": e.ob.MarkDelivered(e.ctx, swapped, nil),
 		"Fail":          e.ob.Fail(e.ctx, swapped, outbox.Ladder{time.Hour}, sink503),
 		"MarkDead":      e.ob.MarkDead(e.ctx, swapped, badShape),
 	} {
@@ -440,7 +465,7 @@ func TestAClaimedAimedAtAnotherTenantChangesNothing(t *testing.T) {
 		t.Errorf("tenant B's own row = state %q, lease %v, err %v, want pending and still leased", row.State, row.LeaseUntil, err)
 	}
 	// The lease itself is untouched: its real holder still finishes the row.
-	if err := e.ob.MarkDelivered(e.ctx, genuine); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, genuine, nil); err != nil {
 		t.Errorf("the genuine holder afterwards: %v", err)
 	}
 }
@@ -479,8 +504,8 @@ func TestAnErrorIsNotALostLease(t *testing.T) {
 	}
 
 	for name, err := range map[string]error{
-		"MarkPrepared":  e.ob.MarkPrepared(cancelled, c),
-		"MarkDelivered": e.ob.MarkDelivered(cancelled, c),
+		"MarkPrepared":  e.prepare(cancelled, c),
+		"MarkDelivered": e.ob.MarkDelivered(cancelled, c, nil),
 		"Fail":          e.ob.Fail(cancelled, c, outbox.Ladder{time.Hour}, sink503),
 		"Fail to dead":  e.ob.Fail(cancelled, c, outbox.Ladder{}, sink503),
 		"MarkDead":      e.ob.MarkDead(cancelled, c, badShape),
@@ -499,7 +524,7 @@ func TestAnErrorIsNotALostLease(t *testing.T) {
 	if !reflect.DeepEqual(before, after) {
 		t.Errorf("the row changed:\nbefore %+v\nafter  %+v", before, after)
 	}
-	if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c, nil); err != nil {
 		t.Errorf("the same lease, once the context is good again: %v", err)
 	}
 
@@ -647,12 +672,61 @@ func TestGetIsTenantScoped(t *testing.T) {
 	}
 }
 
+// TestAnOrderingKeyLockIsInTheOutboxHalfOfTheNamespace reads the lock this module really takes
+// out of pg_locks, inside the transaction that holds it, rather than trusting a copy of the
+// formula.
+//
+// Postgres has one advisory-lock namespace. This module sets the high bit of its key and
+// internal/pipeline clears it on the entity keys of the supersede chain, so the two key sets
+// are disjoint by construction and the cross-module rule is "take every advisory lock ascending
+// by key", a total order with no premise about the two hashes never colliding (ADR 12 decision
+// 1). The other half is pinned by TestTheLocksHeldAreTheKeysOfTheEntities in internal/pipeline.
+//
+// Fails when: a later change simplifies either formula back to a bare hashtextextended, and the
+// rule silently needs its premise again.
+func TestAnOrderingKeyLockIsInTheOutboxHalfOfTheNamespace(t *testing.T) {
+	e := setup(t)
+	var held []int64
+	err := e.db.TenantTx(e.ctx, tenantA, func(tx pgx.Tx) error {
+		err := outboxdb.New(tx).LockOrderingKey(e.ctx, outboxdb.LockOrderingKeyParams{
+			TenantID: tenantA.String(), OrderingKey: "task:1",
+		})
+		if err != nil {
+			return err
+		}
+		// classid is the key's high 32 bits and objid its low 32, which is how Postgres stores
+		// a one-argument advisory key.
+		rows, err := tx.Query(e.ctx, `SELECT classid, objid FROM pg_locks
+		                               WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()`)
+		if err != nil {
+			return err
+		}
+		held, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (int64, error) {
+			var high, low uint32
+			err := r.Scan(&high, &low)
+			return int64(uint64(high)<<32 | uint64(low)), err //nolint:gosec // a 64 bit key put back together
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("take the ordering key's lock: %v", err)
+	}
+	if len(held) != 1 {
+		t.Fatalf("the transaction holds %d advisory locks, want exactly the ordering key's", len(held))
+	}
+	if held[0] >= 0 {
+		t.Errorf("the ordering key's lock is %d, want a negative key: the non-negative half of the "+
+			"namespace is internal/pipeline's, and the two halves must stay disjoint", held[0])
+	}
+}
+
 // repairKey is the repair statement of ADR 10, as written there: under the key's lock, hand the
 // marker to the earliest unfinished row. Where the key has a head already it changes nothing, or is
 // refused by the unique index if that head is not the earliest row.
 const repairKey = `
 	BEGIN;
-	SELECT pg_advisory_xact_lock(hashtextextended('%[1]s' || chr(31) || '%[2]s', 0));
+	SELECT pg_advisory_xact_lock(
+	         hashtextextended('%[1]s' || chr(31) || '%[2]s', 0) | (-9223372036854775808)::bigint);
 	UPDATE lawang.outbox SET is_head = true
 	 WHERE id = (SELECT id FROM lawang.outbox
 	              WHERE tenant_id = '%[1]s' AND ordering_key = '%[2]s' AND state IN ('pending', 'prepared')
@@ -688,7 +762,7 @@ func TestStrandedKeysFindsAKeyWithWorkAndNoHead(t *testing.T) {
 		var err error
 		switch c.ID() {
 		case done:
-			err = e.ob.MarkDelivered(e.ctx, c)
+			err = e.ob.MarkDelivered(e.ctx, c, nil)
 		case dead:
 			err = e.ob.MarkDead(e.ctx, c, badShape)
 		case backoff:
@@ -757,7 +831,7 @@ func TestStrandedKeysFindsAKeyWithWorkAndNoHead(t *testing.T) {
 	var claimed []string
 	for _, c := range e.claim() {
 		if c.ID() == first["lost:a"] {
-			if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
+			if err := e.ob.MarkDelivered(e.ctx, c, nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -922,15 +996,26 @@ func TestConcurrentWorkersDeliverEachEntityInOrder(t *testing.T) {
 				for i, c := range got {
 					key := batch[i].TenantID + "/" + batch[i].OrderingKey
 					time.Sleep(time.Millisecond) // the work
-					if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
-						t.Errorf("MarkDelivered: %v", err)
-						return
-					}
+					// The bookkeeping is cleared BEFORE the commit that finishes the row, and
+					// that order matters. MarkDelivered hands the head marker to the next version
+					// in the same transaction, so the moment it commits another worker may
+					// legitimately claim that version; clearing afterwards leaves a window in
+					// which this goroutine has not been scheduled yet and the other worker's
+					// perfectly correct claim reads as a violation. CI failed that way on a loaded
+					// runner. Nothing is weakened by the swap: the next version cannot be claimed
+					// until this one finishes, so no real overlap can hide in the new window,
+					// while the defect this test exists to catch (a claim that ignores the
+					// head-of-key rule) still trips the check, because a batch is marked in flight
+					// at claim time and no row of a key is ever delivered before it is claimed.
 					mu.Lock()
 					lastSeq[key] = batch[i].Seq
 					delete(inFlight, key)
 					delivered++
 					mu.Unlock()
+					if err := e.ob.MarkDelivered(e.ctx, c, nil); err != nil {
+						t.Errorf("MarkDelivered: %v", err)
+						return
+					}
 				}
 			}
 		})
@@ -976,7 +1061,7 @@ func TestReplayNeverOvertakesAVersionInFlight(t *testing.T) {
 		t.Errorf("replayed v1 has seq %d, v2 has %d: a replay must go to the back of its queue", first.Seq, second.Seq)
 	}
 
-	if err := e.ob.MarkDelivered(e.ctx, c2); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c2, nil); err != nil {
 		t.Fatal(err)
 	}
 	e.claimOne(v1)
@@ -986,7 +1071,7 @@ func TestReplayRestoresThePreparedState(t *testing.T) {
 	e := setup(t)
 	v1 := e.accept(tenantA, "task:1", 1)
 	c := e.claimOne(v1)
-	if err := e.ob.MarkPrepared(e.ctx, c); err != nil {
+	if err := e.prepare(e.ctx, c); err != nil {
 		t.Fatal(err)
 	}
 	// The sink stays down until the ladder is used up: the commonest dead letter there is.
@@ -1004,10 +1089,10 @@ func TestReplayRestoresThePreparedState(t *testing.T) {
 		t.Errorf("state after replaying a row that died prepared = %q, want prepared (it must not prepare twice)", row.State)
 	}
 	c = e.claimOne(v1)
-	if err := e.ob.MarkPrepared(e.ctx, c); !errors.Is(err, outbox.ErrLeaseLost) {
+	if err := e.prepare(e.ctx, c); !errors.Is(err, outbox.ErrLeaseLost) {
 		t.Errorf("preparing the replayed row again: err = %v, want ErrLeaseLost", err)
 	}
-	if err := e.ob.MarkDelivered(e.ctx, c); err != nil {
+	if err := e.ob.MarkDelivered(e.ctx, c, nil); err != nil {
 		t.Error(err)
 	}
 }

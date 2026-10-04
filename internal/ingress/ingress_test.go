@@ -107,6 +107,8 @@ func (plain) Normalize(provider.Hydrated, provider.Change) ([]record.Record, err
 	return nil, errors.New("not used")
 }
 
+func (plain) VersionOrder() provider.VersionOrder { return provider.VersionOrderDecimal }
+
 // scripted is a WebhookSource whose handshake a test writes, for the replies a well-behaved
 // provider would never return.
 type scripted struct {

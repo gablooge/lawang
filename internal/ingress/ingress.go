@@ -165,9 +165,10 @@ const (
 	Stored Verdict = iota + 1
 	// Duplicate is a delivery this tenant already has, so the re-send was a no-op: 200.
 	Duplicate
-	// Parked is a delivery that was stored under the sentinel tenant because nobody owns it,
-	// more than one tenant could, or it is poison that can never be delivered: 200. A provider
-	// must not retry any of those, so none of them is an error status.
+	// Parked is a delivery that was stored under the sentinel tenant because nobody owns it, more
+	// than one subscription's secret verified it (two tenants' rows, or two rows of one tenant:
+	// ADR 11, decision 5), or it is poison that can never be delivered: 200. A provider must not
+	// retry any of those, so none of them is an error status.
 	Parked
 	// Unverified is the one thing that answers 401: no candidate's secret verified the bytes.
 	Unverified
