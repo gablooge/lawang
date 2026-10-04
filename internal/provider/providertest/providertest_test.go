@@ -40,7 +40,10 @@ func TestEveryCaseIsRefusedUncleanedAndAcceptedCleaned(t *testing.T) {
 // cleaners produce U+FFFD for the same byte, so a case whose only hostile content is bad bytes
 // arrives already cleaned and is passed by a normalizer that cleans nothing. That was true of
 // the "bytes that are not UTF-8" case: with record.CleanDisplay removed from the first real
-// provider, six of the twelve cases failed and that one passed.
+// provider, that case passed while others failed, and after the invisible character was added to
+// it, it fails with them. No count is given. The one written here first was wrong (it said six
+// where seven is measured), and a number in a comment that nothing holds to the code is a number
+// that goes stale; the before and after is the whole of the argument anyway.
 //
 // Every provider's transport is JSON today, so this is the transport to hold the cases to.
 func TestEveryCaseSurvivesAJSONTransport(t *testing.T) {

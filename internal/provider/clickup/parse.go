@@ -28,6 +28,12 @@ const maxID = 64
 
 // maxDigits bounds a ClickUp time, which is epoch milliseconds as a decimal string. Nineteen
 // digits is what an int64 holds, so a longer run is refused here rather than overflowing.
+//
+// No test can tell this bound from its absence, and that is not a gap: strconv.ParseInt below
+// refuses the same strings with the same error, so removing the width arm changes no answer. It
+// is kept, like Verify's digest-length test, because bounding an input before converting it is
+// the shape the rest of this package uses, and because the arm that would otherwise carry it is
+// a library's range check rather than this package's own rule.
 const maxDigits = 19
 
 // subject is what a delivery is about: which entity changed, and therefore what is hydrated.

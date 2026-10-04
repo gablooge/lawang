@@ -272,6 +272,73 @@ func TestOneRegistrationIDIsOneRowPerTenant(t *testing.T) {
 	e.register(tenantA, "W4", "WS4", "", secretA)
 }
 
+// TestARegistrationIDCollisionIsAConflictTheCallerCanRead. The index above is the first thing the
+// subscriptions table refuses that validate cannot pre-check, so it is the first refusal Register
+// can make that is not ErrInvalidSubscription. Left as a raw driver error it reaches B14 looking
+// exactly like a database outage, and a registrar mistake (which an operator must fix, 4xx) would
+// be answered the way an outage is (retry, 5xx), or told apart by string-matching this index's
+// name in a Go file with nothing tying the two together.
+//
+// It is a sentinel BESIDE ErrInvalidSubscription and not under it, because that error means
+// "validate refused this row on its own terms" and validate never saw this: the row is only wrong
+// relative to the rows already in the table.
+//
+// The message must also carry none of what collided, since one of the fields is a secret.
+func TestARegistrationIDCollisionIsAConflictTheCallerCanRead(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	e.register(tenantA, "W1", "", "S1", secretA)
+
+	_, err := e.sub.Register(e.ctx, provider.Subscription{
+		Tenant: tenantA, Provider: fake.DefaultKey, Resource: "W2", External: "S1", Secret: secretA,
+	})
+	if !errors.Is(err, hub.ErrSubscriptionConflict) {
+		t.Fatalf("Register: %v, want ErrSubscriptionConflict: a caller cannot tell this from an outage otherwise", err)
+	}
+	if errors.Is(err, hub.ErrInvalidSubscription) {
+		t.Error("the collision is reported as an invalid subscription, which is a refusal validate never made")
+	}
+	for _, leak := range []struct{ what, value string }{
+		{"the tenant", tenantA.String()},
+		{"the resource", "W2"},
+		{"the registration id", "S1"},
+		{"the secret", string(secretA)},
+	} {
+		if strings.Contains(err.Error(), leak.value) {
+			t.Errorf("the error carries %s: %v", leak.what, err)
+		}
+	}
+
+	// An unrelated failure must NOT be classified as a conflict: the point of the sentinel is to
+	// separate causes, so a row the table refuses for another reason has to stay out of it.
+	if _, err := e.sub.Register(e.ctx, provider.Subscription{
+		Tenant: tenantA, Provider: fake.DefaultKey, Resource: "W9", External: "S9", Secret: nil,
+	}); !errors.Is(err, hub.ErrInvalidSubscription) || errors.Is(err, hub.ErrSubscriptionConflict) {
+		t.Errorf("an empty secret is reported as %v, want ErrInvalidSubscription and not a conflict", err)
+	}
+
+	// The case that holds the constraint NAME in the mapping, rather than just SQLSTATE 23505.
+	// A subscription's id is its primary key and a caller may supply one, so two resources given
+	// one id are a unique violation too. It is a different mistake with a different repair, and
+	// reporting it as a registration-id collision would send an operator to the wrong field.
+	// Without this, dropping the constraint-name test from Register leaves the suite green.
+	const sharedID = "01JBPQZZZZZZZZZZZZZZZZZZZZ"
+	if _, err := e.sub.Register(e.ctx, provider.Subscription{
+		ID: sharedID, Tenant: tenantA, Provider: fake.DefaultKey, Resource: "W7", External: "S7", Secret: secretA,
+	}); err != nil {
+		t.Fatalf("Register with an explicit id: %v", err)
+	}
+	_, err = e.sub.Register(e.ctx, provider.Subscription{
+		ID: sharedID, Tenant: tenantA, Provider: fake.DefaultKey, Resource: "W8", External: "S8", Secret: secretA,
+	})
+	if err == nil {
+		t.Fatal("two resources were given one subscription id")
+	}
+	if errors.Is(err, hub.ErrSubscriptionConflict) {
+		t.Errorf("a duplicate subscription id is reported as a registration-id collision: %v", err)
+	}
+}
+
 // TestTwoTenantsMayRegisterOneRegistrationID. A provider's id space is not this deployment's to
 // make unique across accounts, and the hub decides two tenants' rows on their secrets anyway
 // (TestTwoTenantsOnOneWorkspaceWithDifferentSecretsRouteToTheOwner). So the uniqueness above is

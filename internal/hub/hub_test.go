@@ -182,6 +182,36 @@ func TestTwoSubscriptionsOfOneTenantThatBothVerifyAreParked(t *testing.T) {
 	}
 }
 
+// TestARegistrationIDOnOneOfTwoRowsIsStillAmbiguous is the boundary of what migration 00006 buys,
+// written down because docs/architecture.md section 5 claimed more than it buys and a review
+// caught it.
+//
+// The index makes a registration id identify at most one row of a tenant AMONG THE ROWS THAT
+// CARRY ONE. It says nothing about the size of the candidate set, because that set is the union
+// of two probes (Hub.candidates, ADR 11 decision 4), and CandidatesByWorkspace returns rows whose
+// external_id is empty, which is exactly what the index's predicate leaves out. So one tenant can
+// still present two candidates for one delivery, and the delivery is still parked.
+//
+// The pair here is the tight case: the first row carries the very registration id the delivery
+// names, the second carries none, the index permits both, and each probe finds one of them.
+// TestTwoSubscriptionsOfOneTenantThatBothVerifyAreParked is the looser case, where neither row
+// carries one.
+func TestARegistrationIDOnOneOfTwoRowsIsStillAmbiguous(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	byRegistration := e.register(tenantA, "list-1", "W1", "S1", secretA)
+	byWorkspace := e.register(tenantA, "list-2", "W1", "", secretA)
+	if byRegistration.ID == byWorkspace.ID {
+		t.Fatal("the two registrations updated one row, so there is no pair to be ambiguous about")
+	}
+	h, entry := e.hub(fake.New(fake.DefaultKey), hub.Options{})
+
+	if got := e.accept(h, entry, signed(delivery("W1", "S1", "1"), secretA)); got != ingress.Parked {
+		t.Fatalf("verdict = %s, want parked: the index does not make one tenant's two candidates one", got)
+	}
+	e.wantParked(reasonAmbiguous, "the registration id is on one of the two rows, and the index reaches no further")
+}
+
 // TestAnAmbiguousParkAcrossTwoProbesNamesTheRowsInIdOrder holds the candidate sort to the job its
 // comment claims, which is ordering the union of two DIFFERENT probes.
 //

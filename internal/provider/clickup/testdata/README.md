@@ -1,8 +1,8 @@
 # ClickUp fixtures
 
 **Every payload in this directory is synthesized from ClickUp's published documentation, not
-recorded from a live account.** B11 is not a "(needs you)" item and had no workspace to record
-against, so the webhook bodies follow
+recorded from a live account.** B11 is not a "(needs you)" item, so no account was used (which is
+not the same as there being none to use), and the webhook bodies follow
 [Task webhook payloads](https://developer.clickup.com/docs/webhooktaskpayloads) and
 [Webhook signature](https://developer.clickup.com/docs/webhooksignature), and the API responses
 follow [Get Task](https://developer.clickup.com/reference/gettask) and
@@ -26,8 +26,13 @@ golden tests. What a real recording may change, and what to look at first:
   move itself sends. The documentation says it is sent; a recording is what can confirm it;
 - whether every `history_items[].date` is a decimal string on every history item type. One that
   is not is skipped rather than refused (see `historyDate` in `parse.go`), so the cost of being
-  wrong is a version that falls back to `date_updated` and not a dead letter, but a type whose
-  date is shaped differently is worth knowing about;
+  wrong is a version that falls back to `date_updated` rather than the whole delivery dying at
+  the parse. That is the better trade (a hard refusal kills every delivery of a workspace,
+  permanently) but it is not free, and on the history item type that matters most here it is
+  **still a dead letter, one stage later**: if `date_updated` does not move on a move, falling
+  back to it is exactly what reproduces a record id the ledger has already seen, which the ledger
+  can only dead-letter (`pipeline.ErrScopeReturned`, and ADR 15 decision 4's A to B and back to A
+  case). So a history item type whose date is shaped differently is worth finding;
 - **whether `GET /task/{id}/comment` really pages with `start` and `start_id`** the way
   `api.comment` assumes. If the contract differs, every comment edited past the first page is
   `ErrNotFound`, and the four-page bound makes that read as the documented limitation rather

@@ -163,6 +163,13 @@ func (p *Provider) Verify(r provider.Request, secret []byte) bool {
 	// 401 on a provider's dashboard for no gain. hmac.Equal already refuses a digest of the
 	// wrong length, so the length test changes no answer; it is the shape of the refusal
 	// written down, and no test can tell it from its absence.
+	//
+	// The err arm is the opposite, and a sweep had to find it: hex.DecodeString hands back the
+	// bytes it decoded BEFORE the error, so a correct digest followed by anything that is not
+	// hex decodes to exactly the right 32 bytes. Drop this arm and those bytes reach hmac.Equal
+	// and verify, which gives every valid signature unboundedly many accepted spellings.
+	// TestVerifyRefuses has that case, and it is the only one here the comparison does not
+	// answer by itself.
 	want, err := hex.DecodeString(sigs[0])
 	if err != nil || len(want) != sha256.Size {
 		return false

@@ -596,7 +596,7 @@ Three deterministic keys, minted in exactly one package (`internal/ids`) so the 
 | accept | `delivery_id = blake3(provider, raw_body)`, unique per tenant | an identical re-send is an accept no-op |
 | record | `id = "rec_" + blake3(provider, external_id, version, scope, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
 | subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates, and the row keeps its id |
-| subscription | unique on `(tenant, provider, external_id)` where the registration id is not empty | a registration id identifies one row of a tenant, so a delivery that names it has one candidate of that tenant and is never parked as an ambiguous owner on a registrar's mistake (ADR 15, decision 3) |
+| subscription | unique on `(tenant, provider, external_id)` where the registration id is not empty | two rows of one tenant cannot carry one registration id, so the by-registration probe returns at most one row per tenant (ADR 15, decision 3) |
 
 Parts are joined with a `0x1F` separator so `("ab","c")` never collides with `("a","bc")`. A part
 that is empty or itself contains `0x1F` is refused with an error rather than hashed: an empty tenant
@@ -610,6 +610,20 @@ byte-identical deliveries for both. A global constraint would drop the second te
 
 The sentinel tenant that holds unattributable deliveries is a tenant for this key like any other,
 so a provider that re-sends a delivery nobody owns parks it once and gets 200 for every repeat.
+
+**What the registration-id index does and does not prevent.** It prevents exactly one state: two
+rows of one tenant and provider that both carry the *same non-empty* registration id, which no
+delivery naming that id could ever be resolved out of, because one registration has one secret and
+both rows would verify. It does **not** bound the candidate set, and so it does not retire the
+ambiguous-owner park. A delivery's candidates are the union of two probes
+([ADR 11](adr/0011-hub-resolution.md), decision 4), and the by-workspace probe returns rows whose
+registration id is empty, which is precisely what the index's predicate leaves out. One tenant can
+therefore still present two candidates: one row carrying the named registration id and one carrying
+only the workspace, or two rows carrying only the workspace. Both shapes are parked, and
+`TestARegistrationIDOnOneOfTwoRowsIsStillAmbiguous` and
+`TestTwoSubscriptionsOfOneTenantThatBothVerifyAreParked` in `internal/hub` hold them there. What
+keeps a registrar out of those shapes is the registration design (at most one row per provider
+workspace per tenant), not the table.
 
 A subscription's id is what an accepted delivery's **ordering key** is built from, so it has to
 outlive a re-registration: an updated row keeps its id, or the next delivery of that subscription

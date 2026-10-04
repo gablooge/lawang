@@ -87,6 +87,14 @@ func TestVerifyRefuses(t *testing.T) {
 		{"odd length hex", signedRequest(t, body, good[:63]), testSecret},
 		{"short digest", signedRequest(t, body, good[:62]), testSecret},
 		{"long digest", signedRequest(t, body, good+"00"), testSecret},
+		// The case the hex-decode guard is actually for, and the only one of these that is not
+		// answered by hmac.Equal on its own. hex.DecodeString returns the bytes it managed
+		// before the error, so a CORRECT digest followed by anything that is not hex decodes to
+		// exactly the right 32 bytes with an error beside them. Without the guard those bytes
+		// go to hmac.Equal and the delivery verifies, which makes every valid signature have
+		// infinitely many accepted spellings. The sweep found this guard surviving its own
+		// deletion because every other case here is refused by the comparison anyway.
+		{"a correct digest with trailing characters that are not hex", signedRequest(t, body, good+"zz"), testSecret},
 		{"another secret's signature", signedRequest(t, body, other), testSecret},
 		{"one byte changed in the body", signedRequest(t, append([]byte{' '}, body...), good), testSecret},
 		{"no body", signedRequest(t, nil, good), testSecret},

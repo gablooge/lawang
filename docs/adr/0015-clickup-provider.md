@@ -18,10 +18,12 @@ written, and all three were left open on purpose for the item that would meet th
    it spells a version, and refuses to start without one.
 
 **Everything below was checked against ClickUp's published documentation, not against a live
-workspace.** B11 is not a "(needs you)" item: it had no account, so every fixture under
+workspace.** B11 is not a "(needs you)" item, so **no account was used**: every fixture under
 `internal/provider/clickup/testdata` is synthesized from the documentation and B12 replaces them
-with real recordings. Where a decision rests on something only a live account can confirm, it
-says so and is built so that the answer does not change the outcome.
+with real recordings. Credentials do exist (`CLAUDE.md` lists `clickup.env`); this item was not
+given them and did not need them, which is a different thing from there being none. Where a
+decision rests on something only a live account can confirm, it says so and is built so that the
+answer does not change the outcome.
 
 ## Decision
 
@@ -100,11 +102,40 @@ names it, and since a registration has one secret, both verify and the delivery 
 ambiguous owner, permanently, until a human removes the collision. A unique index turns that into
 an error the registrar sees the moment it writes the row.
 
-**Per tenant, not globally.** `UNIQUE (provider, external_id)` was measured and is not viable: it
-fails nine tests of the hub suite, `TestTwoTenantsOnOneWorkspaceWithDifferentSecretsRouteToTheOwner`
-and `TestTwoTenantsWhoseSecretsBothVerifyAreParkedNeverRouted` among them, every one of which is
-designed cross-tenant behaviour. A provider's id space is not this deployment's to make unique across
-accounts, and the hub already decides two tenants' rows on their secrets.
+**And can act on, which took a second round to be true.** The index is the first thing
+`subscriptions` refuses that `hub.validate` cannot pre-check, so at first it reached a caller only
+as a driver error with a constraint name in it, which B14 could separate from a database outage
+only by matching that name in Go. `Subscriptions.Register` now maps SQLSTATE 23505 on
+`subscriptions_one_registration_per_tenant` to `hub.ErrSubscriptionConflict`, a sentinel beside
+`ErrInvalidSubscription`. The two together are the whole of "the operator sent something
+unusable", which is what a registrar needs to answer 4xx rather than 5xx; the mapping lives next
+to the one query that can trip it, and its message names no tenant, resource, registration id or
+secret.
+
+**What the index does NOT do**, because the first version of this branch's architecture row said
+it did: it does not retire the ambiguous-owner park. It bounds the by-registration probe, not the
+candidate set, and the candidate set is the union of that probe and the by-workspace one, which
+returns rows whose `external_id` is empty (the rows the predicate leaves out). One tenant with one
+row carrying the registration id and one carrying only the workspace still parks, and
+`TestARegistrationIDOnOneOfTwoRowsIsStillAmbiguous` in `internal/hub` holds that boundary.
+See architecture section 5.
+
+**Per tenant, not globally.** Both global forms were measured, by applying each in place of the
+index migration 00006 adds and running the suites, and neither is viable:
+
+| Variant | Measured |
+|---|---|
+| `UNIQUE (provider, external_id)` | **14** test functions of `internal/hub` fail |
+| `UNIQUE (provider, external_id) WHERE external_id <> ''` | **10** of `internal/hub` fail, plus `TestTwoTenantsMayNameOneWebhookID` in `internal/provider/clickup` |
+
+`TestTwoTenantsOnOneWorkspaceWithDifferentSecretsRouteToTheOwner` and
+`TestTwoTenantsWhoseSecretsBothVerifyAreParkedNeverRouted` are among the failures of both, and
+every failure is designed cross-tenant behaviour. A provider's id space is not this deployment's
+to make unique across accounts, and the hub already decides two tenants' rows on their secrets.
+
+(The figure first written here was nine, for the non-partial variant, and round 2 of review
+re-measured it at 14. The two forms give different answers, which is why the variant is named
+beside each number now.)
 
 **Partial, because a row may legitimately carry no registration id at all.** A provider that
 sends none leaves the column empty (migration 00003's CHECK allows it as long as the workspace id
