@@ -105,8 +105,14 @@ The cost of the table is real and is accepted:
   parameter, so that no caller can finish a delivery without saying what happened to each
   record. Both are compile-time changes and the only caller is the drain.
 - **Two places an operator looks for a dead letter.** A dead row, and a dead record of a
-  delivered row. B25's metrics and operator surface have to cover both, and that is written on
-  its issue.
+  delivered row. B25's metrics and operator surface have to cover both, which is written on
+  [issue #25](https://github.com/gablooge/lawang/issues/25#issuecomment-5975283608) together
+  with the second half of it: there is no Go API for a per-record dead letter yet.
+  `PreparedRecords` returns `state = 'prepared'` only, because it answers "what does this claim
+  still have to deliver", so the `dead_reason` and `last_error` of a record are written by
+  `MarkRecordDead` and read by nothing outside the tests. That is deliberate for now and it
+  means an operator today has raw SQL and nothing else for one of the two places. B25 is where
+  the reader belongs.
 
 ## Consequences
 

@@ -134,14 +134,37 @@ now asked of Postgres in one statement and sorted as keys (`EntityLockKeys` and 
 
 **The order between this lock and the outbox's.** Postgres has one advisory-lock namespace, a
 64 bit key with no classid split, and two modules take locks in it: `internal/outbox` over
-(tenant, ordering key), and this one over (tenant, provider, external id). For any transaction
-that ever holds both, the order is **the ordering-key lock first, then the entity locks**,
-ascending by key. Nothing in the drain holds both today (B10's step 6 takes only entity locks
-and its step 7 only the ordering key's), and the rule is written down here, and in a comment in
-both `queries.sql` files, because the next thing that works an outbox row and a chain in one
-transaction (a reconciliation pass, a repair, a batch finisher) would otherwise pick an order
-by accident, and the two orders deadlock against each other with nothing in either module to
-show it.
+(tenant, ordering key), and this one over (tenant, provider, external id). The rule for any
+transaction that ever holds both is one sentence: **take every advisory lock ascending by key**.
+Nothing in the drain holds both today (B10's step 6 takes only entity locks and its step 7 only
+the ordering key's), and the rule is written down here, and in a comment in both `queries.sql`
+files, because the next thing that works an outbox row and a chain in one transaction (a
+reconciliation pass, a repair, a batch finisher) would otherwise pick an order by accident.
+
+**The namespace is split so that the rule needs no premise** (changed in B10 round 2, review of
+pull request #56). The outbox ORs the high bit into its key and this module ANDs it out, so an
+ordering-key value is always negative, an entity-key value is always non-negative, and the two
+sets are disjoint by construction. Ascending order therefore puts every ordering-key lock before
+every entity lock on its own, which is what the rule used to say in two clauses ("the
+ordering-key lock first, then the entity locks").
+
+The two clauses were a total order only while no ordering-key value ever equalled an
+entity-key value, and nothing enforced that. With `K` an ordering key whose value equals entity
+key `b`, a transaction holding `{K, a, b}` takes `K`, `a`, `b` while a `Prepare` holding
+`{b, K}` takes `b`, `K`, and the two deadlock. That is a hash collision, so it would not have
+happened, which is the same "at 64 bits it would not have happened" reasoning the decision
+above exists to delete: a rule whose safety rests on an unstated and unenforced premise is not
+a rule. (The two formulas cannot collide other than by hash: the outbox hashes
+`tenant \x1f provider:subscription` and this hashes `tenant \x1f provider \x1f external_id`,
+and a provider key admits neither `:` nor `\x1f`, so the strings always differ.)
+
+The cost is one bit: each module has 63 bits instead of 64, so a collision within a module is
+about twice as likely and is still a wait and not a deadlock. The alternative considered was
+the two-argument `pg_advisory_xact_lock(int4, int4)` with a classid per module, which is
+structural in the same way but cuts each key to 32 bits, where collisions between unrelated
+entities stop being rare (a few at a hundred thousand keys) and unrelated work starts
+serializing. Each half is pinned by a test that reads `pg_locks` inside the transaction that
+holds the lock, one per module, so neither formula can quietly lose its bit.
 
 ### 2. The chain is per entity, and the ledger holds what was prepared
 

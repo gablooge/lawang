@@ -16,13 +16,31 @@ import (
 )
 
 // TestStressOrderingUnderRandomLoad runs every writer of the outbox at once, on a few hot keys:
-// acceptors, workers that deliver or dead-letter what they claim, and an operator replaying the
-// dead letters. It asserts what the package promises, while it runs and at the end:
+// acceptors, workers that take each row through one of five outcomes, and an operator replaying
+// what can be replayed. It asserts what the package promises, while it runs and at the end:
 //
 //   - never two rows of one key in flight together;
-//   - each key's rows are claimed in queue order (a replayed row has a fresh seq, at the back);
+//   - each key's rows are claimed in queue order (a replayed row has a fresh seq, at the back),
+//     and a row that was given back is the only one that may be claimed again at its own seq;
 //   - the head marker's invariant holds on every snapshot, not only once things are quiet;
-//   - every row ends up delivered: no row is left behind a marker that was never handed on.
+//   - every row ends up delivered and no record is left dead: nothing is left behind a marker
+//     that was never handed on, and nothing is left waiting for a replay nobody can make.
+//
+// The five outcomes are every transition a worker can write, because a transition that is never
+// generated is a transition this test does not cover:
+//
+//   - delivered, the ordinary one;
+//   - dead, the whole row, replayed later from the back of its key;
+//   - **delivered with one record dead**, which finishes the row and still leaves it replayable.
+//     That is the one way a FINISHED row goes backwards into the queue, and it reassigns seq and
+//     recomputes is_head exactly as the dead-row replay does;
+//   - **halted**, which leaves the row's state and its head marker alone and gives the attempt
+//     back, so the same row is claimed again at the same seq;
+//   - **released**, the same from the shutdown path.
+//
+// Each of the four non-ordinary outcomes happens at most once per row, so the run terminates:
+// every row ends delivered with nothing dead, and the watchdog below fails a run that stops
+// making progress instead of letting it hang.
 //
 // The choices (which key, deliver or dead-letter) come from a seed, logged so that a failure can be
 // run again with OUTBOX_STRESS_SEED. The scheduling of goroutines is not reproducible, the mix is.
@@ -36,12 +54,18 @@ import (
 // point. This one is for what nobody thought of.
 func TestStressOrderingUnderRandomLoad(t *testing.T) {
 	const (
-		acceptors    = 6
-		perAcceptor  = 40
-		workers      = 8
-		keys         = 4
-		deadPercent  = 30
-		stallTimeout = 20 * time.Second
+		acceptors   = 6
+		perAcceptor = 40
+		workers     = 8
+		keys        = 4
+		// The outcome of one claim, as cumulative percentages of a 100-sided roll. Everything
+		// above recordDeadUpTo is an ordinary delivery, and each of the four below is taken at
+		// most once per row (see wantsOnce).
+		haltUpTo       = 10
+		releaseUpTo    = 20
+		deadUpTo       = 45
+		recordDeadUpTo = 65
+		stallTimeout   = 20 * time.Second
 	)
 	seed := uint64(time.Now().UnixNano()) //nolint:gosec // any 64 bits will do
 	if s := os.Getenv("OUTBOX_STRESS_SEED"); s != "" {
@@ -71,16 +95,33 @@ func TestStressOrderingUnderRandomLoad(t *testing.T) {
 		id     string
 	}
 	var (
-		mu        sync.Mutex
-		inFlight  = map[string]string{} // tenant/key -> row id
-		lastSeq   = map[string]int64{}
-		diedOnce  = map[string]bool{}
+		mu       sync.Mutex
+		inFlight = map[string]string{} // tenant/key -> row id
+		lastSeq  = map[string]int64{}
+		lastRow  = map[string]string{} // tenant/key -> the row id that seq belongs to
+		// done[what][row id] is true once that row has had that outcome. Each of the four
+		// non-ordinary outcomes is taken at most once per row, so every row reaches delivered.
+		done      = map[string]map[string]bool{}
 		delivered atomic.Int64
 		replays   atomic.Int64
-		toReplay  = make(chan dead, acceptors*perAcceptor)
-		total     = int64(acceptors * perAcceptor)
-		all       sync.WaitGroup
+		// Room for every row to be replayed twice: once from dead and once from delivered
+		// with a dead record in it.
+		toReplay = make(chan dead, 2*acceptors*perAcceptor)
+		total    = int64(acceptors * perAcceptor)
+		all      sync.WaitGroup
 	)
+	for _, what := range []string{"halt", "release", "dead", "record-dead"} {
+		done[what] = map[string]bool{}
+	}
+	// wantsOnce reports whether this row may have this outcome now, and records that it did.
+	// Caller holds mu.
+	wantsOnce := func(what, id string) bool {
+		if done[what][id] {
+			return false
+		}
+		done[what][id] = true
+		return true
+	}
 
 	for a := range acceptors {
 		all.Go(func() {
@@ -124,6 +165,7 @@ func TestStressOrderingUnderRandomLoad(t *testing.T) {
 				}
 				// Everything in the batch is in flight from the moment it is claimed.
 				keysOf := make([]string, len(got))
+				statesOf := make([]string, len(got))
 				for i, c := range got {
 					row, err := e.ob.Get(ctx, c.Tenant(), c.ID())
 					if err != nil {
@@ -133,37 +175,79 @@ func TestStressOrderingUnderRandomLoad(t *testing.T) {
 						return
 					}
 					key := row.TenantID + "/" + row.OrderingKey
-					keysOf[i] = key
+					keysOf[i], statesOf[i] = key, row.State
 					mu.Lock()
 					if other, busy := inFlight[key]; busy {
 						fail("%s: row %s claimed while %s is still in flight", key, c.ID(), other)
 					}
-					if row.Seq <= lastSeq[key] {
+					// Strictly forward, with one exception: a row that was halted or given
+					// back keeps its seq and its place, so the very same row may be claimed
+					// again at the seq it already had. Any other repeat is the queue going
+					// backwards.
+					switch {
+					case row.Seq < lastSeq[key]:
 						fail("%s: seq %d claimed after seq %d", key, row.Seq, lastSeq[key])
+					case row.Seq == lastSeq[key] && c.ID() != lastRow[key]:
+						fail("%s: row %s claimed at seq %d, which belongs to row %s",
+							key, c.ID(), row.Seq, lastRow[key])
 					}
 					if !row.IsHead {
 						fail("%s: row %s was claimed and is not the head of its key", key, c.ID())
 					}
 					inFlight[key] = c.ID()
-					lastSeq[key] = row.Seq
+					lastSeq[key], lastRow[key] = row.Seq, c.ID()
 					mu.Unlock()
 				}
 				for i, c := range got {
 					time.Sleep(time.Duration(rng.IntN(1500)) * time.Microsecond) // the work
 					mu.Lock()
-					dies := !diedOnce[c.ID()] && rng.IntN(100) < deadPercent
-					if dies {
-						diedOnce[c.ID()] = true
+					// A row that has already been prepared (it came back from a replay of a
+					// delivery with one dead record in it) is delivered and never prepared
+					// again, which is what the drain does with one.
+					outcome := "deliver"
+					if roll := rng.IntN(100); statesOf[i] == outbox.StatePending {
+						switch {
+						case roll < haltUpTo && wantsOnce("halt", c.ID()):
+							outcome = "halt"
+						case roll < releaseUpTo && wantsOnce("release", c.ID()):
+							outcome = "release"
+						case roll < deadUpTo && wantsOnce("dead", c.ID()):
+							outcome = "dead"
+						case roll < recordDeadUpTo && wantsOnce("record-dead", c.ID()):
+							outcome = "record-dead"
+						}
 					}
 					// No longer in flight from just before the finishing call: the next row of the
 					// key is claimable from the moment that call commits, which is before it returns.
 					delete(inFlight, keysOf[i])
 					mu.Unlock()
 
-					if dies {
+					switch outcome {
+					case "halt":
+						// The shortest pause the package takes, so the row comes straight
+						// back. It keeps its state, its seq and its head marker, and gives
+						// the attempt back.
+						err = e.ob.Halt(ctx, c, time.Millisecond, badShape)
+					case "release":
+						err = e.ob.Release(ctx, c)
+					case "dead":
 						err = e.ob.MarkDead(ctx, c, badShape)
 						toReplay <- dead{c.Tenant(), c.ID()}
-					} else {
+					case "record-dead":
+						// Prepared, then finished as delivered with its one record refused.
+						// The row is finished and still replayable, which is the one way a
+						// finished row goes back into the queue.
+						recordID := "rec_" + c.ID()
+						err = e.prepare(ctx, c, doc(recordID))
+						if err == nil {
+							err = e.ob.MarkDelivered(ctx, c, []outbox.DeadRecord{
+								{RecordID: recordID, Cause: refused},
+							})
+							if err == nil {
+								toReplay <- dead{c.Tenant(), c.ID()}
+							}
+						}
+					default:
 						err = e.ob.MarkDelivered(ctx, c, nil)
 						delivered.Add(1)
 					}
@@ -234,5 +318,21 @@ func TestStressOrderingUnderRandomLoad(t *testing.T) {
 	if unfinished != 0 || isDelivered != total {
 		t.Errorf("%d rows delivered and %d not, want all %d delivered", isDelivered, unfinished, total)
 	}
-	t.Logf("%d deliveries, %d dead letters replayed", delivered.Load(), replays.Load())
+	// A delivered row with a dead record in it is replayable, so "every row is delivered" is
+	// not the whole promise: a record left dead is a record nobody replayed.
+	var deadRecords, allRecords int64
+	err = admin.QueryRow(e.ctx, `
+		SELECT count(*) FILTER (WHERE state = 'dead'), count(*) FROM lawang.outbox_record`).
+		Scan(&deadRecords, &allRecords)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deadRecords != 0 {
+		t.Errorf("%d records of %d are still dead, want none: a per-record dead letter was never replayed",
+			deadRecords, allRecords)
+	}
+	if allRecords == 0 {
+		t.Error("no record was ever stored, so the per-record outcomes were never generated")
+	}
+	t.Logf("%d deliveries, %d replays, %d prepared records", delivered.Load(), replays.Load(), allRecords)
 }

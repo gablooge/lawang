@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -45,6 +46,21 @@ var faultDetails = []string{
 	detailTimedOut, detailNoSuchHost, detailRefused, detailTLS, detailConnection,
 	detailCancelled, detailNoCredential, detailUnreadableReply, detailRecordTooLarge,
 	detailNoRequest, detailInvalidRecord, detailWriteFailed, detailWrongTenant,
+}
+
+// KnownDetail reports whether detail is one of this package's own phrases, or empty.
+//
+// Fault and Rejection are exported types with an exported Detail, and their doc comments say
+// the field holds a phrase of this package, but a Sink this repository did not write is free
+// to put anything there. A Detail exists for a log line, and issue #9's acceptance is that a
+// sink URL and its credential appear in nothing a failed delivery produces, so a caller that
+// LOGS a Detail it did not build asks this first and prints something of its own when the
+// answer is false. internal/worker does.
+//
+// It is deliberately a membership test and not a shape test: every phrase here is a constant
+// of this program and carries nothing a receiver, a request or a record gave.
+func KnownDetail(detail string) bool {
+	return detail == "" || slices.Contains(faultDetails, detail)
 }
 
 // The error codes this package puts in a Cause for a record Lawang itself refused. Detail says

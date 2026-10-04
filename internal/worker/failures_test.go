@@ -128,43 +128,83 @@ func TestASinkThatBreaksItsContractHalts(t *testing.T) {
 	}
 }
 
-// TestAStoredRecordThatIsNoLongerThisTenantsIsParked. The second commit delivers documents the
-// first one stored, possibly from another process, so the thing that keeps a sink from being
-// handed somebody else's record is record.Reopen: it mints the id again and refuses a document
-// that does not hash to the id stored beside it.
+// TestAStoredRecordThatIsNotTheOneThatWasStoredIsParked. The second commit delivers documents
+// the first one stored, possibly from another process, so the thing that keeps a sink from
+// being handed a record nobody prepared is record.Reopen: it mints the id again from the
+// document and holds the document against the columns the row carries beside it.
 //
-// The document is edited here the way nothing in the program can, because the point is that the
-// drain does not trust its own table either. The delivery is parked rather than retried, since
-// the same bytes come back the same on the next attempt, and nothing of it is delivered: a
-// delivery that cannot be made whole is not made in part.
-func TestAStoredRecordThatIsNoLongerThisTenantsIsParked(t *testing.T) {
+// The row is edited here the way nothing in the program can, because the point is that the
+// drain does not trust its own table either. Each case is a single edit the tenant's own SQL
+// could make, and each is a row that still decodes and still passes the format, which is why
+// none of them can be left to the decoder:
+//
+//   - the version is hashed into the record id, so the document mints an id that is not its own;
+//   - the op and the kind are NOT hashed into it. They are in the record's seal, and a seal is
+//     recomputed from the document's own values when the document is decoded, so a document
+//     edited in one of them agrees with itself and only the columns beside it disagree. This is
+//     the edit that matters most: an upsert turned into a delete is a tombstone at the
+//     receiver, and record.OpDelete removes every stored version of the entity;
+//   - the record id column is what the outbox keys, leases and dead-letters the delivery on, so
+//     a document swapped for another record of the tenant is accounted for under an id that was
+//     never offered.
+//
+// The delivery is parked rather than retried, since the same bytes come back the same on the
+// next attempt, and nothing of it is delivered: a delivery that cannot be made whole is not
+// made in part.
+func TestAStoredRecordThatIsNotTheOneThatWasStoredIsParked(t *testing.T) {
 	t.Parallel()
-	e := setup(t, worker.Options{})
-	id := e.accept(tenantA, "fake:S1", ev(entity, "1", listA))
+	// Each edit runs against a database of its own: the row ends dead either way, and a case
+	// that asserted a last_error an earlier case had left there would prove nothing.
+	for name, edit := range map[string]string{
+		"the version, which the id hashes": `
+			UPDATE lawang.outbox_record
+			   SET document = convert_to(replace(convert_from(document, 'UTF8'),
+			                                     '"version":"1"', '"version":"9"'), 'UTF8')`,
+		// Validate refuses a delete that still carries a title and a text, so the tombstone
+		// edit clears them. That is one more field in the same edit, not a second guard.
+		"the op, which the seal covers and the id does not": `
+			UPDATE lawang.outbox_record
+			   SET document = convert_to(
+			         regexp_replace(
+			           regexp_replace(
+			             replace(convert_from(document, 'UTF8'), '"op":"upsert"', '"op":"delete"'),
+			             '"title":"[^"]*"', '"title":""'),
+			           '"text":"[^"]*"', '"text":""'), 'UTF8')`,
+		"the kind, which the seal covers and the id does not": `
+			UPDATE lawang.outbox_record
+			   SET document = convert_to(replace(convert_from(document, 'UTF8'),
+			                                     '"kind":"task"', '"kind":"message"'), 'UTF8')`,
+		"the record id the row is keyed on": `
+			UPDATE lawang.outbox_record SET record_id = 'rec_nobody_prepared_this'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e := setup(t, worker.Options{})
+			id := e.accept(tenantA, "fake:S1", ev(entity, "1", listA))
 
-	e.sinks.mu.Lock()
-	e.sinks.panics = 1 // prepare the delivery and stop before it is delivered
-	e.sinks.mu.Unlock()
-	e.drainOnce()
-	e.leaseExpired()
+			e.sinks.mu.Lock()
+			e.sinks.panics = 1 // prepare the delivery and stop before it is delivered
+			e.sinks.mu.Unlock()
+			e.drainOnce()
+			e.leaseExpired()
+			if got := e.row(tenantA, id).LastError; got != "" {
+				t.Fatalf("the row starts with last_error = %q, so what this case asserts is not its own", got)
+			}
 
-	// A version the id does not stand for any more. The document still passes the format and
-	// still decodes, which is why the id has to be minted again rather than read.
-	e.admin(`UPDATE lawang.outbox_record
-	            SET document = convert_to(replace(convert_from(document, 'UTF8'),
-	                                              '"version":"1"', '"version":"9"'), 'UTF8')`)
+			e.admin(edit)
+			e.drainOnce()
 
-	e.drainOnce()
-
-	e.wantState(id, outbox.StateDead, "not retryable")
-	if got := e.row(tenantA, id).LastError; got != "internal error (code stored_record)" {
-		t.Errorf("last_error = %q, want the class and the code, and nothing from the document", got)
-	}
-	if got := len(e.documents(tenantA)); got != 0 {
-		t.Errorf("the stub holds %d documents, want none", got)
-	}
-	if calls := e.sinks.callCount(); calls != 1 {
-		t.Errorf("the sink was called %d times, want only the one that died: nothing may be offered", calls)
+			e.wantState(id, outbox.StateDead, "not retryable")
+			if got := e.row(tenantA, id).LastError; got != "internal error (code stored_record)" {
+				t.Errorf("last_error = %q, want the class and the code, and nothing from the document", got)
+			}
+			if got := len(e.documents(tenantA)); got != 0 {
+				t.Errorf("the stub holds %d documents, want none", got)
+			}
+			if calls := e.sinks.callCount(); calls != 1 {
+				t.Errorf("the sink was called %d times, want only the one that died: nothing may be offered", calls)
+			}
+		})
 	}
 }
 

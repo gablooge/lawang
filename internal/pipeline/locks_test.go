@@ -43,6 +43,7 @@ func TestTheLocksHeldAreTheKeysOfTheEntities(t *testing.T) {
 		// The keys the entities of this delivery hash to, asked for separately from the
 		// statement under test.
 		rows, err := tx.Query(e.ctx, `SELECT hashtextextended($1 || chr(31) || $2 || chr(31) || id, 0)
+		                                     & 9223372036854775807::bigint
 		                                FROM unnest($3::text[]) AS id`,
 			tenantA.String(), fake.DefaultKey, ids)
 		if err != nil {
@@ -72,6 +73,17 @@ func TestTheLocksHeldAreTheKeysOfTheEntities(t *testing.T) {
 	slices.Sort(held)
 	if !slices.Equal(held, want) {
 		t.Errorf("the advisory locks held are %v, want %v: the keys of this delivery's entities, each once", held, want)
+	}
+	// And every one of them is in this module's half of the one advisory-lock namespace.
+	// internal/outbox sets the high bit of its ordering keys and this clears it, so the two key
+	// sets are disjoint and "take every advisory lock ascending by key" is a total order across
+	// both modules with no premise about collisions (EntityLockKeys, ADR 12 decision 1). The
+	// outbox's half is pinned by TestAnOrderingKeyLockIsInTheOutboxHalfOfTheNamespace.
+	for _, k := range held {
+		if k < 0 {
+			t.Errorf("entity lock key %d is negative, which is the outbox's half of the namespace: "+
+				"the two halves must stay disjoint or the cross-module lock order stops being total", k)
+		}
 	}
 }
 

@@ -19,7 +19,15 @@
 -- miss each other just the same. store begins every transaction READ COMMITTED by name for that
 -- reason, whatever default_transaction_isolation says. Two keys that hash alike only wait for each
 -- other, which is harmless. The claim never takes it.
-SELECT pg_advisory_xact_lock(hashtextextended(@tenant_id::text || chr(31) || @ordering_key::text, 0));
+--
+-- The high bit of the key is set, which puts every ordering-key lock in the negative half of
+-- Postgres's one advisory-lock namespace. internal/pipeline clears it, so its entity locks are
+-- the non-negative half, and an ordering-key value can never equal an entity-key value. That is
+-- what makes the cross-module rule ("ascending by key", see internal/pipeline/queries.sql and
+-- ADR 12 decision 1) a total order without assuming the two hashes never collide. Each half
+-- still holds 63 bits, and a collision WITHIN a half is a wait, not a deadlock.
+SELECT pg_advisory_xact_lock(
+         hashtextextended(@tenant_id::text || chr(31) || @ordering_key::text, 0) | (-9223372036854775808)::bigint);
 
 -- name: Accept :one
 -- Runs bound to the tenant that owns the verified subscription, after LockOrderingKey. A repeated
@@ -160,7 +168,10 @@ UPDATE outbox
 -- LockOrderingKey for a row known only by its id. Runs bound to the row's tenant, before Replay
 -- and before the finishing transitions. It reads the row without locking it (ordering_key never
 -- changes), so the advisory lock always comes before any row lock.
-SELECT pg_advisory_xact_lock(hashtextextended(tenant_id::text || chr(31) || ordering_key, 0))
+--
+-- The same key as LockOrderingKey, high bit and all: the two have to name one lock.
+SELECT pg_advisory_xact_lock(
+         hashtextextended(tenant_id::text || chr(31) || ordering_key, 0) | (-9223372036854775808)::bigint)
   FROM outbox
  WHERE id = @id;
 
@@ -248,16 +259,21 @@ UPDATE outbox r
 -- It runs after MarkPrepared, which holds the lease and the state: a worker whose lease was taken
 -- over is refused there and never reaches this, so two workers cannot both store the records of
 -- one delivery and meet on the primary key.
-INSERT INTO outbox_record (outbox_id, record_id, pos, document)
-SELECT @outbox_id, r.record_id, (r.n - 1)::int, d.document
+INSERT INTO outbox_record (outbox_id, record_id, pos, document, op, kind)
+SELECT @outbox_id, r.record_id, (r.n - 1)::int, d.document, o.op, k.kind
   FROM unnest(@record_ids::text[]) WITH ORDINALITY AS r(record_id, n)
-  JOIN unnest(@documents::bytea[]) WITH ORDINALITY AS d(document, n) USING (n);
+  JOIN unnest(@documents::bytea[]) WITH ORDINALITY AS d(document, n) USING (n)
+  JOIN unnest(@ops::text[]) WITH ORDINALITY AS o(op, n) USING (n)
+  JOIN unnest(@kinds::text[]) WITH ORDINALITY AS k(kind, n) USING (n);
 
 -- name: PreparedRecords :many
 -- What a claim of this delivery still has to deliver, in delivery order. A record that has
 -- already been delivered is not sent again, and a dead letter waits for a replay to bring it
 -- back, so a re-drain after a crash offers exactly what is left.
-SELECT record_id, document
+--
+-- op and kind come back with the document because record.Reopen needs them: they are in the
+-- record's seal and not in its id, so the document cannot be checked for them on its own.
+SELECT record_id, document, op, kind
   FROM outbox_record
  WHERE outbox_id = @outbox_id AND state = 'prepared'
  ORDER BY pos;

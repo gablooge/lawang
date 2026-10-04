@@ -95,13 +95,78 @@ func TestAPreparedDeliveryIsDeliveredFromWhatItStored(t *testing.T) {
 		t.Fatalf("PreparedRecords = %v, want %v", got, want)
 	}
 	for i := range want {
-		if got[i].RecordID != want[i].RecordID || string(got[i].Document) != string(want[i].Document) {
-			t.Errorf("record %d = %s %q, want %s %q",
-				i, got[i].RecordID, got[i].Document, want[i].RecordID, want[i].Document)
+		// The op and the kind come back too. record.Reopen needs them to check the document,
+		// and a round trip that dropped them would fail every record closed rather than be
+		// noticed here, so they are asserted where they are stored.
+		if got[i].RecordID != want[i].RecordID || string(got[i].Document) != string(want[i].Document) ||
+			got[i].Op != want[i].Op || got[i].Kind != want[i].Kind {
+			t.Errorf("record %d = %s %q %s/%s, want %s %q %s/%s",
+				i, got[i].RecordID, got[i].Document, got[i].Op, got[i].Kind,
+				want[i].RecordID, want[i].Document, want[i].Op, want[i].Kind)
 		}
 	}
 	if row, _ := e.ob.Get(e.ctx, tenantA, id); row.State != outbox.StatePrepared {
 		t.Errorf("state = %q, want prepared: the second worker must deliver and not prepare again", row.State)
+	}
+}
+
+// TestWorkWithholdsTheBodyOfAPreparedRow pins the one reason Work's projection has a CASE in it.
+//
+// A prepared row is delivered from the records it stored and its body is never read again
+// (architecture 3.2, step 7), so fetching raw_body for one is up to a megabyte of webhook body
+// read on every re-drain and on every halt. A halted row is claimed once per halt pause for as
+// long as an operator takes, so for a halted tenant with a backlog that is the whole of that
+// backlog's bodies, once a minute, for nothing.
+//
+// Without this test the CASE is held up by nothing: replacing it with a plain raw_body left
+// internal/outbox and internal/worker green.
+func TestWorkWithholdsTheBodyOfAPreparedRow(t *testing.T) {
+	e := setup(t)
+	id := e.accept(tenantA, "task:1", 1)
+	c := e.claimOne(id)
+
+	pending, err := e.ob.Work(e.ctx, c)
+	if err != nil {
+		t.Fatalf("Work on a pending row: %v", err)
+	}
+	if pending.State != outbox.StatePending {
+		t.Fatalf("state = %q, want pending: the case below is only about a prepared row", pending.State)
+	}
+	// The premise: a pending row does get its body, or withholding it from a prepared one
+	// would prove nothing.
+	if want := `{"key":"task:1","v":1}`; string(pending.Body) != want {
+		t.Fatalf("the body of a pending row = %q, want %q", pending.Body, want)
+	}
+	if pending.Provider != "fake" {
+		t.Errorf("provider = %q, want fake", pending.Provider)
+	}
+
+	if err := e.prepare(e.ctx, c, doc("rec_a")); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := e.ob.Work(e.ctx, c)
+	if err != nil {
+		t.Fatalf("Work on a prepared row: %v", err)
+	}
+	if prepared.State != outbox.StatePrepared {
+		t.Fatalf("state = %q, want prepared", prepared.State)
+	}
+	if prepared.Body != nil {
+		t.Errorf("the body of a prepared row = %q, want none: it is never read again", prepared.Body)
+	}
+	// And the row still says who to work it as, which is the rest of what Work is for.
+	if prepared.Provider != "fake" {
+		t.Errorf("provider = %q, want fake", prepared.Provider)
+	}
+	// The body is withheld and not lost: it is still in the table for an operator.
+	var stored string
+	err = e.adminConn().QueryRow(e.ctx,
+		"SELECT convert_from(raw_body, 'UTF8') FROM lawang.outbox WHERE id = $1", id).Scan(&stored)
+	if err != nil {
+		t.Fatalf("read raw_body as the superuser: %v", err)
+	}
+	if want := `{"key":"task:1","v":1}`; stored != want {
+		t.Errorf("raw_body in the table = %q, want %q: Work withholds it, nothing deletes it", stored, want)
 	}
 }
 
@@ -452,26 +517,40 @@ func TestExhaustedIsOnePastTheLastAttemptTheLadderSchedules(t *testing.T) {
 	}
 }
 
-// TestPrepareInRefusesARecordIdPostgresCannotStore. Every text that reaches a statement from
+// TestPrepareInRefusesATextPostgresCannotStore. Every text that reaches a statement from
 // outside the package is asked this first, because the alternative is SQLSTATE 22021, which a
-// caller cannot tell from an outage.
-func TestPrepareInRefusesARecordIdPostgresCannotStore(t *testing.T) {
+// caller cannot tell from an outage. The op and the kind are asked as well as the record id:
+// they are three columns written from the same caller's values, and an empty op would meet the
+// table's CHECK instead, which is no easier to read.
+func TestPrepareInRefusesATextPostgresCannotStore(t *testing.T) {
 	e := setup(t)
 	id := e.accept(tenantA, "task:1", 1)
 	c := e.claimOne(id)
-	for name, recordID := range map[string]string{
-		"a NUL byte":    "rec_\x00a",
-		"invalid UTF-8": "rec_\xff",
+	bad := map[string]outbox.PreparedRecord{}
+	for name, text := range map[string]string{
+		"a NUL byte":    "\x00a",
+		"invalid UTF-8": "\xff",
 		"empty":         "",
 	} {
+		r := doc("rec_a")
+		r.RecordID = text
+		bad["the record id is "+name] = r
+		r = doc("rec_a")
+		r.Op = text
+		bad["the op is "+name] = r
+		r = doc("rec_a")
+		r.Kind = text
+		bad["the kind is "+name] = r
+	}
+	for name, rec := range bad {
 		err := e.db.TenantTx(e.ctx, tenantA, func(tx pgx.Tx) error {
-			return e.ob.PrepareIn(e.ctx, tx, c, []outbox.PreparedRecord{{RecordID: recordID, Document: []byte("{}")}})
+			return e.ob.PrepareIn(e.ctx, tx, c, []outbox.PreparedRecord{rec})
 		})
 		if err == nil {
 			t.Errorf("%s: err = nil, want a refusal", name)
 		}
 	}
-	// The refusal is the record id and not the state: the row is still preparable afterwards.
+	// The refusal is the record and not the state: the row is still preparable afterwards.
 	if err := e.prepare(e.ctx, c, doc("rec_a")); err != nil {
 		t.Errorf("PrepareIn after the refusals: %v", err)
 	}

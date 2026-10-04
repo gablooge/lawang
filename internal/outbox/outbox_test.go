@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/gablooge/lawang/internal/outbox"
+	"github.com/gablooge/lawang/internal/outbox/outboxdb"
 	"github.com/gablooge/lawang/internal/store"
 	"github.com/gablooge/lawang/internal/tenancy"
 	"github.com/gablooge/lawang/internal/testdb"
@@ -127,9 +128,16 @@ func (e *env) prepare(ctx context.Context, c outbox.Claimed, recs ...outbox.Prep
 	})
 }
 
-// doc is a stand-in for a record document: this package never looks inside one.
+// doc is a stand-in for a record document: this package never looks inside one. The op and the
+// kind are stored beside it and are not read here either (record.Reopen is what compares them
+// with the document), so they are plausible constants and nothing depends on them.
 func doc(recordID string) outbox.PreparedRecord {
-	return outbox.PreparedRecord{RecordID: recordID, Document: []byte(`{"id":"` + recordID + `"}`)}
+	return outbox.PreparedRecord{
+		RecordID: recordID,
+		Document: []byte(`{"id":"` + recordID + `"}`),
+		Op:       "upsert",
+		Kind:     "message",
+	}
 }
 
 // admin changes rows behind the application's back, to move time along.
@@ -664,12 +672,61 @@ func TestGetIsTenantScoped(t *testing.T) {
 	}
 }
 
+// TestAnOrderingKeyLockIsInTheOutboxHalfOfTheNamespace reads the lock this module really takes
+// out of pg_locks, inside the transaction that holds it, rather than trusting a copy of the
+// formula.
+//
+// Postgres has one advisory-lock namespace. This module sets the high bit of its key and
+// internal/pipeline clears it on the entity keys of the supersede chain, so the two key sets
+// are disjoint by construction and the cross-module rule is "take every advisory lock ascending
+// by key", a total order with no premise about the two hashes never colliding (ADR 12 decision
+// 1). The other half is pinned by TestTheLocksHeldAreTheKeysOfTheEntities in internal/pipeline.
+//
+// Fails when: a later change simplifies either formula back to a bare hashtextextended, and the
+// rule silently needs its premise again.
+func TestAnOrderingKeyLockIsInTheOutboxHalfOfTheNamespace(t *testing.T) {
+	e := setup(t)
+	var held []int64
+	err := e.db.TenantTx(e.ctx, tenantA, func(tx pgx.Tx) error {
+		err := outboxdb.New(tx).LockOrderingKey(e.ctx, outboxdb.LockOrderingKeyParams{
+			TenantID: tenantA.String(), OrderingKey: "task:1",
+		})
+		if err != nil {
+			return err
+		}
+		// classid is the key's high 32 bits and objid its low 32, which is how Postgres stores
+		// a one-argument advisory key.
+		rows, err := tx.Query(e.ctx, `SELECT classid, objid FROM pg_locks
+		                               WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()`)
+		if err != nil {
+			return err
+		}
+		held, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (int64, error) {
+			var high, low uint32
+			err := r.Scan(&high, &low)
+			return int64(uint64(high)<<32 | uint64(low)), err //nolint:gosec // a 64 bit key put back together
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("take the ordering key's lock: %v", err)
+	}
+	if len(held) != 1 {
+		t.Fatalf("the transaction holds %d advisory locks, want exactly the ordering key's", len(held))
+	}
+	if held[0] >= 0 {
+		t.Errorf("the ordering key's lock is %d, want a negative key: the non-negative half of the "+
+			"namespace is internal/pipeline's, and the two halves must stay disjoint", held[0])
+	}
+}
+
 // repairKey is the repair statement of ADR 10, as written there: under the key's lock, hand the
 // marker to the earliest unfinished row. Where the key has a head already it changes nothing, or is
 // refused by the unique index if that head is not the earliest row.
 const repairKey = `
 	BEGIN;
-	SELECT pg_advisory_xact_lock(hashtextextended('%[1]s' || chr(31) || '%[2]s', 0));
+	SELECT pg_advisory_xact_lock(
+	         hashtextextended('%[1]s' || chr(31) || '%[2]s', 0) | (-9223372036854775808)::bigint);
 	UPDATE lawang.outbox SET is_head = true
 	 WHERE id = (SELECT id FROM lawang.outbox
 	              WHERE tenant_id = '%[1]s' AND ordering_key = '%[2]s' AND state IN ('pending', 'prepared')

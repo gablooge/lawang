@@ -219,7 +219,8 @@ func (q *Queries) Halt(ctx context.Context, arg HaltParams) (int64, error) {
 }
 
 const lockOrderingKey = `-- name: LockOrderingKey :exec
-SELECT pg_advisory_xact_lock(hashtextextended($1::text || chr(31) || $2::text, 0))
+SELECT pg_advisory_xact_lock(
+         hashtextextended($1::text || chr(31) || $2::text, 0) | (-9223372036854775808)::bigint)
 `
 
 type LockOrderingKeyParams struct {
@@ -247,13 +248,21 @@ type LockOrderingKeyParams struct {
 // miss each other just the same. store begins every transaction READ COMMITTED by name for that
 // reason, whatever default_transaction_isolation says. Two keys that hash alike only wait for each
 // other, which is harmless. The claim never takes it.
+//
+// The high bit of the key is set, which puts every ordering-key lock in the negative half of
+// Postgres's one advisory-lock namespace. internal/pipeline clears it, so its entity locks are
+// the non-negative half, and an ordering-key value can never equal an entity-key value. That is
+// what makes the cross-module rule ("ascending by key", see internal/pipeline/queries.sql and
+// ADR 12 decision 1) a total order without assuming the two hashes never collide. Each half
+// still holds 63 bits, and a collision WITHIN a half is a wait, not a deadlock.
 func (q *Queries) LockOrderingKey(ctx context.Context, arg LockOrderingKeyParams) error {
 	_, err := q.db.Exec(ctx, lockOrderingKey, arg.TenantID, arg.OrderingKey)
 	return err
 }
 
 const lockOrderingKeyOf = `-- name: LockOrderingKeyOf :exec
-SELECT pg_advisory_xact_lock(hashtextextended(tenant_id::text || chr(31) || ordering_key, 0))
+SELECT pg_advisory_xact_lock(
+         hashtextextended(tenant_id::text || chr(31) || ordering_key, 0) | (-9223372036854775808)::bigint)
   FROM outbox
  WHERE id = $1
 `
@@ -261,6 +270,8 @@ SELECT pg_advisory_xact_lock(hashtextextended(tenant_id::text || chr(31) || orde
 // LockOrderingKey for a row known only by its id. Runs bound to the row's tenant, before Replay
 // and before the finishing transitions. It reads the row without locking it (ordering_key never
 // changes), so the advisory lock always comes before any row lock.
+//
+// The same key as LockOrderingKey, high bit and all: the two have to name one lock.
 func (q *Queries) LockOrderingKeyOf(ctx context.Context, id string) error {
 	_, err := q.db.Exec(ctx, lockOrderingKeyOf, id)
 	return err
@@ -426,7 +437,7 @@ func (q *Queries) Park(ctx context.Context, arg ParkParams) (string, error) {
 }
 
 const preparedRecords = `-- name: PreparedRecords :many
-SELECT record_id, document
+SELECT record_id, document, op, kind
   FROM outbox_record
  WHERE outbox_id = $1 AND state = 'prepared'
  ORDER BY pos
@@ -435,11 +446,16 @@ SELECT record_id, document
 type PreparedRecordsRow struct {
 	RecordID string
 	Document []byte
+	Op       string
+	Kind     string
 }
 
 // What a claim of this delivery still has to deliver, in delivery order. A record that has
 // already been delivered is not sent again, and a dead letter waits for a replay to bring it
 // back, so a re-drain after a crash offers exactly what is left.
+//
+// op and kind come back with the document because record.Reopen needs them: they are in the
+// record's seal and not in its id, so the document cannot be checked for them on its own.
 func (q *Queries) PreparedRecords(ctx context.Context, outboxID string) ([]PreparedRecordsRow, error) {
 	rows, err := q.db.Query(ctx, preparedRecords, outboxID)
 	if err != nil {
@@ -449,7 +465,12 @@ func (q *Queries) PreparedRecords(ctx context.Context, outboxID string) ([]Prepa
 	var items []PreparedRecordsRow
 	for rows.Next() {
 		var i PreparedRecordsRow
-		if err := rows.Scan(&i.RecordID, &i.Document); err != nil {
+		if err := rows.Scan(
+			&i.RecordID,
+			&i.Document,
+			&i.Op,
+			&i.Kind,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -608,16 +629,20 @@ func (q *Queries) ReviveDeadRecords(ctx context.Context, outboxID string) (int64
 
 const storePreparedRecords = `-- name: StorePreparedRecords :exec
 
-INSERT INTO outbox_record (outbox_id, record_id, pos, document)
-SELECT $1, r.record_id, (r.n - 1)::int, d.document
+INSERT INTO outbox_record (outbox_id, record_id, pos, document, op, kind)
+SELECT $1, r.record_id, (r.n - 1)::int, d.document, o.op, k.kind
   FROM unnest($2::text[]) WITH ORDINALITY AS r(record_id, n)
   JOIN unnest($3::bytea[]) WITH ORDINALITY AS d(document, n) USING (n)
+  JOIN unnest($4::text[]) WITH ORDINALITY AS o(op, n) USING (n)
+  JOIN unnest($5::text[]) WITH ORDINALITY AS k(kind, n) USING (n)
 `
 
 type StorePreparedRecordsParams struct {
 	OutboxID  string
 	RecordIds []string
 	Documents [][]byte
+	Ops       []string
+	Kinds     []string
 }
 
 // The statements below work the records of one delivery (outbox_record). They all run bound to
@@ -632,7 +657,13 @@ type StorePreparedRecordsParams struct {
 // over is refused there and never reaches this, so two workers cannot both store the records of
 // one delivery and meet on the primary key.
 func (q *Queries) StorePreparedRecords(ctx context.Context, arg StorePreparedRecordsParams) error {
-	_, err := q.db.Exec(ctx, storePreparedRecords, arg.OutboxID, arg.RecordIds, arg.Documents)
+	_, err := q.db.Exec(ctx, storePreparedRecords,
+		arg.OutboxID,
+		arg.RecordIds,
+		arg.Documents,
+		arg.Ops,
+		arg.Kinds,
+	)
 	return err
 }
 

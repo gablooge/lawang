@@ -9,7 +9,13 @@
 -- carrying {A, B} took the two locks in the opposite order to one carrying {B, C}, which is a
 -- deadlock and not a wait. Sorting the hashes makes that unwritable instead of improbable, and
 -- two entities whose keys collide now really do only wait for each other.
-SELECT DISTINCT hashtextextended(@tenant_id::text || chr(31) || @provider::text || chr(31) || e, 0) AS lock_key
+--
+-- The high bit is cleared, which puts every entity lock in the non-negative half of Postgres's
+-- one advisory-lock namespace. internal/outbox sets it on its ordering keys, so the two halves
+-- are disjoint by construction: see the order below.
+SELECT DISTINCT
+       (hashtextextended(@tenant_id::text || chr(31) || @provider::text || chr(31) || e, 0)
+          & 9223372036854775807::bigint)::bigint AS lock_key
   FROM unnest(@external_ids::text[]) AS e;
 
 -- name: LockEntityKey :exec
@@ -44,15 +50,32 @@ SELECT DISTINCT hashtextextended(@tenant_id::text || chr(31) || @provider::text 
 --
 -- Postgres has ONE advisory lock namespace, a 64 bit key with no classid split, and two modules
 -- take locks in it: internal/outbox over (tenant, ordering key), and this one over (tenant,
--- provider, external id). The order between them, for any transaction that ever holds both, is
--- **the outbox's ordering-key lock first, then the entity locks**, ascending by key.
+-- provider, external id). The rule for a transaction that ever holds both is one sentence:
+-- **take every advisory lock ascending by key**.
+--
+-- That is a total order, and it needs no premise about the two modules' keys, because the
+-- namespace is split by construction. The outbox sets the high bit of its key and this
+-- statement clears it, so an ordering-key value is always negative, an entity-key value is
+-- always non-negative, and the two sets are disjoint. Ascending order therefore puts every
+-- ordering-key lock before every entity lock on its own, which is the order the rule used to
+-- state as two clauses ("the ordering-key lock first, then the entity locks").
+--
+-- The split is the point. The rule used to be two clauses over one undivided namespace, and it
+-- was a total order only while no ordering-key value ever equalled an entity-key value. Nothing
+-- enforced that, and it is exactly the "at 64 bits it will not happen" reasoning the paragraph
+-- above exists to delete: with K an ordering key equal to entity key b, a transaction holding
+-- {K, a, b} takes K then a then b, while a Prepare holding {b, K} would take b then K, and the
+-- two deadlock. (The two formulas cannot collide other than by hash: the outbox hashes
+-- tenant \x1f provider:subscription and this hashes tenant \x1f provider \x1f external_id, and
+-- a provider key admits neither ':' nor \x1f, so the strings always differ.) Each half still
+-- holds 63 bits, and a collision WITHIN a half is a wait and not a deadlock, which is what the
+-- paragraph above is about.
 --
 -- Nothing in the drain holds both today. The worker prepares a delivery in a transaction that
 -- takes only entity locks, and finishes it in a later transaction that takes only the ordering
 -- key's (internal/outbox, finishIn). The rule is written down because the next thing that works
 -- an outbox row and a chain in one transaction (a reconciliation pass, a repair, a batch
--- finisher) would otherwise pick an order by accident, and the two orders deadlock against each
--- other with nothing in either module to see. ADR 12, decision 1 states it beside this
+-- finisher) would otherwise pick an order by accident. ADR 12, decision 1 states it beside this
 -- paragraph.
 SELECT pg_advisory_xact_lock(@lock_key::bigint);
 

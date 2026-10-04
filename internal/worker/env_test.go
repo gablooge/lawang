@@ -57,7 +57,10 @@ type env struct {
 
 // setup gives a test its own migrated database, as the non-superuser application role, a drain
 // over the fake provider, and a strict stub sink behind a Sinks the test can break.
-func setup(t *testing.T, opts worker.Options) *env {
+//
+// providers replaces the fake provider, for the one test that needs a provider whose API fails
+// in a way of its own. It keeps the same key, so nothing else about a test changes.
+func setup(t *testing.T, opts worker.Options, providers ...provider.Provider) *env {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	t.Cleanup(cancel)
@@ -71,7 +74,10 @@ func setup(t *testing.T, opts worker.Options) *env {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	reg, err := provider.NewRegistry(fake.New(fake.DefaultKey))
+	if len(providers) == 0 {
+		providers = []provider.Provider{fake.New(fake.DefaultKey)}
+	}
+	reg, err := provider.NewRegistry(providers...)
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
@@ -116,9 +122,13 @@ type sinks struct {
 	// plainErr is returned by Deliver instead of a *sink.Fault, which no sink may do.
 	plainErr error
 	// reject names record ids the receiver refuses, and extra names ids it refuses that were
-	// never offered to it.
+	// never offered to it. rejectDetail is the Detail each Rejection carries, which a sink
+	// this repository did not write chooses freely.
 	reject map[string]bool
 	extra  []string
+	// rejectAll refuses every record offered, for a test that does not know the record ids.
+	rejectAll    bool
+	rejectDetail string
 	// before runs at the start of every Deliver, for the tests that need to be inside the sink
 	// call when something else happens (a shutdown).
 	before func()
@@ -159,16 +169,17 @@ func (s *sinks) Deliver(ctx context.Context, t tenancy.ID, recs []record.Record)
 		s.mu.Unlock()
 		return sink.DeliveryResult{}, fault
 	}
-	reject, extra := s.reject, s.extra
+	reject, extra, detail, all := s.reject, s.extra, s.rejectDetail, s.rejectAll
 	s.mu.Unlock()
 
 	var result sink.DeliveryResult
 	var taken []record.Record
 	for _, r := range recs {
-		if reject[r.ID] {
+		if all || reject[r.ID] {
 			result.Rejected = append(result.Rejected, sink.Rejection{
-				ID:    r.ID,
-				Cause: outbox.NewCause(outbox.ClassSinkRejected).WithCode("unsupported_kind"),
+				ID:     r.ID,
+				Cause:  outbox.NewCause(outbox.ClassSinkRejected).WithCode("unsupported_kind"),
+				Detail: detail,
 			})
 			continue
 		}
@@ -176,7 +187,9 @@ func (s *sinks) Deliver(ctx context.Context, t tenancy.ID, recs []record.Record)
 	}
 	for _, id := range extra {
 		result.Rejected = append(result.Rejected, sink.Rejection{
-			ID: id, Cause: outbox.NewCause(outbox.ClassSinkRejected).WithCode("invented"),
+			ID:     id,
+			Cause:  outbox.NewCause(outbox.ClassSinkRejected).WithCode("invented"),
+			Detail: detail,
 		})
 	}
 	// Everything the receiver did not refuse goes to the strict stub, which is what actually

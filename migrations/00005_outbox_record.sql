@@ -27,12 +27,36 @@ CREATE TABLE outbox_record (
   -- Validate and whose seal was intact at the moment it was stored. The wire name is NOT applied
   -- (principle 4: it is the sink's, and two sinks may call one source two things), so the stored
   -- document carries the internal provider key in "source" and internal/record can mint the id
-  -- again from it and refuse a document that does not hash to the id beside it (record.Reopen).
+  -- again from it (record.Reopen).
+  --
+  -- record.Reopen refuses a document that does not mint record_id, the column above, under the
+  -- provider and the tenant the row is read back for, and it refuses one whose op or kind is not
+  -- the pair of columns below.
   --
   -- bytea, like outbox.raw_body, and not jsonb: jsonb reorders members, drops a repeated name and
   -- rewrites numbers, and this column holds bytes that were already checked rather than a document
   -- to query.
   document    bytea       NOT NULL,
+  -- The record's op and kind, as record.Record carries them.
+  --
+  -- They are columns because record.Reopen cannot get them from the document: a record id hashes
+  -- the provider, the external id, the version, the scope and the tenant and does NOT hash these
+  -- two, so a document whose op was edited from "upsert" to "delete" mints the id it already
+  -- carries and nothing inside it disagrees. The record's seal covers both, for the reason
+  -- record.seal gives, and a seal cannot survive a round trip through a table: it is recomputed
+  -- from the document's own values when the document is decoded. So the two fields the seal
+  -- covers beyond the id travel beside the document instead, and Reopen holds the one against
+  -- the other.
+  --
+  -- The consequence of not having them: one edited field in document turns a delivery into a
+  -- tombstone, and the receiver removes the entity.
+  --
+  -- The values are checked as non-empty and no further. The closed sets are record.Op and
+  -- record.Kind, where a new member is a new format version (record.FormatV1), and a copy of
+  -- them here would be a second list to keep in step for no gain: nothing is delivered from
+  -- these columns, they are only ever compared with what the document says.
+  op          text        NOT NULL CHECK (op <> ''),
+  kind        text        NOT NULL CHECK (kind <> ''),
   state       text        NOT NULL DEFAULT 'prepared'
                           CHECK (state IN ('prepared', 'delivered', 'dead')),
   -- As on outbox, and under the same rule: plain text an operator reads and every backup carries,
@@ -59,8 +83,14 @@ ALTER TABLE outbox_record FORCE ROW LEVEL SECURITY;
 -- with a record missing from it and mark the delivery delivered, which is the silent loss this
 -- whole table exists to remove. Keeping the tenant in one place makes that unwritable rather than
 -- merely wrong, with no composite foreign key and no second unique index on the hot outbox table
--- to maintain it. The cost is a primary-key probe of outbox per row, which the planner runs as a
--- semi-join.
+-- to maintain it.
+--
+-- The cost is a primary-key probe of outbox per candidate row. The planner does NOT flatten this
+-- into a semi-join: it keeps a correlated SubPlan and re-executes it per row, and for an UPDATE
+-- it plans the SubPlan twice, once for USING and once for WITH CHECK. Measured on 50,000
+-- deliveries over 200 tenants and 150,000 record rows, every statement of this table is an index
+-- probe between 0.05 and 0.32 ms and under 50 shared buffers, so the probe is what it costs and
+-- the plan is what to expect from EXPLAIN.
 --
 -- The helper roles are granted nothing on this table, as on no table holding a payload: the drain
 -- claims across tenants as lawang_worker and reads what it prepared as the application role,

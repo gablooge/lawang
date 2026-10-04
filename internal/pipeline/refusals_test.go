@@ -344,9 +344,11 @@ func TestEntityLocksAreTakenInOneOrder(t *testing.T) {
 			t.Errorf("LockOrder(%v) = %v, want %v: two deliveries of the same entities must lock in one order", keys, got, want)
 		}
 	}
-	// A negative key is not an edge case to skip: hashtextextended returns a signed 64 bit
-	// value, so half the keys there are sort below zero, and a sort that treated them as
-	// unsigned would order two deliveries differently.
+	// A negative key is not an edge case to skip. An entity key is non-negative now (the high
+	// bit is this module's half of the one advisory-lock namespace, ADR 12 decision 1), but
+	// the outbox's keys are the negative half, so the order the whole rule rests on is a
+	// signed one: a sort that treated a key as unsigned would put an entity lock before an
+	// ordering-key lock and invert the cross-module order.
 	if got := pipeline.LockOrder([]int64{-1, 1}); !slices.Equal(got, []int64{-1, 1}) {
 		t.Errorf("LockOrder of a negative and a positive key = %v, want the negative first", got)
 	}

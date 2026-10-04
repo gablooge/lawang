@@ -448,17 +448,26 @@ func (o *Outbox) Release(ctx context.Context, c Claimed) error {
 }
 
 // PreparedRecord is one record a delivery was prepared into: the record id a sink is idempotent
-// on, and the document that sink receives.
+// on, the document that sink receives, and the two fields of the record's seal that its id does
+// not hash.
 //
 // The document is what record.Record.MarshalJSON wrote, with no wire name applied, because the
 // wire name is the sink's and two sinks may call one source two things (principle 4). It is
 // stored and not re-derived, because record_ledger holds what was PREPARED: a worker that
 // prepared a delivery and then died would skip every one of its own records on the next attempt
-// and deliver nothing. record.Reopen reads one back and refuses a document that does not hash to
-// the record id stored beside it.
+// and deliver nothing. record.Reopen reads one back and refuses a document that does not mint
+// the record id stored beside it, or whose op or kind is not the pair stored beside it.
+//
+// This package never looks inside a document and never reads Op or Kind for anything: they are
+// text it stores and hands back, and record.Stored is where their meaning is. They are here
+// rather than in the document because a seal cannot survive a round trip through a table (it is
+// recomputed from the document's own values on the way back), so the two fields the seal covers
+// beyond the id have to travel beside it.
 type PreparedRecord struct {
 	RecordID string
 	Document []byte
+	// Op and Kind are record.Record's Op and Kind as strings. Neither may be empty.
+	Op, Kind string
 }
 
 // PrepareIn stores the records a delivery was prepared into and moves the row to prepared, in
@@ -492,14 +501,21 @@ func (o *Outbox) PrepareIn(ctx context.Context, tx pgx.Tx, c Claimed, recs []Pre
 	}
 	ids := make([]string, len(recs))
 	docs := make([][]byte, len(recs))
+	ops := make([]string, len(recs))
+	kinds := make([]string, len(recs))
 	for i, r := range recs {
 		if r.RecordID == "" || !storable(r.RecordID) {
 			return errors.New("outbox: a prepared record needs a storable record id")
 		}
-		ids[i], docs[i] = r.RecordID, r.Document
+		// As for the record id: the alternative to asking is SQLSTATE 22021 or a CHECK
+		// violation, neither of which a caller can tell from an outage.
+		if r.Op == "" || !storable(r.Op) || r.Kind == "" || !storable(r.Kind) {
+			return errors.New("outbox: a prepared record needs a storable op and kind")
+		}
+		ids[i], docs[i], ops[i], kinds[i] = r.RecordID, r.Document, r.Op, r.Kind
 	}
 	if err := q.StorePreparedRecords(ctx, outboxdb.StorePreparedRecordsParams{
-		OutboxID: c.id, RecordIds: ids, Documents: docs,
+		OutboxID: c.id, RecordIds: ids, Documents: docs, Ops: ops, Kinds: kinds,
 	}); err != nil {
 		return fmt.Errorf("outbox: store the prepared records: %w", err)
 	}
@@ -520,7 +536,7 @@ func (o *Outbox) PreparedRecords(ctx context.Context, c Claimed) ([]PreparedReco
 		}
 		out = make([]PreparedRecord, len(rows))
 		for i, r := range rows {
-			out[i] = PreparedRecord{RecordID: r.RecordID, Document: r.Document}
+			out[i] = PreparedRecord{RecordID: r.RecordID, Document: r.Document, Op: r.Op, Kind: r.Kind}
 		}
 		return nil
 	})

@@ -44,6 +44,12 @@ One binary, two roles, one database.
 
 Other subcommands: `migrate`, `connect <provider>`, `reconcile <tenant> <provider>`, `version`.
 
+**`lawang worker` is not wired up yet** (as of B10). The drain is a package, `internal/worker`,
+used by its tests and by B12, and the command exits with "not built yet": a drain needs a sink
+per tenant, and that configuration arrives with the vault (B13) and the operator API (B14).
+This table describes the role the command will have, and everything else in this document
+describes the drain as it is built.
+
 There is **no message broker**. The only queue is the `outbox` table. Retries and the dead-letter
 queue are row states, not topics, so replaying a dead letter is an `UPDATE`, not a re-publish.
 
@@ -343,12 +349,16 @@ should accept in a stable key order or be ready to retry a deadlock.
 
 **One namespace, one order.** Postgres has a single advisory-lock namespace (a 64 bit key, with
 no classid split), and two modules take locks in it: the outbox over (tenant, ordering key),
-and `internal/pipeline` over (tenant, provider, external id) for the supersede chain. For any
-transaction that ever holds both, the order is **the ordering-key lock first, then the entity
-locks**, ascending by key ([ADR 12](adr/0012-ledger-supersede-masking.md) decision 1). Nothing
-in the drain holds both today, since step 6 takes only entity locks and step 7 only the
-ordering key's, but the rule is written down because the two orders deadlock against each other
-and nothing in either module would show it.
+and `internal/pipeline` over (tenant, provider, external id) for the supersede chain. The rule
+for any transaction that ever holds both is **take every advisory lock ascending by key**
+([ADR 12](adr/0012-ledger-supersede-masking.md) decision 1). It is a total order with no
+premise attached, because the namespace is split by construction: the outbox sets the high bit
+of its key and the pipeline clears it, so an ordering-key value is always negative, an
+entity-key value is always non-negative, and ascending order puts the ordering key first by
+itself. Each module keeps 63 bits, and a collision within a module is a wait and not a
+deadlock. Nothing in the drain holds both today, since step 6 takes only entity locks and step
+7 only the ordering key's, but the rule is written down because the two orders deadlock against
+each other and nothing in either module would show it.
 
 The same lock keeps the head marker. The transitions that finish a row take it too, before
 anything else, so the writers of one key (accept, replay, delivered, dead) run strictly one

@@ -50,6 +50,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,6 +71,25 @@ import (
 // shapes this can take, a tenant nobody has configured a sink for (an operator acts) and a
 // vault that cannot be reached right now (it comes back by itself), without either of them
 // spending the retry ladder.
+//
+// # An implementation returns one sink per tenant and keeps it
+//
+// Sink is called once per delivery, and a sink owns a connection pool: sink.NewHTTP gives each
+// one a cloned *http.Transport of its own, because sharing http.DefaultTransport capped the
+// idle connections per host at two and cost 1,480 failed deliveries against 209 (issue #9,
+// measured on pull request #55). An implementation that builds a sink per call throws that
+// measurement away and pays a TCP and TLS handshake per delivery instead, which is what the
+// shape of this signature invites: a context and a tenant in, a sink out, which is what a vault
+// lookup looks like.
+//
+// It also leaks. Neither sink.Sink nor sink.HTTP has a Close, so nothing calls
+// CloseIdleConnections on a transport that is dropped, and each abandoned one holds up to
+// MaxIdleConnsPerHost sockets open until IdleConnTimeout (90 seconds by default). At one
+// delivery a second that is up to 90 live transports at once.
+//
+// So: cache by tenant, build on a miss, and when a tenant's configuration changes, call
+// CloseIdleConnections on the transport of the sink being replaced before dropping it. A sink
+// is safe for concurrent use, and the drain calls one from every goroutine of the pool.
 type Sinks interface {
 	Sink(ctx context.Context, t tenancy.ID) (sink.Sink, error)
 }
@@ -243,8 +263,22 @@ func (d *Drain) wait(ctx context.Context) {
 // and the batch is only a way of paying for one claim instead of several. A batch that takes
 // longer than the lease is possible and is safe: every transition is guarded by the lease
 // token, so a row taken over meanwhile is refused rather than written twice, and the sink's
-// idempotence makes the repeated delivery a no-op. It costs the repeat, which is why the
-// defaults keep a batch well inside a lease.
+// idempotence makes the repeated delivery a no-op.
+//
+// The bound an operator should know is Batch x RowTimeout against Lease, and the defaults do
+// NOT keep a batch inside a lease: 5 rows at 90 seconds is 450 seconds against a 2 minute
+// lease, and it does not take the worst case to get there, since the http sink's own default
+// timeout is 30 seconds and three rows that each hit it already exceed the lease. NewDrain
+// relates RowTimeout to Lease and deliberately not the product, because clamping the product
+// would mean either a batch of one or a lease measured in tens of minutes, and a long lease is
+// how long a crashed worker's rows sit undeliverable.
+//
+// So this is the real bound: while a sink is slow rather than broken, the tail of a batch is
+// worked after its own lease has expired, those rows are delivered a second time by whoever
+// claimed them next (safe, by idempotence, and paid for), every transition on them is refused,
+// and the drain logs "could not record a delivery that was made" and "the lease was lost
+// before the delivery was recorded" once per such row. An operator seeing those together is
+// looking at a slow sink and should lower Batch or raise Lease.
 func (d *Drain) once(ctx context.Context) (int, error) {
 	claimed, err := d.ob.Claim(ctx, d.opts.Batch, d.opts.Lease)
 	if err != nil {
@@ -337,7 +371,12 @@ func (d *Drain) readyRecords(ctx context.Context, log *slog.Logger, c outbox.Cla
 		}
 		recs := make([]record.Record, 0, len(stored))
 		for _, s := range stored {
-			r, err := record.Reopen(s.Document, work.Provider, c.Tenant())
+			// Everything the row holds about the record, not the document alone: the record id
+			// the row is keyed on, and the op and kind the document's own seal cannot vouch
+			// for (record.Stored).
+			r, err := record.Reopen(record.Stored{
+				ID: s.RecordID, Op: record.Op(s.Op), Kind: record.Kind(s.Kind), Document: s.Document,
+			}, work.Provider, c.Tenant())
 			if err != nil {
 				// The document in the table is not this tenant's record, or not a record at
 				// all. Another attempt reads the same bytes, so it is a dead letter, and the
@@ -357,8 +396,9 @@ func (d *Drain) readyRecords(ctx context.Context, log *slog.Logger, c outbox.Cla
 	})
 	if err != nil {
 		// Normalize's one outside call is the provider's, so a failure that is not a dead
-		// letter is the provider's API.
-		d.failPipeline(ctx, log, c, outbox.ClassProviderUnavailable, err)
+		// letter is the provider's API, and the error may carry the provider's own text
+		// (outside says why that is not logged as it is).
+		d.failPipeline(ctx, log, c, outbox.ClassProviderUnavailable, err, outside(err))
 		return nil, false
 	}
 
@@ -389,7 +429,9 @@ func (d *Drain) readyRecords(ctx context.Context, log *slog.Logger, c outbox.Cla
 			log.Info("the lease was lost before this delivery was prepared, so another worker has it")
 			return nil, false
 		}
-		d.failPipeline(ctx, log, c, outbox.ClassInternal, err)
+		// Prepare, documentsOf and PrepareIn are all this program's own code, talking to this
+		// program's own database, so the error is logged as it is.
+		d.failPipeline(ctx, log, c, outbox.ClassInternal, err, err)
 		return nil, false
 	}
 	return out.Records, true
@@ -408,7 +450,11 @@ func documentsOf(recs []record.Record) ([]outbox.PreparedRecord, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: a prepared record cannot be written: %w", pipeline.ErrDeadLetter, err)
 		}
-		out = append(out, outbox.PreparedRecord{RecordID: r.ID, Document: doc})
+		// Op and Kind go beside the document, because the id does not hash them and a decoded
+		// document's seal is recomputed from its own values: see record.Stored.
+		out = append(out, outbox.PreparedRecord{
+			RecordID: r.ID, Document: doc, Op: string(r.Op), Kind: string(r.Kind),
+		})
 	}
 	return out, nil
 }
@@ -423,7 +469,9 @@ func (d *Drain) deliver(ctx context.Context, log *slog.Logger, c outbox.Claimed,
 	}
 	snk, err := d.sinks.Sink(ctx, c.Tenant())
 	if err != nil {
-		d.halt(ctx, log, c, outbox.NewCause(outbox.ClassInternal).WithCode(codeNoSink), err)
+		// Sinks is the operator's own code, and from B13 a vault client: outside says why its
+		// error is not logged as it is.
+		d.halt(ctx, log, c, outbox.NewCause(outbox.ClassInternal).WithCode(codeNoSink), outside(err))
 		return
 	}
 
@@ -433,21 +481,31 @@ func (d *Drain) deliver(ctx context.Context, log *slog.Logger, c outbox.Claimed,
 	var fault *sink.Fault
 	switch {
 	case errors.As(err, &fault):
+		// A Fault built in internal/sink carries nothing but constants of this program, and a
+		// Fault from a sink this repository did not write may not: outside is where the two
+		// are told apart.
+		why := outside(err)
 		switch fault.Action {
 		case sink.ActionRetry:
-			d.fail(ctx, log, c, fault.Cause, fault)
+			d.fail(ctx, log, c, fault.Cause, why)
 		case sink.ActionHalt:
-			d.halt(ctx, log, c, fault.Cause, fault)
-		case sink.ActionUnset:
-			d.halt(ctx, log, c, outbox.NewCause(outbox.ClassInternal).WithCode(codeSinkContract), fault)
+			d.halt(ctx, log, c, fault.Cause, why)
 		default:
-			d.halt(ctx, log, c, outbox.NewCause(outbox.ClassInternal).WithCode(codeSinkContract), fault)
+			// Every other Action, sink.ActionUnset (the zero value, which no Fault built in
+			// internal/sink carries) and any action a later version of that package adds that
+			// this one does not know. There is deliberately no arm of its own for the zero
+			// value: it would be byte-identical to this one, so the compiler could not tell
+			// the two apart and neither could a reader asking which arm a given Fault took.
+			// An unforeseen case stalls, because a retry here ends at a dead letter.
+			d.halt(ctx, log, c, outbox.NewCause(outbox.ClassInternal).WithCode(codeSinkContract), why)
 		}
 	case err != nil:
 		// A sink reports a failed delivery as a *sink.Fault and in no other way. Something else
 		// is a sink that is broken, and nothing is known about what reached the receiver, so
-		// the row stalls instead of walking a ladder that ends in a dead letter.
-		d.halt(ctx, log, c, outbox.NewCause(outbox.ClassInternal).WithCode(codeSinkContract), err)
+		// the row stalls instead of walking a ladder that ends in a dead letter. It is also a
+		// value from outside: a sink that does not keep the error contract is the last one to
+		// trust with the text of its error.
+		d.halt(ctx, log, c, outbox.NewCause(outbox.ClassInternal).WithCode(codeSinkContract), outside(err))
 	default:
 		dead, err := deadRecords(result.Rejected, recs)
 		if err != nil {
@@ -458,12 +516,73 @@ func (d *Drain) deliver(ctx context.Context, log *slog.Logger, c outbox.Claimed,
 			return
 		}
 		for _, r := range result.Rejected {
-			// Detail is this package's own phrase and is not stored, so the log line is the
-			// only place it is ever seen.
-			log.Warn("the sink refused a record", "record_id", r.ID, "cause", r.Cause.String(), "detail", r.Detail)
+			// Detail is not stored, so the log line is the only place it is ever seen. It is
+			// one of internal/sink's own phrases when internal/sink built the Rejection, and
+			// anything at all when another sink did, so it is printed only while that package
+			// vouches for it. The record id needs no such check: deadRecords has already
+			// refused an answer naming anything that was not in the batch, so by here every id
+			// is one of ours.
+			detail := r.Detail
+			if !sink.KnownDetail(detail) {
+				detail = "withheld: not a phrase internal/sink knows"
+			}
+			log.Warn("the sink refused a record", "record_id", r.ID, "cause", r.Cause.String(), "detail", detail)
 		}
 		d.finish(ctx, log, c, dead)
 	}
+}
+
+// maxWhyDepth bounds how far outside unwraps an error chain. A chain is built by whoever
+// returned the error, so its length is theirs to choose, and a log attribute is not the place
+// to find out how long it is.
+const maxWhyDepth = 8
+
+// outsideText is what the drain prints about an error it did not build. It is an error so that
+// it goes into the same "why" attribute as the ones the drain did build.
+type outsideText string
+
+func (t outsideText) Error() string { return string(t) }
+
+// outside reduces an error that reached the drain across one of the three interfaces somebody
+// else implements, provider.Provider (through pipeline.Normalize), Sinks and sink.Sink, to
+// something this package is willing to write down.
+//
+// The text of such an error is not ours to trust. net/http returns a *url.Error whose text
+// quotes the request URL with its query string, which is where several receivers and several
+// provider APIs take their API key, and issue #9's acceptance is that this exact text appears
+// in nothing a failed delivery produces. internal/sink removed it from everything it hands
+// back; logging err.Error() here would put it back one layer up, in a log line, which is where
+// the project already decided it must not be.
+//
+// A *sink.Fault is this program's own type and every part of it is a constant of this program:
+// the Action, the outbox.Cause (which Cause.WithCode filters) and a Detail that is one of
+// internal/sink's phrases. A Sink this repository did not write can put anything in Detail, so
+// the Detail is checked (sink.KnownDetail) rather than assumed, and a Fault that passes is
+// logged as it is, because it is the one thing a broken sink returns that an operator can read.
+//
+// Everything else becomes the chain of concrete types, which names the shape of the failure
+// without quoting any value the failing call was given. The cost is real: an operator debugging
+// a provider outage gets "*url.Error wrapping *net.OpError" and the Cause, and not the message
+// the provider wrote. That is the same trade internal/sink made one layer down, and a provider
+// that wants its message read should return an error of its own with nothing of the request in
+// it (noted on issue #11).
+func outside(err error) error {
+	var fault *sink.Fault
+	if errors.As(err, &fault) && sink.KnownDetail(fault.Detail) {
+		return fault
+	}
+	var b strings.Builder
+	for i := 0; err != nil && i < maxWhyDepth; i++ {
+		if i > 0 {
+			b.WriteString(" wrapping ")
+		}
+		fmt.Fprintf(&b, "%T", err)
+		err = errors.Unwrap(err)
+	}
+	if err != nil {
+		b.WriteString(" wrapping more")
+	}
+	return outsideText(b.String())
 }
 
 // deadRecords turns the sink's rejections into the outbox's per-record dead letters, and refuses
@@ -473,6 +592,11 @@ func (d *Drain) deliver(ctx context.Context, log *slog.Logger, c outbox.Claimed,
 // batch was taken", so an id that was not in the batch, or one named twice, makes the whole
 // sentence unreadable: the outbox would be told to kill a record of some other delivery, or to
 // mark delivered a record the sink refused under its other mention.
+//
+// Neither error quotes the id. An id that was not in the batch is a string the sink chose, and
+// this error is logged, so quoting it would be the drain writing down a value a sink invented
+// (issue #9). The id that was offered is in the delivery's own records, where an operator
+// looking at the row can see it; what the sink made up belongs in what the sink logs.
 func deadRecords(rejected []sink.Rejection, offered []record.Record) ([]outbox.DeadRecord, error) {
 	if len(rejected) == 0 {
 		return nil, nil
@@ -486,9 +610,9 @@ func deadRecords(rejected []sink.Rejection, offered []record.Record) ([]outbox.D
 	for _, r := range rejected {
 		switch {
 		case !inBatch[r.ID]:
-			return nil, fmt.Errorf("worker: the sink refused a record that was not in the batch: %s", r.ID)
+			return nil, errors.New("worker: the sink refused a record that was not in the batch")
 		case seen[r.ID]:
-			return nil, fmt.Errorf("worker: the sink refused one record twice: %s", r.ID)
+			return nil, errors.New("worker: the sink refused one record twice")
 		}
 		seen[r.ID] = true
 		dead = append(dead, outbox.DeadRecord{RecordID: r.ID, Cause: r.Cause})
@@ -536,12 +660,15 @@ func (d *Drain) fail(ctx context.Context, log *slog.Logger, c outbox.Claimed, ca
 
 // failPipeline is fail or dead, by the one distinction internal/pipeline makes: an error that
 // wraps ErrDeadLetter is one the same bytes produce again.
-func (d *Drain) failPipeline(ctx context.Context, log *slog.Logger, c outbox.Claimed, class outbox.Class, err error) {
+//
+// err decides, and why is what is written down. The two differ on the one path where the error
+// may carry a provider's own text: see outside.
+func (d *Drain) failPipeline(ctx context.Context, log *slog.Logger, c outbox.Claimed, class outbox.Class, err, why error) {
 	if errors.Is(err, pipeline.ErrDeadLetter) {
-		d.dead(ctx, log, c, outbox.NewCause(outbox.ClassNormalizer), err)
+		d.dead(ctx, log, c, outbox.NewCause(outbox.ClassNormalizer), why)
 		return
 	}
-	d.fail(ctx, log, c, outbox.NewCause(class), err)
+	d.fail(ctx, log, c, outbox.NewCause(class), why)
 }
 
 // dead parks the row, for a failure that the same bytes will produce again.
