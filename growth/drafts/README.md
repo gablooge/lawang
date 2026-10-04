@@ -90,7 +90,9 @@ dot is easy to miss while reviewing.
    gone. It was not true for the kind of pull request the guide is written for. It is replaced by
    a measurement from this repository's own pull requests, dated 2026-10-04, which says days to
    weeks for anything outside the backlog queue. Re-measure it before the file moves, and again
-   whenever it starts to flatter the project.
+   whenever it starts to flatter the project. It has been measured three times now and corrected
+   twice: every pull request in the repository is counted in it today, seventeen of them, rather
+   than a chosen sample.
 4. **`good first issue` labels.** The label exists and no issue carries it. `first-issues.md` has
    six candidates, all re-verified on 2026-10-04. Opening even two of them changes what a visitor
    sees.
@@ -100,6 +102,12 @@ dot is easy to miss while reviewing.
    enable Discussions, revisit both files: the question template says "Discussions are not
    enabled, so questions are issues", and the config sends people to the backlog and the
    architecture partly because there is nowhere else to send them.
+6. **A reminder for the day the conduct address stops working.** The project's only conduct route
+   is `conduct@samsulhadi.com`, on a domain you own. If the domain lapses, or the mail stops being
+   collected, the code of conduct keeps sending strangers to an address that goes nowhere and
+   nothing in the repository will notice. This is the same shape as item 5: a true statement with
+   no mechanism to catch it becoming false. A dead single route is worse than a visible
+   placeholder, because a placeholder at least tells the reader to look somewhere else.
 
 ## What is deliberately not here
 

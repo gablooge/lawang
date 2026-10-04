@@ -200,18 +200,37 @@ from outside the project is not. Measured from this repository's own pull reques
 
 | Kind of pull request | First review | Opened to merged |
 |---|---|---|
-| A backlog item, in queue order | 16 to 103 minutes (#47, #51, #53, #56, #57) | 11 and 12 days for the two slowest (#48, #49), which waited on the branch below them |
-| Anything else | two weeks. #35 and #46 each got a first review 15 days after they were opened, and #45 had none after 14 days | none of the three had merged |
+| A backlog item, in queue order. Ten so far | 16 to 103 minutes, every one of them | 4 hours 34 minutes to 12 days. The two slowest are #48 and #49, and the reason is below |
+| Everything else. Seven so far | 16 minutes to 15 days. Three were read within eight hours (#33, #44, #51), three waited two weeks (#35, #45, #46), and #34 was merged with no review posted at all | #33, #34, #44 and #51 merged inside a day. The three that waited are still open |
 
 So the honest recent range for a pull request from outside the queue is **days to weeks**, and the
 longest wait on record is the one a contributor would be in. One person maintains this in their
 spare time. There is no service level agreement, no promise and no target: the table is a
 measurement of the past, not a commitment about the future, and it may get better or worse.
 
-Two things make it so, and both are mechanisms rather than moods. The queue comes first, because
-the backlog is what gets the project to a release. And every round above is a person deciding to
-sit down and run the cycle. A quiet fortnight is capacity, not disregard, and a polite comment on
-a quiet pull request is welcome.
+**What the second row really measures**, because the label is wider than the thing. It is not
+"not a backlog item". Four pull requests outside the queue were handled as fast as anything in it.
+The three that waited two weeks (#35 waited 15 days, #45 and #46 waited 14 days each, and all
+three were still open on 2026-10-04) are documentation and growth branches, opened within two days
+of each other, and they were parked while the queue ran. The split is between what the maintainer
+was working on at the time and what was parked. Your pull request will in practice be the parked
+kind, which is why days to weeks is the number to plan for, but the mechanism is attention and not
+a rule about labels.
+
+**And the eleven days in the first row are not a stacking delay.** #48 was opened on
+2026-09-21T01:23:45Z, first reviewed 41 minutes later, approved at 03:04:26Z, and approved again
+after a close-out delta review at 04:34:58Z. It then sat approved, green and unblocked until it
+was merged on 2026-10-02T13:47:29Z, 11 days and 9 hours later. Nothing was below it to wait for:
+#47 had already merged 54 minutes before #48 was opened. #49 is the one that did wait on the
+branch below it, because its branch carried #48's commits and could not go in first, and it merged
+18 hours after #48 did. So the longest wait in the queue row is the merge step, and the merge step
+is the same one person as everything else here.
+
+Three things make it so, and all three are mechanisms rather than moods. The queue comes first,
+because the backlog is what gets the project to a release. Every round above is a person deciding
+to sit down and run the cycle. And merging is a person too, even after the review has said yes. A
+quiet fortnight is capacity, not disregard, and a polite comment on a quiet pull request is
+welcome.
 
 **A finding is not a rejection.** Most pull requests here, including the maintainer's own, get
 findings. That is what the review is for. You have two good answers to any finding: fix it, or
@@ -254,4 +273,7 @@ licensed under it. There is no contributor licence agreement to sign.
 
 ## Code of conduct
 
-By taking part you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+By taking part you agree to the [Code of Conduct](CODE_OF_CONDUCT.md). Conduct reports go to
+conduct@samsulhadi.com. If the report is about the maintainer, the Code of Conduct has a
+subsection that says what to do, because there is no independent person inside this project to
+send it to.
