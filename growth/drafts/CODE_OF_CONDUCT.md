@@ -36,9 +36,23 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement at [INSERT CONTACT METHOD]. All complaints will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement at conduct@samsulhadi.com. All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the reporter of any incident.
+
+### Who reads a report, and what to do if it is about them
+
+*This subsection is the Lawang project's own addition. It is not part of Contributor Covenant 2.1, which assumes a group of community leaders where this project has one person. Everything else in this file is the Covenant, unchanged.*
+
+Lawang has one maintainer, Samsul Hadi ([@gablooge](https://github.com/gablooge)), and today they are the only person who reads conduct@samsulhadi.com. Wherever this document says "community leaders", read it as whoever holds that role at the time, which is currently one person. The promise above to respect a reporter's privacy is made by that person, and you should know how few people that is before you decide what to write.
+
+If your report is about the maintainer, then there is no independent person inside this project to send it to. Saying otherwise would be false, so this document says it plainly instead. What you can do:
+
+* Report it to GitHub, with "Report abuse" on the comment, issue or pull request itself, or through the form at https://support.github.com/contact/report-abuse. GitHub acts under its own Terms of Service and Community Guidelines, and it is outside the maintainer's control, which is the whole reason it is listed first.
+* Say publicly what happened, if you would rather. Nothing in this document asks you to stay quiet about how you were treated.
+* Write to conduct@samsulhadi.com anyway, if you want it on the record with the person it concerns.
+
+Do not send a conduct report through the security advisory form. That channel is for vulnerabilities in the software, and it is read as one.
 
 ## Enforcement Guidelines
 

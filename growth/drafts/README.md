@@ -37,30 +37,43 @@ dot is easy to miss while reviewing.
 
 ## What needs you before any of it moves
 
-1. **The code of conduct contact.** `CODE_OF_CONDUCT.md` is Contributor Covenant 2.1, word for word,
-   with the upstream Hugo front matter removed and nothing else changed. Checked on 2026-10-04
-   against the canonical source
+1. **The code of conduct contact: settled on 2026-10-04, recorded here.** You supplied
+   `conduct@samsulhadi.com` and it is in the file. Nothing is outstanding on this item. What was
+   decided, so that nobody has to reconstruct it later:
+
+   1. **A route that a stranger can use and that you read:** `conduct@samsulhadi.com`, in the
+      "Enforcement" section where the upstream placeholder used to be. Private vulnerability
+      reporting stays what it is, a security channel, and the file now says in as many words not
+      to send a conduct report through the advisory form.
+   2. **Not your personal inbox:** a role address, which is the reason it exists. `CLAUDE.md`
+      keeps anything personal to you out of this repository, and a conduct contact is the one
+      address a bad actor has a motive to abuse. It is now the only real address anywhere in the
+      tree, and it should stay the only one. Everything else that looks like an address is a test
+      fixture under `.invalid`, `.test`, `.example` or `example.com`.
+   3. **Who reads it, named in the file:** you, by name and handle, with the sentence worded so
+      it stays true if that ever changes ("whoever holds that role at the time, which is currently
+      one person"). The reader is named right next to the privacy promise, which is what makes
+      that promise mean anything.
+   4. **What a reporter does when the report is about the only person who reads reports:** the
+      file says plainly that there is no independent route inside the project, because there is
+      not, and then gives the three real options: GitHub's own abuse reporting (first, because it
+      is the one route outside your control), saying publicly what happened, or writing to the
+      address anyway to put it on the record.
+
+   **The file is no longer Contributor Covenant 2.1 word for word, and it says so.** Requirement 4
+   had to be written by this project, so the addition is one clearly marked subsection, which
+   opens by saying it is not part of the Covenant and that everything else in the file is. The
+   verbatim claim above now reads: Contributor Covenant 2.1, unchanged except for the removal of
+   the upstream Hugo front matter and the addition of that one named subsection. Checked on
+   2026-10-04 against the canonical source
    ([text](https://www.contributor-covenant.org/version/2/1/code_of_conduct/),
    [file](https://github.com/EthicalSource/contributor_covenant/blob/release/content/version/2/1/code_of_conduct.md)):
-   with the front matter and its following blank line removed, the two are byte identical.
+   outside that subsection the two are byte identical once the front matter and its following
+   blank line are removed.
 
-   It still holds the upstream placeholder `[INSERT CONTACT METHOD]`, in the "Enforcement" section.
-   No address was invented for you, and no address exists anywhere in this repository today. Only
-   you can choose what goes there. Four things are needed before that file can move to the root:
-
-   1. **A route that a stranger can use and that you read.** An address, or a GitHub-based route.
-      Private vulnerability reporting is enabled on this repository, but it is a security channel
-      and not a conduct channel, so it does not cover this.
-   2. **Not your personal inbox.** `CLAUDE.md` says nothing personal to the maintainer belongs in
-      this repository, and this file is public, permanent and scraped. A conduct contact is the
-      one address a bad actor has a motive to abuse.
-   3. **Who reads it, named in the file.** One maintainer, [@gablooge](https://github.com/gablooge).
-      The promise already in the file to respect a reporter's privacy only means something once
-      the reader is identified.
-   4. **What a reporter does when the report is about the only person who reads reports.**
-      Contributor Covenant 2.1 assumes a plural "community leaders" and this project has one. One
-      honest sentence is better than silence. Note that adding it ends the "word for word" claim
-      above, so say in the file that this sentence is the project's own addition.
+   **Still yours to do, outside this pull request:** the file is a draft under `growth/drafts/`
+   and the code of conduct is not in force until you move it to the repository root. The address
+   is live, so a report could arrive before the file moves.
 2. **The links inside `CONTRIBUTING.md`.** It links to `CODE_OF_CONDUCT.md`, `SECURITY.md`,
    `LICENSE`, `docs/backlog.md`, `docs/architecture.md` and `.claude/agents/pr-reviewer.md`. They
    all resolve once the two new files are at the repository root. Check them after you move the
