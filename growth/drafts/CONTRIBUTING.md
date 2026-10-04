@@ -224,12 +224,21 @@ after a close-out delta review at 04:34:58Z. It then sat approved, green and unb
 was merged on 2026-10-02T13:47:29Z, 11 days and 9 hours later. Nothing was below it to wait for:
 #47 had already merged 54 minutes before #48 was opened. #49 is the one that did wait on the
 branch below it, because its branch carried #48's commits and could not go in first, and it merged
-18 hours after #48 did. So the longest wait in the queue row is the merge step, and the merge step
-is the same one person as everything else here.
+18 hours after #48 did. The branch was not the only thing holding #49, though, and on its own it
+was not enough. #49 was labelled `review:needs-maintainer` at 2026-09-21T08:20:31Z, and nothing at
+all happened on it until 2026-10-02T14:30:50Z, 11 days and 6 hours later, 43 minutes after #48
+merged. It was not approved until 2026-10-03T01:49:07Z. Had #48 merged on day one, #49 still could
+not have merged, because it was waiting for a person to decide and not for a branch. The two
+causes ended within the same hour, which is what makes either one look sufficient by itself. So
+the longest waits in the queue row are the merge step and the wait for a decision, and both are
+the same one person as everything else here.
 
-Three things make it so, and all three are mechanisms rather than moods. The queue comes first,
+Four things make it so, and all four are mechanisms rather than moods. The queue comes first,
 because the backlog is what gets the project to a release. Every round above is a person deciding
-to sit down and run the cycle. And merging is a person too, even after the review has said yes. A
+to sit down and run the cycle. Merging is a person too, even after the review has said yes. And a
+pull request labelled `review:needs-maintainer` waits for that same person, however long that
+takes: of the four mechanisms this is the one you can set off yourself, by disagreeing twice or by
+raising something the agents may not settle, and the one measured case of it cost eleven days. A
 quiet fortnight is capacity, not disregard, and a polite comment on a quiet pull request is
 welcome.
 
