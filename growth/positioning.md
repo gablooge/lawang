@@ -78,14 +78,25 @@ should come second.
 ## What only this project does, or plans to do
 
 "Only" means: as far as the review of 2026-10-04 found, against the projects in landscape
-section 5. Re-check before saying it in public, and say the narrow version.
+section 5. Re-check before saying it in public, say the narrow version, and keep the scope of
+the search attached to it.
 
 **Read landscape section 1 first.** The cut to two providers took the breadth out of the
 "nobody does this" argument, and what is left is narrower than the first pass claimed: no
 self-hosted, ingestion-only component was found that delivers permission-carrying records to a
-sink the adopter owns, and for ClickUp no project at all was found that carries the source's own
-visibility. For Slack, Onyx (Enterprise Edition) and PipesHub (Apache 2.0) both carry
-permissions, inside their own index. The difference there is shape, not permissions.
+sink the adopter owns, and for ClickUp none of the four projects checked (Onyx, Glean, Airweave
+and PipesHub) was found to carry the source's visibility into a record it hands on.
+
+Both qualifiers are load-bearing. Glean's documentation says its connectors fetch each source's
+permissions map, stated generally rather than per connector, and Glean's directory lists a
+ClickUp connector (landscape section 2, Glean), so the claim is about handing the visibility on
+in a record, not about whether anyone carries it at all. And landscape section 9 lists what the
+search did not cover, three items of which bear on this sentence, so the sentence names the four
+projects it checked instead of saying "no project at all". That sentence is word for word the
+one in landscape section 1, on purpose: if one is ever reworded, reword the other.
+
+For Slack, Onyx (Enterprise Edition) and PipesHub (Apache 2.0) both carry permissions, inside
+their own index. The difference there is shape, not permissions.
 
 1. **Permissions as part of the record, in an ingestion-only component, fully under Apache 2.0.**
    Every record carries one scope, and membership changes are synced to your sink as their own
@@ -131,7 +142,7 @@ The answer, without decoration:
   not by this page.
 - The design is not new. It is a rewrite of a Python predecessor, and the roadmap's
   [parity table](../docs/roadmap.md) says item by item what carries over, what changed and what
-  was deliberately dropped. Architecture section 10 lists eleven principles, each taken from a
+  was deliberately dropped. Architecture section 10 lists twelve principles, each taken from a
   real defect or near miss in that predecessor. Two of them match defects a mature project fixed
   in public this year: a Teams standard channel indexed as public, and a deduplication gate keyed
   on content that can skip a permission-only change (landscape section 2, Onyx). The problem is
@@ -186,9 +197,11 @@ Candidate gaps noticed during this run. Each needs the usefulness review before 
    say which deployments are supported (a company's own app for its own workspace) and what
    reconciliation does if the app is rate limited to 1 request per minute and 15 objects.
    Evidence: landscape section 3.
-2. **"How do I enforce this in MY retrieval layer?"** Every vendor guide answers it (pre-filter,
-   fetch more, post-filter, optional live check). Lawang has the format but no worked example for
-   a real index (pgvector, Qdrant, OpenSearch) or for an authorization engine (OpenFGA, SpiceDB).
+2. **How an adopter enforces this in their own retrieval layer.** Every vendor guide answers
+   that question (pre-filter, fetch more, post-filter, optional live check). The phrasing here
+   is deliberately not in quotation marks: it is this review's summary of the question, not
+   anybody's words. Lawang has the format but no worked example for a real index (pgvector,
+   Qdrant, OpenSearch) or for an authorization engine (OpenFGA, SpiceDB).
    The pgvector sink is after v0.1, so the example would have to use the `http` or `jsonl` sink.
    Evidence: landscape section 2 (Truto, Paragon, Bedrock) and "Related, not competing".
 3. **Deletions and the revocation window.** Deleted content that still shows up, and stale

@@ -97,9 +97,25 @@ What survives, re-checked provider by provider on 2026-10-04:
 
 **So the honest sentence is narrower than the first pass wrote.** Not "nobody does this", but:
 no self-hosted, ingestion-only component was found that delivers permission-carrying records to a
-sink the adopter owns, and for ClickUp specifically, no project at all was found that carries the
-source's visibility. The niche is real and it is narrow, and on the strongest version of the
-claim it is one provider wide. Anyone repeating it in public should say the narrow version.
+sink the adopter owns, and for ClickUp none of the four projects checked (Onyx, Glean, Airweave
+and PipesHub) was found to carry the source's visibility into a record it hands on.
+
+Both qualifiers are load-bearing, and the evidence for that is in this file. "Into a record it
+hands on" is what the bullet above rests on: Glean's own documentation says its connectors fetch
+each source's permissions map (section 2, Glean), stated generally rather than per connector,
+and Glean's directory lists a ClickUp connector. A sentence that said "no project carries
+ClickUp's visibility" would be contradicted by a page this file cites itself. "Of the four
+projects checked" is the other qualifier, because the scope of a claim can only be the scope of
+the search: section 9 lists what was not covered, and three of its open items bear on this exact
+sentence (Glean's per-connector permission behaviour, whether Airweave or PipesHub carry source
+ACLs in code, and whether Airbyte has a ClickUp source). What this file can support is that four
+named projects were looked at and none of them was found to hand the visibility on, not that
+nobody anywhere does.
+
+The niche is real and it is narrow, and on the strongest version of the claim it is one provider
+wide. Anyone repeating it in public should say this narrow version, with both qualifiers and the
+four names attached. `positioning.md` carries the same sentence word for word on purpose: if one
+is ever reworded, reword the other.
 
 The closest things found, and how they differ:
 
@@ -451,10 +467,13 @@ All pages in this section were read on **2026-10-04** unless a line says otherwi
 
 ### Related, not competing
 
-- **Convoy** (Go, Elastic License 2.0): "The Cloud Native Webhooks Gateway". It ingests,
-  persists, retries and delivers webhooks, with idempotency keys, and it knows nothing about
-  providers, records or permissions. <https://github.com/frain-dev/convoy> Choose it when you
-  need a general webhook gateway.
+- **Convoy** (Go): "The Cloud Native Webhooks Gateway". It ingests, persists, retries and
+  delivers webhooks, with idempotency keys, and it knows nothing about providers, records or
+  permissions. <https://github.com/frain-dev/convoy> FOUND: the `LICENSE` file is the Elastic
+  License 2.0 (read 2026-10-04,
+  <https://github.com/frain-dev/convoy/blob/main/LICENSE>). GitHub does not resolve the
+  repository to a standard identifier, so the file itself was opened rather than the badge read.
+  Choose it when you need a general webhook gateway.
 - **OpenFGA, SpiceDB, Oso, Cerbos**: authorization engines. They answer "may this person see this
   object" at query time. They are the enforcement half, and the guides from Truto, Paragon and
   Cerbos all place them after retrieval. <https://github.com/openfga/openfga>
@@ -580,8 +599,8 @@ it was removed, and section 9 lists which.
 - "A user queries 'Q4 revenue projections' and the system dutifully returns the most semantically
   similar chunks", which, the article continues, come from a confidential board deck the user was
   never supposed to see. Also: "The embedding model does not know about permissions." And: "This
-  is the primary reason many enterprises stall on RAG deployments". Kirk Ryan (read 2026-10-04,
-  published 2026-03-03).
+  is not a hypothetical risk. It is the primary reason many enterprises stall on RAG
+  deployments". Kirk Ryan (read 2026-10-04, published 2026-03-03).
   <https://kirkryan.co.uk/item-level-permissions-in-rag-why-your-vector-database-needs-access-control/>
 - "Failing to properly handle user permissions with your AI-enabled features/agents can create
   silent data leaks, introduce compliance risks, and allow the AI to bypass existing access
@@ -679,8 +698,8 @@ that ratio, so it has been removed rather than re-sourced.
 
 | Place | What it is | Activity | Self-promotion rules |
 |---|---|---|---|
-| Hacker News, Show HN | General technology news, strong infrastructure audience | Very high | FOUND: "Show HN is for something you've made that other people can play with." Off topic are "blog posts, sign-up pages, newsletters, lists, and other reading material. Those can't be tried out, so can't be Show HNs." And: "If your work isn't ready for users to try out, please don't do a Show HN", "Please don't ask friends to upvote or comment." <https://news.ycombinator.com/showhn.html> So: not before M6. |
-| Lobsters | Invite-only technical link site | Medium, high quality | FOUND: an invite is needed, and "As a rule of thumb, self-promo should be less than a quarter of one's stories and comments." New users also cannot "use tags for meta discussions or that are prone to off-topic stories", a list that includes `show` and `announce`. <https://lobste.rs/about> |
+| Hacker News, Show HN | General technology news, strong infrastructure audience | Very high | FOUND: "Show HN is for something you've made that other people can play with." Off topic are "blog posts, sign-up pages, newsletters, lists, and other reading material. Those can't be tried out, so can't be Show HNs." And: "If your work isn't ready for users to try out, please don't do a Show HN", "Please don't ask friends to upvote or comment." <https://news.ycombinator.com/showhn.html> (read 2026-10-04) So: not before M6. |
+| Lobsters | Invite-only technical link site | Medium, high quality | FOUND: an invite is needed, and "As a rule of thumb, self-promo should be less than a quarter of one's stories and comments." New users also cannot "use tags for meta discussions or that are prone to off-topic stories", a list that includes `show` and `announce`. <https://lobste.rs/about> (read 2026-10-04) |
 | r/Rag, r/LocalLLaMA, r/LangChain | RAG builders | High | NOT VERIFIED. The pages cannot be fetched here. Read each sidebar and wiki before posting. |
 | r/dataengineering | Data engineers | High | NOT VERIFIED. The page cannot be fetched here. The first pass added "Known for strict limits on vendor posts" from memory; that has been removed, because it is a claim about a named community with no source. |
 | r/golang | Go developers | High | NOT VERIFIED. The page cannot be fetched here. Read the rules on project posts and on AI-assisted code before posting: this repository is built with agents and should say so openly. |
@@ -717,7 +736,7 @@ that ratio, so it has been removed rather than re-sourced.
 | CSDN, Zhihu, Datawhale (Chinese) | Articles and study groups on RAG | SEARCH ONLY: that permission-aware knowledge bases ("RBAC-RAG") are discussed on these platforms. The one link here, <https://github.com/datawhalechina/all-in-rag> (read 2026-09-19), is a Chinese-language RAG study repository, which is not the same claim. NOT VERIFIED: their rules. |
 
 INFER about all of these: the honest format everywhere is a technical article that teaches
-something true (architecture section 10 has eleven candidates), with the project mentioned once.
+something true (architecture section 10 has twelve candidates), with the project mentioned once.
 That is Mode 4 work, and only when what it describes runs.
 
 ---
@@ -779,6 +798,37 @@ maintainer saying them.
 - The Indonesian Discord membership figures, the GoJakarta move to Luma, and the claim that
   RBAC-RAG is discussed on CSDN and Zhihu. All three are marked SEARCH ONLY: a search summary
   reported them and no page was opened.
+- Whether Microsoft 365 Copilot connectors cover the five providers. The directory says 100+
+  prebuilt connectors; the five were not confirmed one by one (section 5, Copilot connectors
+  row).
+- How to suggest a link to Golang Weekly (section 7).
+- The Relevance Slack community's own self-promotion rules (section 7).
+
+The last three were carried only by their inline markers until the round 2 review pointed out
+that section 9 did not repeat them. Nothing in either file rests on any of the three. This list
+is not a guarantee of completeness, and it is the right place to look for the scope of a claim,
+not a proof that everything outside it was checked.
+
+**Corrected on 2026-10-04 after the round 2 review**
+
+- **One quotation was not character for character.** The third Kirk Ryan fragment in section 6
+  was printed as "This is the primary reason many enterprises stall on RAG deployments", which
+  joins the opening of one sentence to the body of the next. The page reads "This is not a
+  hypothetical risk. It is the primary reason many enterprises stall on RAG deployments, and it
+  is why item-level permission enforcement is table stakes for any production system that
+  ingests documents from access-controlled sources." The fragment now quotes the two sentences
+  as the page prints them. The wording was settled by reading the page source, not by asking a
+  fetching tool whether a string occurs: two such answers disagreed with each other, one of them
+  reporting a preceding sentence that is not next to the passage at all. The other two fragments
+  from the same author were re-confirmed at the same time, as were the Riedl, Mestci and
+  Vavilova quotations, and the publication date of 2026-03-03 was confirmed in the page's own
+  metadata. One exception in about twenty passages is listed here rather than quietly fixed,
+  because the promise at the top of this file is worth only as much as its exceptions are
+  visible.
+- **The count of principles in architecture section 10 was wrong in two places**, here and in
+  `positioning.md`. It said eleven. There are twelve, numbered 1 to 12, and there have been
+  twelve since the initial design commit `3a21c8b`, so this was wrong in the first pass and
+  survived the rewrite. Counted on `origin/main` on 2026-10-04.
 
 **Quotations removed in the 2026-10-04 rewrite, and why**
 
