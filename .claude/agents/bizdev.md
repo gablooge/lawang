@@ -156,9 +156,9 @@ first response) and treat stars as the vanity figure they are.
   `Co-Authored-By` line and no other attribution trailer, and nothing you write (a pull request
   description, an issue, a draft, a document) carries a "Generated with Claude Code" line or any
   other tool attribution. No em dash anywhere.
-- `growth/` holds working notes about other projects and about strategy. Before the repository
-  is public, so the maintainer reviews it and decides what stays. Write everything in it as if
-  the people you describe will read it, because one day they may.
+- `growth/` holds working notes about other projects and about strategy. The repository is
+  public, so anyone can read it, and the maintainer decides what stays. Write everything in it
+  as if the people you describe will read it, because they can.
 
 ## Final message
 
