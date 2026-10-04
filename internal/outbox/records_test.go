@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/gablooge/lawang/internal/outbox"
 )
@@ -518,10 +519,25 @@ func TestExhaustedIsOnePastTheLastAttemptTheLadderSchedules(t *testing.T) {
 }
 
 // TestPrepareInRefusesATextPostgresCannotStore. Every text that reaches a statement from
-// outside the package is asked this first, because the alternative is SQLSTATE 22021, which a
-// caller cannot tell from an outage. The op and the kind are asked as well as the record id:
-// they are three columns written from the same caller's values, and an empty op would meet the
-// table's CHECK instead, which is no easier to read.
+// outside the package is asked this first, because the alternative is that the statement runs
+// and Postgres answers: SQLSTATE 22021 for a NUL byte or invalid UTF-8, and 23514 against the
+// table's CHECK for an empty op or kind. The op and the kind are asked as well as the record
+// id, because they are three columns written from the same caller's values.
+//
+// So "the call returned an error" is the one thing this test must not assert, because Postgres
+// supplies one either way and the assertion would hold with no guard in the package at all.
+// What it asserts is that the refusal is this package's, and that it costs the caller nothing:
+//
+//   - the error is not a *pgconn.PgError, so no statement reached the server;
+//   - and the caller's transaction is still usable afterwards. PrepareIn takes the caller's
+//     transaction by design (the records and the ledger rows have to commit together), so a
+//     refusal that reaches the server aborts that transaction: every later statement in it
+//     fails with SQLSTATE 25P02 and the ledger rows the caller had already written go down
+//     with it. A guard that returns before any statement runs leaves the transaction where it
+//     found it.
+//
+// Both guards are covered, the record id and the op and kind, because the second was written
+// to match the first and the first is in the same position.
 func TestPrepareInRefusesATextPostgresCannotStore(t *testing.T) {
 	e := setup(t)
 	id := e.accept(tenantA, "task:1", 1)
@@ -543,11 +559,31 @@ func TestPrepareInRefusesATextPostgresCannotStore(t *testing.T) {
 		bad["the kind is "+name] = r
 	}
 	for name, rec := range bad {
-		err := e.db.TenantTx(e.ctx, tenantA, func(tx pgx.Tx) error {
-			return e.ob.PrepareIn(e.ctx, tx, c, []outbox.PreparedRecord{rec})
+		// refusal is what PrepareIn itself returned, before store wraps it, and afterwards is
+		// what the next statement on the caller's own transaction says.
+		var refusal, afterwards error
+		_ = e.db.TenantTx(e.ctx, tenantA, func(tx pgx.Tx) error {
+			refusal = e.ob.PrepareIn(e.ctx, tx, c, []outbox.PreparedRecord{rec})
+			if refusal == nil {
+				return errors.New("nothing was refused, so roll this back")
+			}
+			var one int
+			afterwards = tx.QueryRow(e.ctx, "SELECT 1").Scan(&one)
+			// Rolled back either way, so that the row is still preparable at the end.
+			return refusal
 		})
-		if err == nil {
+		if refusal == nil {
 			t.Errorf("%s: err = nil, want a refusal", name)
+			continue
+		}
+		if afterwards != nil {
+			t.Errorf("%s: the refusal poisoned the caller's transaction, so the statement after it failed: %v",
+				name, afterwards)
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(refusal, &pgErr) {
+			t.Errorf("%s: the refusal is Postgres's (SQLSTATE %s), not this package's: %v",
+				name, pgErr.Code, refusal)
 		}
 	}
 	// The refusal is the record and not the state: the row is still preparable afterwards.

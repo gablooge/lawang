@@ -396,6 +396,13 @@ var ErrNotThisTenantsRecord = errors.New("record: the document does not carry th
 // ErrNotTheRecordStored reports a stored document that is a valid record of this tenant and is
 // not the one the row beside it says was stored: its id, its Op or its Kind is another's. See
 // Reopen and Stored.
+//
+// Who is expected to ask: nothing in the delivery path, and that is deliberate. A drain treats
+// every Reopen error the same way, as a dead letter, because none of them is retryable and the
+// same bytes produce the same answer next time. It is exported and separate from
+// ErrNotThisTenantsRecord for the operator surface of B25, which has to say which of the two
+// happened, and for a test that has to show a fix caught the case it was written for rather
+// than some other refusal.
 var ErrNotTheRecordStored = errors.New("record: the document is not the record the row beside it says was stored")
 
 // Stored is one record as the store holds it: the document, plus the fields of the seal that
@@ -433,20 +440,29 @@ type Stored struct {
 // because a decoded record knows no tenant (the tenant is in no field of the envelope), so
 // SealedFor is false for it and every sink would refuse it as another tenant's record.
 //
-// It is not a way around the seal, and it is not weaker than the seal. The id is minted again
-// from the fields the document carries and from provider and tenant, and a document whose own
-// id is not the one that comes out is ErrNotThisTenantsRecord. What the id does not hash,
-// s.Op and s.Kind, is held against the document, and so is s.ID, and a document that disagrees
-// with any of them is ErrNotTheRecordStored. Between them that is every field the seal covers,
-// which is what a tripwire test in this package holds the seal to. So a document edited in the
-// table (in any sealed field), a document stored for one tenant and read back for another, a
+// It is not a way around the seal. The id is minted again from the fields the document carries
+// and from provider and tenant, and a document whose own id is not the one that comes out is
+// ErrNotThisTenantsRecord. What the id does not hash, s.Op and s.Kind, is held against the
+// document, and so is s.ID, and a document that disagrees with any of them is
+// ErrNotTheRecordStored. Between them that is every field the seal covers, which is what a
+// tripwire test in this package holds the seal to. So a document edited in the DOCUMENT ALONE
+// (in any sealed field), a document stored for one tenant and read back for another, a
 // document read back under the wrong provider, and a document swapped for another record of
 // the same tenant are all refused here rather than delivered to somebody.
 //
-// What it cannot catch is a change to a field that is in neither the id nor the seal (the
-// title, the text, the author), which is exactly what MarshalJSON cannot catch for a record
-// this process sealed: one id is one version of one entity, in one scope, with one op and one
-// kind, and the content is whatever that version said (ADR 4).
+// That qualifier is the whole of the claim, and it is narrower than the seal's. In process the
+// seal is a private field no outside caller can write; here both sides of every comparison are
+// columns of one row. Reopen holds the document against what the row says beside it, so it
+// catches an edit to one side and cannot catch a writer who edits both sides to agree. No
+// unkeyed check can: a seal digest in a column would be recomputable by anything that can write
+// the document, so it would catch exactly the same edits and no more. What answers a writer who
+// holds the table is the grants on it and the operator surface that shows which field moved,
+// not a column beside the document.
+//
+// It also cannot catch a change to a field that is in neither the id nor the seal (the title,
+// the text, the author), which is exactly what MarshalJSON cannot catch for a record this
+// process sealed: one id is one version of one entity, in one scope, with one op and one kind,
+// and the content is whatever that version said (ADR 4).
 func Reopen(s Stored, provider string, tenant tenancy.ID) (Record, error) {
 	var stored Record
 	if err := json.Unmarshal(s.Document, &stored); err != nil { // strict: the whole format, and then Validate

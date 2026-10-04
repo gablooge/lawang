@@ -408,13 +408,24 @@ being able to read one back, and it cannot write `is_head`, so it can lease a he
 one. Payloads are read afterwards, as the application role bound to the claimed row's tenant.
 
 **What a failure leaves behind.** `last_error` and `dead_reason` are plain text that operators
-read and every backup carries, so they never hold token material, a URL, or text written by a
-remote system. The outbox does not take an error string at all. A failure is recorded as an
+read and every backup carries, so they never hold token material, a URL, or a sentence written
+by a remote system. The outbox does not take an error string at all. A failure is recorded as an
 `outbox.Cause`: one of the outbox's own classifications (section 11), the HTTP status, and the
 remote system's error code if it looks like one (short, and nothing but letters, digits, `_`, `-`
 and `.`), otherwise the word "withheld". The reason is the obvious call it rules out: the error
 of an HTTP client quotes the request URL, and the query string is where many sinks and providers
 carry their API key.
+
+**The error code is the one exception, and it is deliberate.** It is chosen by the receiver, or
+by a `Sink` implementation that is not one of this repository's, and `Cause.WithCode` is a shape
+filter and not a trust boundary: 64 bytes of that alphabet is a shape a bot token, a base64url
+run and a hex run all fit, so a caller that passes a secret as the code stores a secret. It is
+kept because a dead letter with the receiver's own code in it is the one an operator can act on,
+and nothing but the code is kept: a `Detail` is for a log line and never reaches a column, and a
+worker checks a `Detail` it did not build against `sink.KnownDetail` before it even logs one. A
+reader of this paragraph should not conclude that nothing a sink chose is written down. One
+thing is, by name, and `internal/worker`'s marker test names the attribute and the two columns
+it reaches.
 
 ### 3.3 Reconciliation
 

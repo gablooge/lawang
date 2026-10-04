@@ -207,6 +207,56 @@ func TestNamesValidate(t *testing.T) {
 	}
 }
 
+// TestKnownDetailIsEveryPhraseOfThisPackageAndTheEmptyString.
+//
+// KnownDetail is what a caller outside this package asks before it logs a Detail it did not
+// build, and internal/worker is that caller: a Detail that fails here is replaced by a line of
+// the caller's own. Until now nothing in this package called it, so two answers that the caller
+// depends on were pinned only one package away, by a mutation of the caller's test.
+//
+//   - Every phrase in the list is known. A Detail this package built must never be withheld
+//     from an operator's log as if a sink had invented it, and the list is hand-maintained.
+//     TestADetailIsAlwaysThisPackagesOwnPhrase holds the list against the detail* constants, so
+//     a fourteenth constant that is not listed fails there; this holds KnownDetail against the
+//     list, so the predicate and the list cannot drift apart either.
+//   - The empty string is known, and that is deliberate rather than an accident of the
+//     implementation. A Rejection the receiver refused carries no Detail by design (see
+//     Rejection.Detail), so a caller that printed "withheld" for it would be withholding
+//     nothing and saying something false. It is also the branch internal/worker's outside
+//     travels for a Fault with no Detail, which is why that function keeps the Detail and not
+//     the whole Fault.
+//
+// And a phrase this package could not have built is not known, however much it looks like one.
+func TestKnownDetailIsEveryPhraseOfThisPackageAndTheEmptyString(t *testing.T) {
+	t.Parallel()
+	for _, detail := range sink.FaultDetails {
+		if !sink.KnownDetail(detail) {
+			t.Errorf("KnownDetail(%q) = false for a phrase this package owns", detail)
+		}
+	}
+	if !sink.KnownDetail("") {
+		t.Error(`KnownDetail("") = false, so a Rejection with no Detail, which is every ` +
+			`refusal the receiver made, would be logged as text this package will not vouch for`)
+	}
+	for name, detail := range map[string]string{
+		"a sink's own sentence":        "POST https://api.example/v1/x?api_key=sUp3r failed",
+		"a receiver's error text":      "invalid_auth",
+		"a phrase with a space added":  detailTimedOutForTest + " ",
+		"a phrase in another case":     strings.ToUpper(detailTimedOutForTest),
+		"a prefix of a phrase":         detailTimedOutForTest[:len(detailTimedOutForTest)-1],
+		"a phrase with something more": detailTimedOutForTest + ", at the sink",
+		"whitespace":                   " ",
+	} {
+		if sink.KnownDetail(detail) {
+			t.Errorf("%s: KnownDetail(%q) = true, so a caller would print it as this package's own", name, detail)
+		}
+	}
+}
+
+// detailTimedOutForTest is one phrase of the list, taken from the list itself so that editing
+// the constant cannot leave this test asserting about a phrase that no longer exists.
+var detailTimedOutForTest = sink.FaultDetails[0]
+
 // TestADetailIsAlwaysThisPackagesOwnPhrase reads the package's own source, rather than a list
 // someone keeps by hand, and holds three things:
 //

@@ -8,3 +8,8 @@ import "context"
 //
 // Run is tested too, because the shutdown is only visible there.
 func (d *Drain) Once(ctx context.Context) (int, error) { return d.once(ctx) }
+
+// MaxWhyDepth is how far outside unwraps an error chain. The test for the bound reads it from
+// here rather than keeping a copy, so raising the bound cannot leave the test asserting the
+// old one.
+const MaxWhyDepth = maxWhyDepth

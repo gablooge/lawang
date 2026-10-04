@@ -48,10 +48,16 @@ SELECT DISTINCT
 --
 -- # The order between this lock and the outbox's
 --
--- Postgres has ONE advisory lock namespace, a 64 bit key with no classid split, and two modules
--- take locks in it: internal/outbox over (tenant, ordering key), and this one over (tenant,
--- provider, external id). The rule for a transaction that ever holds both is one sentence:
--- **take every advisory lock ascending by key**.
+-- Postgres has ONE advisory lock namespace for the one-argument form this code uses, a 64 bit
+-- key, and two modules take locks in it: internal/outbox over (tenant, ordering key), and this
+-- one over (tenant, provider, external id). The rule for a transaction that ever holds both is
+-- one sentence: **take every advisory lock ascending by key**.
+--
+-- (The two-argument pg_advisory_xact_lock(int4, int4) would give each module a classid of its
+-- own. It was refused on cost and not on correctness: under the rule below a collision inside
+-- a module is a wait either way, so 32 bit keys would not bring the deadlock back, they would
+-- add false contention between unrelated entities, which starts to matter around 10,000 keys
+-- per module. ADR 12 decision 1 has the arithmetic.)
 --
 -- That is a total order, and it needs no premise about the two modules' keys, because the
 -- namespace is split by construction. The outbox sets the high bit of its key and this

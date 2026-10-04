@@ -431,6 +431,14 @@ func (d *Drain) readyRecords(ctx context.Context, log *slog.Logger, c outbox.Cla
 		}
 		// Prepare, documentsOf and PrepareIn are all this program's own code, talking to this
 		// program's own database, so the error is logged as it is.
+		//
+		// What makes that safe is a property of pgx rather than of this code, and it is worth
+		// writing down because nothing here would notice it changing: a statement that refuses
+		// a row carries Postgres's DETAIL, which for a CHECK or a unique violation on
+		// outbox_record is "Failing row contains (...)" with the stored document in it, and
+		// pgconn.PgError.Error() prints the severity, the message and the SQLSTATE and not the
+		// Detail. If that ever stops being true, this is the call site that starts quoting a
+		// record's content into a log line, and it would need the same treatment as outside.
 		d.failPipeline(ctx, log, c, outbox.ClassInternal, err, err)
 		return nil, false
 	}
@@ -554,11 +562,31 @@ func (t outsideText) Error() string { return string(t) }
 // back; logging err.Error() here would put it back one layer up, in a log line, which is where
 // the project already decided it must not be.
 //
-// A *sink.Fault is this program's own type and every part of it is a constant of this program:
-// the Action, the outbox.Cause (which Cause.WithCode filters) and a Detail that is one of
-// internal/sink's phrases. A Sink this repository did not write can put anything in Detail, so
-// the Detail is checked (sink.KnownDetail) rather than assumed, and a Fault that passes is
-// logged as it is, because it is the one thing a broken sink returns that an operator can read.
+// A *sink.Fault is this program's own type, but a Sink this repository did not write builds one
+// too, and then only its shape is ours. Of its three fields the Detail is the one this function
+// can decide: it is a phrase from a list internal/sink owns, so sink.KnownDetail is asked rather
+// than assumed, and a phrase that passes is what comes back, because it is the one readable
+// thing a broken sink gives an operator.
+//
+// The Cause is a different thing and this function does not touch it. A Cause carries a class of
+// this program's own and a code, and the code is chosen by the receiver or by the sink:
+// sink.Rejection.Detail says so in as many words, and outbox.Cause.WithCode is only a shape
+// filter (at most 64 bytes of [A-Za-z0-9_.-], which its own doc comment says cannot stop a
+// caller that passes a secret as the code). That code is kept on purpose, because a receiver's
+// own error code is what makes a dead letter actionable, and it is stored: every caller of this
+// function passes the same Cause to outbox.Fail, outbox.Halt or outbox.MarkDead, which write
+// Cause.String() into outbox.last_error, and sink.Rejection.Cause takes the same route into
+// outbox_record.last_error through deadRecords. So the drain does write down one thing a sink
+// chose. It is the Cause, deliberately, under B04's decision, and
+// TestNoThirdPartyTextReachesAnythingTheDrainWrites pins which log attribute and which column
+// hold it.
+//
+// What this function must therefore not do is hand back a value that reprints the Cause a
+// second time somewhere nothing says it is. *sink.Fault is such a value: Fault.Error() prints
+// Cause.String(), and KnownDetail("") is true, so returning the Fault itself put the sink's code
+// into the "why" attribute of a line whose "cause" attribute already carries it, and put it
+// there for every Fault, including the ones with no Detail at all. The Detail alone comes back
+// instead, and a Fault with no Detail falls through to the chain below like anything else.
 //
 // Everything else becomes the chain of concrete types, which names the shape of the failure
 // without quoting any value the failing call was given. The cost is real: an operator debugging
@@ -568,8 +596,8 @@ func (t outsideText) Error() string { return string(t) }
 // it (noted on issue #11).
 func outside(err error) error {
 	var fault *sink.Fault
-	if errors.As(err, &fault) && sink.KnownDetail(fault.Detail) {
-		return fault
+	if errors.As(err, &fault) && fault.Detail != "" && sink.KnownDetail(fault.Detail) {
+		return outsideText(fault.Detail)
 	}
 	var b strings.Builder
 	for i := 0; err != nil && i < maxWhyDepth; i++ {

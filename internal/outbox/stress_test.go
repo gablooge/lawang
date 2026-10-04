@@ -184,6 +184,16 @@ func TestStressOrderingUnderRandomLoad(t *testing.T) {
 					// back keeps its seq and its place, so the very same row may be claimed
 					// again at the seq it already had. Any other repeat is the queue going
 					// backwards.
+					//
+					// Called what it is: this is a RELAXATION of the plain "seq must not go
+					// backwards" it replaced, and not a strengthening of it. Halt and Release
+					// make the plain form false, so the smallest change that admits them is
+					// to allow equality and tie-break on the row id, which is what these two
+					// arms are. What it gives up is one case the plain form caught: the same
+					// row claimed again at its own seq after it was finished. The head
+					// invariant two lines down is what rules that out instead, and it is
+					// pinned by a mutation (Release reassigning seq, caught 3 runs of 3 by
+					// the head invariant and not by this check).
 					switch {
 					case row.Seq < lastSeq[key]:
 						fail("%s: seq %d claimed after seq %d", key, row.Seq, lastSeq[key])

@@ -122,13 +122,15 @@ type sinks struct {
 	// plainErr is returned by Deliver instead of a *sink.Fault, which no sink may do.
 	plainErr error
 	// reject names record ids the receiver refuses, and extra names ids it refuses that were
-	// never offered to it. rejectDetail is the Detail each Rejection carries, which a sink
-	// this repository did not write chooses freely.
+	// never offered to it. rejectDetail is the Detail each Rejection carries, and rejectCode
+	// is the code in its Cause (the default below when it is empty). A sink this repository
+	// did not write chooses both freely.
 	reject map[string]bool
 	extra  []string
 	// rejectAll refuses every record offered, for a test that does not know the record ids.
 	rejectAll    bool
 	rejectDetail string
+	rejectCode   string
 	// before runs at the start of every Deliver, for the tests that need to be inside the sink
 	// call when something else happens (a shutdown).
 	before func()
@@ -169,8 +171,11 @@ func (s *sinks) Deliver(ctx context.Context, t tenancy.ID, recs []record.Record)
 		s.mu.Unlock()
 		return sink.DeliveryResult{}, fault
 	}
-	reject, extra, detail, all := s.reject, s.extra, s.rejectDetail, s.rejectAll
+	reject, extra, detail, all, code := s.reject, s.extra, s.rejectDetail, s.rejectAll, s.rejectCode
 	s.mu.Unlock()
+	if code == "" {
+		code = "unsupported_kind"
+	}
 
 	var result sink.DeliveryResult
 	var taken []record.Record
@@ -178,7 +183,7 @@ func (s *sinks) Deliver(ctx context.Context, t tenancy.ID, recs []record.Record)
 		if all || reject[r.ID] {
 			result.Rejected = append(result.Rejected, sink.Rejection{
 				ID:     r.ID,
-				Cause:  outbox.NewCause(outbox.ClassSinkRejected).WithCode("unsupported_kind"),
+				Cause:  outbox.NewCause(outbox.ClassSinkRejected).WithCode(code),
 				Detail: detail,
 			})
 			continue

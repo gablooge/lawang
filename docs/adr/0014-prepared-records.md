@@ -63,9 +63,28 @@ Four things follow from it, each of which is the reason for a line of code elsew
    document back and mints its id again from the fields it carries plus the provider and the
    tenant, refusing a document whose stored id is not the one that comes out. A decoded record
    knows no tenant (the tenant is in no field of the envelope), so without this every sink would
-   refuse a re-drained record as another tenant's; with it, a document edited in the table, or
-   read back for the wrong tenant or the wrong provider, is refused instead of delivered to
-   somebody.
+   refuse a re-drained record as another tenant's.
+
+   **Minting the id is not enough on its own, which is why the table carries `record_id`, `op`
+   and `kind` beside the document.** The id hashes the provider, the external id, the version,
+   the scope and the tenant; the seal covers two more, `op` and `kind`, and a seal does not
+   survive a round trip through a table because `Seal` recomputes it from the document's own
+   values. So a document edited from `"op":"upsert"` to `"op":"delete"` agrees with itself, mints
+   the id it already carries, and would go out as a tombstone that removes the entity at the
+   receiver. `record.Reopen` therefore takes a `record.Stored` (the row's `record_id`, its `op`,
+   its `kind` and the document) and refuses any disagreement with `ErrNotTheRecordStored`, and a
+   reflection tripwire in `internal/record` fails if a seventh field joins the seal. The
+   `record_id` is held too, which is what stops a document from being replaced wholesale by
+   another self-consistent record of the same tenant while the outbox goes on accounting for the
+   row under the id it still holds.
+
+   The protection this gives is against an edit to **one side**: a document edited in the table,
+   or read back for the wrong tenant or the wrong provider, is refused instead of delivered to
+   somebody. A writer who edits the document and the columns to agree is not caught, and no
+   unkeyed check in this table would catch one: a seal digest column would be recomputable by
+   anything that can write the document. Two readable columns were chosen over a digest for that
+   reason, plus one more: they say **which** field moved, which a digest cannot, and that is what
+   B25's operator surface has to show.
 2. **The delivery offers what is left.** A claim is given the records that are neither delivered
    nor dead, so a crash after a partial delivery never offers a record twice and a dead letter
    waits for a replay.

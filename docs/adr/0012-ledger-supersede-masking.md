@@ -161,10 +161,17 @@ and a provider key admits neither `:` nor `\x1f`, so the strings always differ.)
 The cost is one bit: each module has 63 bits instead of 64, so a collision within a module is
 about twice as likely and is still a wait and not a deadlock. The alternative considered was
 the two-argument `pg_advisory_xact_lock(int4, int4)` with a classid per module, which is
-structural in the same way but cuts each key to 32 bits, where collisions between unrelated
-entities stop being rare (a few at a hundred thousand keys) and unrelated work starts
-serializing. Each half is pinned by a test that reads `pg_locks` inside the transaction that
-holds the lock, one per module, so neither formula can quietly lose its bit.
+structural in the same way but cuts each key to 32 bits.
+
+**That alternative was refused on cost, not on correctness**, and the distinction matters for
+whoever reopens the question. Under "take every advisory lock ascending by key" a collision
+inside a module is a wait in either design, so 32 bit keys would not bring the deadlock back.
+What they would bring is false contention between unrelated entities: by the birthday bound,
+any collision among 10,000 keys in a 32 bit space is already about a 1 percent chance, and at
+100,000 keys about one colliding pair is expected, which is unrelated work serializing for no
+reason. At 63 bits neither number is reachable. Each half is pinned by a test that reads
+`pg_locks` inside the transaction that holds the lock, one per module, so neither formula can
+quietly lose its bit.
 
 ### 2. The chain is per entity, and the ledger holds what was prepared
 
