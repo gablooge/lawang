@@ -5,9 +5,20 @@ title: "provider: "
 labels: provider
 ---
 
-Five short answers. The last two decide whether it can be built.
+**Before you write anything, check whether it is already asked for.** v0.1.0 connects ClickUp and
+Slack. Outlook (#16), Microsoft Teams (#17) and HubSpot (#18) are already open issues, deferred to
+after v0.1.0 rather than refused. If yours is one of those three, comment on that issue instead of
+opening a new one, and answer the questions below there. A second person saying they need it, and
+why, is the most useful thing the maintainer can receive. A duplicate issue is the least.
+
+Six short answers. The last two decide whether it can be built.
 
 **Which provider**
+
+**A link to its webhook or API documentation**
+The public developer documentation. The ClickUp provider was built entirely from published
+documentation, so this link is the single most useful thing you can hand over, and you probably
+have the page open already.
 
 **What you would ingest from it**
 Messages, tasks, comments, files, something else.
