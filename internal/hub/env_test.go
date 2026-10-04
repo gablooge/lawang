@@ -25,6 +25,9 @@ import (
 const (
 	tenantA = tenancy.ID("tenant_a")
 	tenantB = tenancy.ID("tenant_b")
+	// tenantC exists for the one test that needs three rows carrying one registration id.
+	// `subscriptions_one_registration_per_tenant` allows that only across tenants.
+	tenantC = tenancy.ID("tenant_c")
 )
 
 // The secrets the tests sign with. They are test material and nothing else: no provider ever sees

@@ -1,0 +1,26 @@
+{
+  "event": "taskUpdated",
+  "history_items": [
+    {
+      "id": "2800763136717140857",
+      "type": 1,
+      "date": "1791100000000",
+      "field": "name",
+      "parent_id": "901100",
+      "data": {},
+      "source": null,
+      "user": {
+        "id": 183,
+        "username": "placeholder-author",
+        "email": "author@example.invalid",
+        "color": "#827718",
+        "initials": "PA",
+        "profilePicture": null
+      },
+      "before": "placeholder task name",
+      "after": "placeholder task name, edited"
+    }
+  ],
+  "task_id": "86a1b2",
+  "webhook_id": "7fa3ec74-0000-4000-8000-000000000001"
+}
