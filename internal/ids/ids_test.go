@@ -1,6 +1,7 @@
 package ids
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,9 @@ import (
 	"regexp"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/oklog/ulid/v2"
 	"github.com/zeebo/blake3"
 )
 
@@ -270,6 +273,69 @@ func TestBadPartsAreRefused(t *testing.T) {
 	// The body is the last part, so a separator inside it is unambiguous and allowed.
 	if _, err := DeliveryID("slack", []byte("a\x1fb")); err != nil {
 		t.Errorf("DeliveryID refused a body containing 0x1F: %v", err)
+	}
+}
+
+// TestNewUnpredictableIsAULIDAndItsEntropyIsNotTheClock pins NewUnpredictable in the package that
+// owns it. Everything else that exercises it lives in internal/pipeline, which is where it is used
+// and not where its contract is.
+//
+// Three things are pinned, and they are the three a change to this package could break without
+// anybody noticing:
+//
+//   - The SHAPE: 26 characters that parse back as a canonical ULID. A caller embeds the result in
+//     a masking placeholder that goes out on a record, so it has to be 26 characters of the
+//     alphabet the record format allows. ParseStrict and not Parse, because the character set is
+//     the half Parse leaves unchecked: in oklog/ulid v2.1.2 the overflow test sits outside the
+//     strict guard, so Parse returns ErrOverflow too, and only ParseStrict refuses a character
+//     that is not in the Crockford alphabet. That half is the one this assertion needs, because
+//     a placeholder goes out as record text.
+//   - The CLOCK. The first 48 bits are a real millisecond timestamp, which is what makes the id
+//     sortable by creation time the way New is. A derived or constant timestamp would still
+//     parse.
+//   - The ENTROPY. The other 80 bits are drawn fresh from crypto/rand, so two calls differ in
+//     them and not merely in the millisecond they happened to land in. This is the guarantee the
+//     whole function exists for, and it is asserted on Entropy() rather than on the string,
+//     because two calls usually differ in their clock as well and that difference would satisfy a
+//     string comparison on its own. internal/pipeline's placeholder test draws the same
+//     distinction, for the same reason.
+func TestNewUnpredictableIsAULIDAndItsEntropyIsNotTheClock(t *testing.T) {
+	t.Parallel()
+
+	before := ulid.Timestamp(time.Now().Add(-time.Second))
+	first, err := NewUnpredictable()
+	if err != nil {
+		t.Fatalf("NewUnpredictable: %v", err)
+	}
+	second, err := NewUnpredictable()
+	if err != nil {
+		t.Fatalf("NewUnpredictable, second call: %v", err)
+	}
+	after := ulid.Timestamp(time.Now().Add(time.Second))
+
+	a, err := ulid.ParseStrict(first)
+	if err != nil {
+		t.Fatalf("NewUnpredictable() = %q, which is not a canonical ULID: %v", first, err)
+	}
+	b, err := ulid.ParseStrict(second)
+	if err != nil {
+		t.Fatalf("NewUnpredictable() = %q, which is not a canonical ULID: %v", second, err)
+	}
+	if len(first) != 26 {
+		t.Errorf("NewUnpredictable() = %q, want 26 characters like New()", first)
+	}
+	for _, id := range []ulid.ULID{a, b} {
+		if id.Time() < before || id.Time() > after {
+			t.Errorf("the id's timestamp is %d, outside [%d, %d]: it is not the wall clock, so the "+
+				"id is no longer sortable by creation time", id.Time(), before, after)
+		}
+	}
+	// The property the function is named for. Not first != second, which the clock alone would
+	// satisfy for an id whose 80 "random" bits were a constant or a digest of something.
+	if bytes.Equal(a.Entropy(), b.Entropy()) {
+		t.Errorf("two calls gave the same 80 entropy bits %x (%q and %q): the entropy is not coming "+
+			"from crypto/rand, and a caller that needs an unpredictable value is getting a "+
+			"predictable one", a.Entropy(), first, second)
 	}
 }
 

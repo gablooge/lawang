@@ -25,3 +25,16 @@ func (l Ladder) Next(attempts int) (delay time.Duration, ok bool) {
 	}
 	return l[attempts-1], true //nolint:gosec // G602: bounds checked on the line above
 }
+
+// Exhausted reports an attempt count that this ladder can no longer account for, which is one
+// past the last attempt it schedules.
+//
+// The last attempt the ladder allows is len(l)+1: Next schedules a wait after each of the first
+// len(l) failures, and the attempt after the last of those is the one Fail dead-letters. So a
+// claim numbered higher than that is a row that was claimed again although the ladder was over,
+// which can only mean that no attempt ever reached Fail. attempts is incremented by the claim
+// and read by nothing else, so a worker that dies or hangs leaves exactly this trace and no
+// other (Outbox.MarkAbandoned).
+//
+// A halt is not such an attempt and never trips this: Halt gives the attempt back.
+func (l Ladder) Exhausted(attempts int) bool { return attempts > len(l)+1 }

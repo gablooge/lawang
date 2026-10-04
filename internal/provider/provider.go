@@ -1,0 +1,483 @@
+// Package provider holds the interfaces a SaaS integration implements and the registry that wires
+// them up once at startup. Nothing here knows about any particular provider: each one lives in a
+// package of its own under this one, and the rest of Lawang reaches it only through these
+// interfaces (docs/architecture.md, section 7).
+//
+// Provider is what every integration implements. The others are optional capabilities, discovered
+// with a type assertion rather than stubbed out, so a provider that has no webhook does not carry
+// a method that returns "not supported".
+package provider
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"slices"
+
+	"github.com/gablooge/lawang/internal/record"
+	"github.com/gablooge/lawang/internal/tenancy"
+)
+
+// Provider is one SaaS integration.
+type Provider interface {
+	// Key is the internal provider key ("slack", "ms_graph"): a lowercase letter followed by up
+	// to 31 of a-z, 0-9 and underscore, and never a hyphen (record.ValidProviderKey, ADR 3). It
+	// is a constant of the program, never a name a sink or a request chooses: it is the first
+	// segment of every scope id and of every external id, and it is hashed into every record id,
+	// so changing it re-keys everything the provider has ever delivered. A Registry calls Key
+	// once, at registration, and uses its own copy of the result from then on.
+	Key() string
+
+	// Hydrate fetches the full object a Change is about. It is the only place a provider talks
+	// to its API, it runs in the worker and never on the accept path, and it must honour ctx.
+	// The pipeline degrades to a minimal record when it fails, so an error here is not a lost
+	// change (architecture 3.2, step 4).
+	Hydrate(ctx context.Context, t tenancy.ID, c Change) (Hydrated, error)
+
+	// Normalize turns what Hydrate returned into the records of one change: usually one, and
+	// more when a delivery carries an entity and its parent. The records are complete but
+	// unsealed, because sealing needs the tenant and is the pipeline's step: Normalize fills
+	// everything record.Seal then checks. It does no I/O.
+	//
+	// One field of the record has a rule the format cannot state, and this is where a provider
+	// author meets it: record.Version must be spelled the way VersionOrder declares, for every
+	// entity, on every change. The pipeline orders an entity's versions to keep its supersede
+	// chain pointing forward, and a version it cannot read under the declared order is a dead
+	// letter (pipeline.ErrVersionNotComparable), never a guess.
+	//
+	// The shapes that catch people out, all of them ordinary and all of them refused:
+	//
+	//   - A dotted version ("1.9.3" against "1.10.2", a SharePoint file at "9.0" then "10.0").
+	//     It is neither one decimal run nor a fixed width, and it inverts byte-wise at every
+	//     tenth change. Mint a comparable version instead: zero-pad each component to a fixed
+	//     width and declare VersionOrderLexical, or use the provider's modified timestamp.
+	//   - An RFC 3339 timestamp that grows a fractional second between two records. The width
+	//     changes, so it is not fixed width. Format it with a fixed number of fractional digits,
+	//     in UTC, and it is VersionOrderLexical.
+	//   - A base64 change token passed straight through under VersionOrderLexical. Declare
+	//     VersionOrderBase64 for it: base64's ASCII order is not its value order, so the pipeline
+	//     has to decode it rather than compare the characters. Check first that the decoded bytes
+	//     are most significant first, because that part is a promise and not a proof: a token
+	//     whose varying field is little-endian decodes cleanly and compares backwards, and a real
+	//     Graph changeKey is not uniformly big-endian. If it does not hold, re-spell it here.
+	//
+	// None of this changes what a sink sees. To a sink a version is opaque (ADR 4), so a
+	// normalizer is free to re-spell the provider's own token into something orderable.
+	Normalize(h Hydrated, c Change) ([]record.Record, error)
+
+	// VersionOrder says how this provider spells record.Record.Version. It is the only thing
+	// that lets the pipeline put two versions of one entity in order, so it is declared once,
+	// by the provider that mints them, rather than guessed at from the strings.
+	//
+	// It is a constant of the program. NewRegistry calls it once, refuses VersionOrderUnset and
+	// anything it does not recognize (ErrNoVersionOrder), and keeps its own copy, so a provider
+	// that changes its mind later cannot change how a stored delivery is ordered.
+	VersionOrder() VersionOrder
+}
+
+// VersionOrder is how a provider spells record.Record.Version, and therefore how internal/pipeline
+// may order two versions of one entity.
+//
+// ADR 4 makes "monotonic per external_id" a promise the provider's normalizer makes to the
+// pipeline, and calls a version opaque to a sink. Opaque to a sink is not opaque to the pipeline:
+// the supersede chain points forward only, so the pipeline has to decide which of two versions is
+// newer, and the wrong answer lets an older record supersede a newer one at a sink and take the
+// scope that access is decided on with it.
+//
+// The pipeline cannot work that out from the strings, and this type exists because it tried. Two
+// versions being the same length proves nothing: a base64 counter (a Microsoft Graph changeKey, an
+// Exchange ETag), a hash and a UUID are all fixed width, and none of them sorts by value in ASCII.
+// Base64 is the plain case: its alphabet puts 'z' at value 51 and '0' at value 52, while ASCII puts
+// 'z' at 122 and '0' at 48, so a counter ticking from "...z" to "...0" sorts backwards byte-wise.
+// Inferring an order from a coincidence of length is how that goes unnoticed.
+//
+// So the spelling is declared. A provider that declares nothing does not register, and a version
+// the declared order cannot read is a dead letter rather than a guess: both ends fail closed.
+type VersionOrder uint8
+
+const (
+	// VersionOrderUnset names no order. It is the zero value on purpose: a provider author who
+	// has not thought about this gets a refusal at start-up (ErrNoVersionOrder) and never a
+	// silent guess, and a Normalized that did not come from a registered provider orders nothing.
+	VersionOrderUnset VersionOrder = iota
+
+	// VersionOrderDecimal means every version is one run of decimal digits and nothing else,
+	// ordered by the NUMBER it spells. "9" is older than "10", whatever their lengths, and leading
+	// zeros count for nothing, so "009" and "9" are one version.
+	//
+	// This is what an unpadded counter and an epoch are, and it is the commonest thing a real
+	// provider sends: ClickUp's date_updated is an epoch in milliseconds as a decimal string. The
+	// pipeline proves this one rather than trusting it, since it can see whether a string is a
+	// digit run, and a version that is not one is refused.
+	VersionOrderDecimal
+
+	// VersionOrderLexical means every version of one entity is the same number of bytes AND that
+	// their byte order is their value order. A ULID, Crockford base32, uppercase hex, an epoch in
+	// milliseconds, an RFC 3339 timestamp in UTC with a fixed number of fractional digits.
+	//
+	// This one is a PROMISE the provider makes, and the only part of it the pipeline can prove is
+	// the fixed width: two versions of different lengths are refused. The rest rests on the
+	// declaration, which is why it must never be declared for base64, for RFC 4648 base32 (whose
+	// alphabet runs A-Z then 2-7, while ASCII runs 2-7 then A-Z), for a UUID (fixed width and in
+	// no order at all), or for anything that mixes upper and lower case.
+	VersionOrderLexical
+
+	// VersionOrderBase64 means every version is base64 of a fixed-width BIG-ENDIAN value, ordered
+	// by the BYTES it decodes to. Either RFC 4648 alphabet, padded or not: the pipeline normalises
+	// the spelling, so a provider does not have to pick one and cannot be caught out by its own
+	// encoder. It is what a Microsoft Graph changeKey and an Exchange ETag are, once the W/"..."
+	// wrapper is stripped.
+	//
+	// The ALPHABET and the WIDTH are proved: the pipeline decodes both versions and compares the
+	// bytes, so the alphabet's own ASCII order cannot mislead it, and two versions that do not
+	// decode, or that decode to different widths, are refused.
+	//
+	// "Big-endian" is the part that is still a PROMISE, and it is the same promise
+	// VersionOrderLexical makes one level down. Comparing decoded bytes is the value order only if
+	// the value is stored most significant first; a program holding the bytes cannot see their
+	// layout. Declare this for a little-endian counter and about half its pairs invert, which lets
+	// an older record take the head and the scope access is decided on, exactly as a misdeclared
+	// lexical version does. A real changeKey decodes to a structure whose leading fields are
+	// little-endian, so check two real values of one entity before declaring this, and re-spell
+	// the version in Normalize if the bytes do not grow with the value. ADR 12 decision 3 states
+	// the residual.
+	VersionOrderBase64
+)
+
+// Valid reports whether o is an order this program knows. The zero value is not one.
+func (o VersionOrder) Valid() bool {
+	return o == VersionOrderDecimal || o == VersionOrderLexical || o == VersionOrderBase64
+}
+
+// String names the order for an operator reading a start-up refusal or a dead letter.
+func (o VersionOrder) String() string {
+	switch o {
+	case VersionOrderUnset:
+		return "no version order"
+	case VersionOrderDecimal:
+		return "decimal"
+	case VersionOrderLexical:
+		return "lexical"
+	case VersionOrderBase64:
+		return "base64"
+	default:
+		return fmt.Sprintf("unknown version order %d", uint8(o))
+	}
+}
+
+// ErrCannotDegrade reports a Change whose webhook body does not carry what the record's scope is
+// made of, so no record can be built from it without hydration. A Degrader returns it (wrapped, if
+// it has more to say) instead of falling back to a scope it guessed.
+var ErrCannotDegrade = errors.New("provider: this change cannot be degraded")
+
+// Degrader is the optional capability of a provider that can build a change's records from the
+// webhook body alone, when Hydrate could not reach its API. Without it a hydration failure simply
+// waits for the API to come back (architecture 3.2, step 4).
+//
+// The one rule that makes it safe is about the scope. A degraded record's visibility.scope is
+// hashed into its id exactly as a hydrated one's is, so the degraded path MUST derive the scope
+// from the same inputs, through the same function, as Normalize does. A degraded record that
+// derived a different scope would give one version of one entity two ids: it would be delivered
+// twice, and to the ledger the second would look like a move (ADR 4, decision 7).
+//
+// Where the webhook body does not carry what the scope is made of, there is no honest answer, so
+// Degrade returns ErrCannotDegrade and the delivery waits for hydration or dead-letters. It never
+// guesses a scope, and it never leaves the scope empty for something downstream to fill in.
+//
+// Like Normalize it does no I/O: the whole point of it is that the provider's API is unreachable.
+type Degrader interface {
+	// Degrade builds the records of c out of c.Payload alone. The records are complete but
+	// unsealed, exactly as Normalize returns them, and they carry the same external id, version
+	// and scope the hydrated ones would have carried. What they may lack is content the webhook
+	// body did not have: an empty author, a shorter text.
+	Degrade(c Change) ([]record.Record, error)
+}
+
+// Change is one thing that happened at a provider, as its webhook body or a reconciliation page
+// reported it. The same type carries the live path and the backfill path, so both end up in the
+// same pipeline (architecture 3.2 and 3.3).
+type Change struct {
+	// ExternalID identifies the entity that changed, in the record format's namespaced form
+	// ("clickup:task:86a1b2"): the provider key, a colon, and the provider's own id. It becomes
+	// Record.ExternalID, and the outbox orders by the entity, so two versions of one entity must
+	// give the same string.
+	ExternalID string
+	// Op is what happened to the entity.
+	Op record.Op
+	// Payload is the part of the delivery this change was read from, exactly as the provider
+	// wrote it. It is what a record degraded from the webhook body is built out of, so a
+	// provider keeps here what it would need if its own API were unreachable.
+	Payload []byte
+}
+
+// Hydrated is the full object a provider fetched for a Change. It is deliberately opaque: only
+// the provider that produced it reads it again, in its own Normalize, and no two providers'
+// objects have a field in common, so an interface with methods here would be a shape every
+// provider bends to and nothing else uses.
+type Hydrated any
+
+// WebhookSource is the optional capability of a provider that receives deliveries at
+// /ingress/{provider}. Its four methods are the accept path in order: handshake, delivery keys,
+// verification, parse (architecture 3.1).
+//
+// Everything they are handed arrives from the public internet, signed or not. body is the exact
+// bytes of the request, and no method may assume it is JSON, or UTF-8, or anything else.
+type WebhookSource interface {
+	// Handshake answers a challenge the provider sends to prove the endpoint is ours, and
+	// reports whether it did. It runs before any tenant is resolved and before anything is
+	// verified or stored, because a challenge arrives when no subscription exists yet.
+	//
+	// The reply is bytes and a content type, not JSON: Slack echoes its challenge inside a JSON
+	// object and Microsoft Graph echoes a validationToken as text/plain, so the interface cannot
+	// assume a shape. Returning false means "this is not a handshake", and the delivery goes on
+	// down the accept path.
+	//
+	// r is the request with its body already read and replaced by http.NoBody: read body, never
+	// r.Body. r is there for the URL and the headers, which is where a challenge often is.
+	Handshake(r *http.Request, body []byte) (Reply, bool)
+
+	// DeliveryKeys reads the provider's own identifiers out of a delivery, which are what the
+	// hub looks subscriptions up by. They are untrusted: they say which rows are candidates,
+	// never which tenant this is. The tenant comes from the candidate whose secret verifies the
+	// body (principle 2).
+	//
+	// It takes the body and the headers rather than a Request, because the identifiers are in the
+	// delivery's own content: no provider puts them somewhere only a Request would carry, and a
+	// lookup key read from configuration rather than from the delivery would select candidates
+	// for the wrong delivery.
+	DeliveryKeys(body []byte, h Header) (DeliveryKeys, error)
+
+	// Verify reports whether the delivery is signed with secret, compared in constant time. It
+	// never errors and never panics: a missing secret, a missing or malformed signature, a
+	// missing r.URL that this scheme needs, and a body that is not what the provider sends are
+	// all a plain false (principle 1). It is called once per candidate subscription, so it does
+	// no I/O.
+	Verify(r Request, secret []byte) bool
+
+	// Parse turns a verified delivery into its changes. It runs in the worker, on the stored
+	// bytes, never on the accept path.
+	Parse(body []byte) ([]Change, error)
+}
+
+// URLSigner is the optional capability of a WebhookSource whose signature scheme covers
+// Request.URL: HubSpot v3 signs the method, the full public request URI, the body and a timestamp.
+// It is a marker and not a method that returns a bool, so that a scheme cannot say "no" by
+// accident in a refactor.
+//
+// A deployment that registers such a provider and configures no LAWANG_PUBLIC_BASE_URL cannot
+// accept one single delivery of it: Request.URL is empty, Verify returns false rather than guess,
+// and every delivery is answered 401, which is the status the contract reserves for a forged
+// signature and which is only visible on the provider's own dashboard. The edge cannot see that
+// coming, because it does not know which schemes sign the URL. The hub does, because it is handed
+// the registry, so hub.New refuses to start (architecture 4).
+type URLSigner interface {
+	WebhookSource
+	// SignsPublicURL says that this scheme's signature covers Request.URL. It does nothing.
+	SignsPublicURL()
+}
+
+// Registrar is the optional capability of a provider that creates its own webhook registrations,
+// renews them before they lapse and removes them again. The operator API and "lawang connect"
+// (B14) call Register and Deregister, and the renewal sweep (B19) calls Renew.
+//
+// Everything it returns ends up in the subscriptions table, which is what the accept path resolves
+// a delivery's owner in, so a Subscription's delivery keys have to be the ones the provider will
+// actually put on a delivery. A registration whose workspace id is spelled differently from the
+// one the webhooks carry is a subscription that never matches a candidate, and every delivery it
+// was made for is parked as unowned.
+type Registrar interface {
+	// Register creates the provider-side webhooks for one tenant and returns what it created, one
+	// Subscription per resource. It talks to the provider's API, so it never runs on the accept
+	// path and never inside a transaction.
+	Register(ctx context.Context, t tenancy.ID, cred Credential) ([]Subscription, error)
+	// Renew extends a registration that expires (a Microsoft Graph subscription lasts hours) and
+	// returns it as it now stands. A provider whose registrations do not expire returns s.
+	Renew(ctx context.Context, s Subscription) (Subscription, error)
+	// Deregister removes the provider-side webhook. It is called before the row is deleted, so a
+	// deployment that is taken down stops being sent deliveries it would only park.
+	Deregister(ctx context.Context, s Subscription) error
+}
+
+// Credential is one tenant's credential for one provider, as the vault hands it out: the API token
+// or client secret a Registrar authenticates with, and that hydration uses later.
+//
+// It is deliberately opaque, for the same reason Hydrated is: what a credential holds is the
+// vault's business (B13) and the connect command's (B14), and no two providers' credentials have a
+// field in common. Writing a struct for it here, before the items that decide it, would be a shape
+// every one of them has to rewrite. What is already settled is where it may go: a Credential is
+// secret material, so it never reaches a log line, an error, a plain table or a record.
+type Credential any
+
+// Subscription is one webhook registration Lawang owns, as a row of the subscriptions table and as
+// a Registrar returns it. It is what makes a delivery somebody's: the accept path looks rows up by
+// the delivery's own keys and takes the tenant of the one whose Secret verifies the exact bytes.
+//
+// The zero Subscription is not a subscription: every field but Workspace and External is required,
+// and at least one of those two has to be set, or nothing could ever select the row.
+type Subscription struct {
+	// ID is Lawang's own id for the registration, a ULID. It is not the provider's id (that is
+	// External), and it is what the outbox orders an accepted delivery by.
+	ID string
+	// Tenant owns the registration. It comes from an operator credential (B14), never from a
+	// delivery.
+	Tenant tenancy.ID
+	// Provider is the registry's own key, a constant of this program.
+	Provider string
+	// Resource is what the registration covers, in the provider's own words: a ClickUp workspace,
+	// a mailbox, a channel. It identifies the registration for Lawang, so registering the same
+	// resource again updates this row rather than adding a second one.
+	Resource string
+	// Workspace is the provider's id of the workspace, team, portal or account, as it will appear
+	// on a delivery (DeliveryKeys.Workspace), or empty for a provider that sends none.
+	Workspace string
+	// External is the provider's id of the registration itself, as it will appear on a delivery
+	// (DeliveryKeys.Subscription), or empty for a provider that sends none.
+	External string
+	// Secret is what deliveries of this registration are signed with, and the only credential the
+	// accept path needs. It is secret material: it is never logged, never returned to a caller
+	// outside Lawang, and LogValue and String keep it out of a log line and out of an error.
+	//
+	//nolint:gosec // G117: it is a secret on purpose. This struct is never marshalled to JSON (the
+	// operator API of B14 has its own shape), the column it is stored in is granted to the
+	// resolver role alone, and the two printing methods below redact it, which
+	// TestASubscriptionNeverPrintsItsSecret holds them to.
+	Secret []byte
+}
+
+// LogValue is what a structured log line gets: everything but the secret.
+func (s Subscription) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", s.ID),
+		slog.String("tenant", s.Tenant.String()),
+		slog.String("provider", s.Provider),
+		slog.String("resource", s.Resource),
+		slog.Bool("has_secret", len(s.Secret) > 0),
+	)
+}
+
+// String covers %v, %+v and %s, so printing a Subscription cannot spill the secret either.
+func (s Subscription) String() string {
+	return fmt.Sprintf("{ID:%s Tenant:%s Provider:%s Resource:%s Workspace:%s External:%s Secret:[redacted %d bytes]}",
+		s.ID, s.Tenant, s.Provider, s.Resource, s.Workspace, s.External, len(s.Secret))
+}
+
+// GoString covers %#v.
+func (s Subscription) GoString() string { return "provider.Subscription" + s.String() }
+
+// Request is one delivery as a signature scheme sees it: the parts of the HTTP request a
+// provider's signing scheme can cover. It is a struct rather than a longer parameter list because
+// the schemes disagree about what a signature is over, and the next one to need a field it does
+// not have must not break every implementation that came before it. ClickUp signs the body alone,
+// Slack v0 signs a timestamp header and the body, and HubSpot v3 signs the method, the full
+// request URL, the body and a timestamp header, so the union is what is here.
+//
+// Everything in it arrived from the public internet except URL, which is configuration.
+type Request struct {
+	// Method is the request method, and it is always "POST": the ingress route fixes the method, so
+	// the mux answers anything else itself and no other method reaches a provider. It is carried
+	// because HubSpot v3 puts the method in its base string, and an implementation that builds
+	// that string from this field rather than from a literal keeps saying the truth if the edge
+	// ever routes a second method. There is nothing here to branch on.
+	Method string
+
+	// URL is the absolute public URL the provider posted to: the deployment's configured public
+	// base URL, then this request's own escaped path, then its raw query if it has one.
+	//
+	// It is deliberately not built from Host, X-Forwarded-Host or X-Forwarded-Proto. Every one of
+	// those is chosen by whoever sent the request (a tunnel or a reverse proxy passes them
+	// through), and a sender that chooses part of its own signed input can make a signature
+	// verify over content it picked, which is not a signature check at all.
+	//
+	// It is the empty string when the deployment set no public base URL. A scheme that signs the
+	// URL must then return false rather than guess one, because a signature verified against a
+	// URL Lawang invented proves nothing (fail closed). A scheme that does not sign the URL, which
+	// is most of them, ignores this field and is unaffected.
+	URL string
+
+	// Header is the request's header fields. A scheme's timestamp and its signature are here, and
+	// a header the sender did not send is the empty string, never an error.
+	Header Header
+
+	// Body is the exact bytes of the request, the ones a signature is over. An implementation
+	// must not re-serialize them, and must not modify the slice.
+	//
+	// This one is a rule and not a guarantee, which is the difference between it and Header. The
+	// slice is handed out by value and aliases the edge's own buffer, so an implementation that
+	// normalized the bytes in place (trimming a byte order mark, lower casing, blanking a field
+	// before hashing) would change what every later candidate verifies and what B07 then stores
+	// in the outbox. Nothing in the type system stops that, and a review of a provider package
+	// has to look for it.
+	//
+	// The hub makes it a guarantee where the per-candidate loop is: it hands each candidate its
+	// own copy of the slice, which costs 0.9 microseconds for an 8 KiB delivery and 57
+	// microseconds at the 1 MiB cap, against an accept path that targets 200 ms. It is not done
+	// here, because the edge builds one Request and has no candidate loop to copy in, and any
+	// other caller of Verify has to copy for itself.
+	Body []byte
+}
+
+// Header is the header fields of one delivery, as a provider sees them: readable, and with no way
+// to change what anything else will read.
+//
+// It is not an http.Header, and that is the point. The hub hands one Request to Verify once per
+// candidate subscription (B07), so with a map an implementation that normalized a header in place
+// (a Set or a Del on the way to building a base string) would change what every later candidate
+// sees, and the symptom would be a signature that fails only for the second candidate and only
+// when a tenant has more than one. A comment asking implementations not to do that is not a
+// guard, and cloning the map per request does not help either, since every candidate is handed
+// the same Request. A type with no mutating method takes the mistake off the table and copies
+// nothing: the edge wraps the request's own map once, and reading through the wrapper costs a
+// method call that inlines away.
+type Header struct {
+	h http.Header
+}
+
+// NewHeader wraps h, which the caller must not write to afterwards. The edge passes the request's
+// own map, which net/http does not touch once the handler has been called.
+func NewHeader(h http.Header) Header { return Header{h: h} }
+
+// Get returns the first value of the named field, matching the name case-insensitively the way
+// http.Header.Get does, and the empty string when the sender sent no such field. The zero Header
+// has no fields, so Get on it is the empty string rather than a panic.
+func (h Header) Get(name string) string { return h.h.Get(name) }
+
+// Values returns every value of the named field, in the order the sender sent them, and nil when
+// there is none. A scheme that refuses a delivery carrying two signature headers, which is two
+// claims where the protocol allows one, needs the count and not just the first value.
+//
+// The slice is a copy, so writing to it changes nothing another candidate will read.
+func (h Header) Values(name string) []string { return slices.Clone(h.h.Values(name)) }
+
+// Reply is a handshake answer. The zero Reply is an empty 200.
+type Reply struct {
+	// Status is the HTTP status, and 0 means 200. The edge accepts a 2xx and a 4xx and treats
+	// anything else as a bug in the provider: a handshake is not a delivery, so a 4xx for a
+	// malformed challenge is a legitimate answer, while a redirect (which would let a provider
+	// point a stranger somewhere) and a 5xx (which asks for a retry) are not.
+	Status int
+	// ContentType is the Content-Type header, and empty means text/plain; charset=utf-8. The edge
+	// refuses anything outside a closed allowlist (text/plain and application/json, optionally
+	// with charset=utf-8), because a handshake echoes a stranger's text and a provider that could
+	// name the type could make this origin serve something a browser executes.
+	ContentType string
+	// Body is written as it stands. A provider that echoes a challenge is echoing text a
+	// stranger sent, so it checks that text before putting it here.
+	Body []byte
+}
+
+// DeliveryKeys are the provider's own identifiers on a delivery that say which subscriptions
+// could own it. Both fields are optional, because providers differ: Slack sends a team id and
+// ClickUp a webhook id, Microsoft Graph sends a subscription id per notification, and HubSpot
+// sends a portal id. A key the provider did not send is the empty string, and the hub narrows
+// candidates by the keys it has.
+//
+// Nothing in here establishes a tenant. It is text from a stranger until a candidate's secret
+// verifies the body.
+type DeliveryKeys struct {
+	// Workspace is the provider's id of the workspace, team, portal or account.
+	Workspace string
+	// Subscription is the provider's id of the webhook registration itself.
+	Subscription string
+}

@@ -111,6 +111,15 @@ func checkVersion(version int) error {
 // Close releases every connection.
 func (db *DB) Close() { db.pool.Close() }
 
+// MaxConns is how many connections this pool may open, which is pool_max_conns in the database
+// URL or pgx's default of max(4, NumCPU).
+//
+// It is here because a caller that runs work in parallel has to size itself against it: the
+// worker's drain holds one connection per goroutine for as long as a row's transaction lasts,
+// so a pool of goroutines larger than this one does not drain faster, it only waits (and starves
+// the sweeps that share the same pool). internal/worker reads it in NewDrain.
+func (db *DB) MaxConns() int { return int(db.pool.Config().MaxConns) }
+
 // preflight fails closed on anything that would make tenant isolation silently not apply. Tests
 // that only ever connect as a superuser pass without isolation being real, so this runs on every
 // start, in every environment. It runs once per process: a membership changed by an administrator

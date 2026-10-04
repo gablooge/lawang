@@ -187,10 +187,14 @@ let tenant B's members of `slack:channel:C0GENERAL` see tenant A's records.
   only of bytes that need escaping, about 160 bytes fit in the 512. Base64 ids are mostly letters
   and digits, so a Graph id grows by a few bytes, not threefold. If an id ever does not fit, the
   record is refused with a clear error, which is the right failure for an access key. The limit
-  was not measured against real Graph tenants. B16 and B17 must check it against recorded ids,
-  **and they come before v0.1.0 for that reason**: after the release a longer scope id is a
-  wider pattern, and by [ADR 4](0004-record-format-v1.md) (decision 1) that is a new format
-  version.
+  was not measured against real Graph tenants. B16 and B17 were to check it against recorded
+  ids, and they came before v0.1.0 for that reason, until the 2026-10-03 scope cut moved both
+  past the release. **The verification is deferred and the limit is not**: the 512 bytes freeze
+  with v0.1.0 unmeasured, because after the release a longer scope id is a wider pattern, and by
+  [ADR 4](0004-record-format-v1.md) (decision 1) that is a new format version. So the first real
+  Graph id either fits or needs format v2. Whether to raise the bound before the release on an
+  argued worst case, or to accept that cost, is an open decision for the maintainer:
+  [#52](https://github.com/gablooge/lawang/issues/52).
 - The `provider` and `container_kind` grammar has no hyphen. Provider keys and container kinds
   are ours to choose, so living without one costs nothing. **Adding one later is not free:** it
   widens the pattern of the scope id (and of `external_id` and `container.kind`), a sink that
