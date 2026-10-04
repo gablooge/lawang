@@ -25,6 +25,15 @@
 //	  {"external_id":"fake:task:1","op":"upsert","version":"2",
 //	   "container":"L1","title":"hello","occurred_at":"2026-09-20T10:00:00Z"}]}
 //
+// An event has two optional fields that exist so that tests can reach the degraded path of
+// architecture 3.2, step 4, which no signature or parse test can reach:
+//
+//   - "hydrate":"fail" makes Hydrate return ErrHydrateUnavailable, as a provider whose API is
+//     down would;
+//   - a container of "?" (UnknownContainer) is a delivery that does not say which container the
+//     entity is in, which is the shape of a ClickUp comment webhook. Hydrate resolves it;
+//     Degrade cannot, and refuses rather than guess a scope.
+//
 // A signed delivery carries SignatureHeader: the hex of HMAC-SHA256 over the exact request bytes,
 // which Sign computes.
 package fake
@@ -66,6 +75,26 @@ const maxChallenge = 256
 // maxProviderID bounds the provider's own identifiers on a delivery.
 const maxProviderID = 128
 
+// ContainerKind is the container kind every scope this double mints is built on.
+const ContainerKind = "list"
+
+// UnknownContainer is the container of a delivery whose body does not say which container the
+// entity is in. Hydrate resolves it to ResolvedContainer, the way a real provider would ask its
+// API; Degrade returns provider.ErrCannotDegrade, because a degraded record that guessed a scope
+// would give one version of one entity a second id (ADR 4, decision 7).
+const UnknownContainer = "?"
+
+// ResolvedContainer is what Hydrate resolves UnknownContainer to.
+const ResolvedContainer = "resolved"
+
+// HydrateFail is the only value an event's "hydrate" field may carry.
+const HydrateFail = "fail"
+
+// ErrHydrateUnavailable reports a change whose event asked for a hydration failure. It stands for
+// every reason a real provider's API is momentarily unreachable, and it is not a bad delivery: the
+// same bytes hydrate fine once the API is back.
+var ErrHydrateUnavailable = errors.New("fake: the API is unreachable")
+
 // ErrBadDelivery reports a body this provider would not have sent. It never quotes the body.
 var ErrBadDelivery = errors.New("fake: bad delivery")
 
@@ -73,15 +102,36 @@ var ErrBadDelivery = errors.New("fake: bad delivery")
 var ErrBadChange = errors.New("fake: bad change")
 
 // Provider is the double. Build one with New and register it like any other provider.
-type Provider struct{ key string }
+type Provider struct {
+	key      string
+	versions provider.VersionOrder
+}
 
-// New returns a fake provider whose Key is exactly key. The key is deliberately not validated or
-// defaulted here: the registry owns that rule, and a test that proves the registry refuses a bad
-// key needs a provider that offers one.
-func New(key string) *Provider { return &Provider{key: key} }
+// New returns a fake provider whose Key is exactly key and whose versions are decimal counters,
+// which is what every fixture in the repository spells them as. The key is deliberately not
+// validated or defaulted here: the registry owns that rule, and a test that proves the registry
+// refuses a bad key needs a provider that offers one.
+func New(key string) *Provider {
+	return &Provider{key: key, versions: provider.VersionOrderDecimal}
+}
+
+// NewOrdering returns a fake provider that declares order rather than the decimal default.
+//
+// It is here because the version order is a contract on the provider and not a setting of the
+// pipeline, so the only way to test what the pipeline does with a base64 counter, a fixed-width
+// token or a provider that declares nothing is to have a provider that says so. The order is not
+// validated here either, for the same reason the key is not: the registry is what refuses one,
+// and the test of that refusal needs a provider that offers it.
+func NewOrdering(key string, order provider.VersionOrder) *Provider {
+	return &Provider{key: key, versions: order}
+}
 
 // Key is the provider key.
 func (p *Provider) Key() string { return p.key }
+
+// VersionOrder is how this provider spells a version: decimal counters unless the test asked for
+// something else with NewOrdering. Every Event fixture in the repository uses a plain counter.
+func (p *Provider) VersionOrder() provider.VersionOrder { return p.versions }
 
 // Sign is the signature a delivery of body carries, as SignatureHeader. It is here and not in a
 // test so that every test signs the same way Verify checks.
@@ -218,7 +268,38 @@ func (p *Provider) Hydrate(ctx context.Context, t tenancy.ID, c provider.Change)
 	if ev.ExternalID != c.ExternalID {
 		return nil, fmt.Errorf("%w: the payload is not this change's", ErrBadChange)
 	}
+	if ev.Hydrate == HydrateFail {
+		return nil, ErrHydrateUnavailable
+	}
+	// What hydration is for: the webhook did not say which container the entity is in, and the
+	// API does. The degraded path cannot do this, which is exactly why it refuses.
+	if ev.Container == UnknownContainer {
+		ev.Container = ResolvedContainer
+	}
 	return Object{Event: ev, Text: "hydrated " + ev.ExternalID}, nil
+}
+
+// Degrade builds the record of a change out of the webhook body alone, for when Hydrate could not
+// reach the API.
+//
+// It derives the scope through scopeFor, the same function Normalize uses, on the same input: that
+// is the rule provider.Degrader states, and it is what keeps one version of one entity to one
+// record id whichever path built it. Where the body does not name the container there is nothing
+// to derive a scope from, and no guess that would be honest, so it refuses.
+func (p *Provider) Degrade(c provider.Change) ([]record.Record, error) {
+	ev, err := p.parseEvent(c.Payload)
+	if err != nil {
+		return nil, err
+	}
+	if ev.ExternalID != c.ExternalID {
+		return nil, fmt.Errorf("%w: the payload is not this change's", ErrBadChange)
+	}
+	if ev.Container == UnknownContainer {
+		return nil, fmt.Errorf("%w: the delivery does not name the container", provider.ErrCannotDegrade)
+	}
+	// Everything but what only the API has. The hydrated text is not part of the record id, so the
+	// degraded record is the same record with less in it.
+	return p.recordsFor(ev, "")
 }
 
 // Normalize turns a hydrated object into one unsealed record.
@@ -230,31 +311,66 @@ func (p *Provider) Normalize(h provider.Hydrated, c provider.Change) ([]record.R
 	if obj.Event.ExternalID != c.ExternalID {
 		return nil, fmt.Errorf("%w: the object is not this change's", ErrBadChange)
 	}
-	scope, err := record.ScopeID(p.key, "list", obj.Event.Container)
+	return p.recordsFor(obj.Event, obj.Text)
+}
+
+// recordsFor is the one place a record of this provider is built, so the hydrated path and the
+// degraded path cannot disagree about anything that goes into the record id.
+//
+// hydratedText is what the API added, and the event's own text wins over it when the delivery
+// carried one, so that a test can put content in a webhook body and see it either way.
+func (p *Provider) recordsFor(ev Event, hydratedText string) ([]record.Record, error) {
+	scope, err := p.scopeFor(ev)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrBadChange, err)
+		return nil, err
+	}
+	text := hydratedText
+	if ev.Text != "" {
+		text = ev.Text
 	}
 	return []record.Record{{
-		Op:         record.Op(obj.Event.Op),
+		Op:         record.Op(ev.Op),
 		Kind:       record.KindTask,
-		ExternalID: obj.Event.ExternalID,
-		Version:    obj.Event.Version,
-		OccurredAt: obj.Event.OccurredAt,
-		Title:      obj.Event.Title,
-		Text:       obj.Text,
-		Container:  record.Container{Kind: "list", ID: obj.Event.Container},
+		ExternalID: ev.ExternalID,
+		Version:    ev.Version,
+		OccurredAt: ev.OccurredAt,
+		Title:      ev.Title,
+		Text:       text,
+		Author:     record.Author{ID: ev.Author, Display: ev.Author},
+		Container:  record.Container{Kind: ContainerKind, ID: ev.Container},
 		Visibility: record.Visibility{Scope: scope, Audience: record.AudienceGroup},
+		Origin:     record.Origin{Automation: ev.Automation},
 	}}, nil
 }
 
-// Event is one change on the wire, as this double spells it.
+// scopeFor is the one function that turns an event into a scope id. Both the hydrated path and the
+// degraded one call it, which is the rule provider.Degrader states: two paths that built a scope
+// out of the same event by different routes would give one version of one entity two record ids.
+func (p *Provider) scopeFor(ev Event) (string, error) {
+	scope, err := record.ScopeID(p.key, ContainerKind, ev.Container)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrBadChange, err)
+	}
+	return scope, nil
+}
+
+// Event is one change on the wire, as this double spells it. Only external_id, op, version,
+// container and occurred_at have to be there, so a test writes the fields it is about and no more.
 type Event struct {
 	ExternalID string    `json:"external_id"`
 	Op         string    `json:"op"`
 	Version    string    `json:"version"`
 	Container  string    `json:"container"`
 	Title      string    `json:"title"`
+	Text       string    `json:"text,omitempty"`
+	Author     string    `json:"author,omitempty"`
 	OccurredAt time.Time `json:"occurred_at"`
+	// Automation is what the source says about the author, and it becomes origin.automation. A
+	// real provider reads it off a bot flag on the event.
+	Automation bool `json:"automation,omitempty"`
+	// Hydrate is empty or HydrateFail. It is the one thing a delivery can say about what this
+	// double's API will do, and it is here so that the pipeline's degraded path can be tested.
+	Hydrate string `json:"hydrate,omitempty"`
 }
 
 type envelope struct {
@@ -300,6 +416,12 @@ func (p *Provider) parseEvent(raw []byte) (Event, error) {
 	}
 	if !validProviderID(ev.Version) || !validProviderID(ev.Container) {
 		return Event{}, fmt.Errorf("%w: version or container", ErrBadDelivery)
+	}
+	if ev.Hydrate != "" && ev.Hydrate != HydrateFail {
+		return Event{}, fmt.Errorf("%w: hydrate", ErrBadDelivery)
+	}
+	if ev.Author != "" && !validProviderID(ev.Author) {
+		return Event{}, fmt.Errorf("%w: author", ErrBadDelivery)
 	}
 	if ev.OccurredAt.IsZero() {
 		return Event{}, fmt.Errorf("%w: occurred_at", ErrBadDelivery)

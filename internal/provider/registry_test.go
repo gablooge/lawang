@@ -67,10 +67,10 @@ func TestNewRegistryRefusesTheListItCannotServe(t *testing.T) {
 	}
 }
 
-// shifty returns a different key every time it is asked. Nothing legitimate does that; the point
-// is that the registry asks once and keeps its own copy, so nothing downstream can be steered by
-// a provider that answers differently later.
-type shifty struct{ asked int }
+// shifty returns a different key, and a different version order, every time it is asked. Nothing
+// legitimate does that; the point is that the registry asks once and keeps its own copy of each,
+// so nothing downstream can be steered by a provider that answers differently later.
+type shifty struct{ asked, askedOrder int }
 
 func (s *shifty) Key() string {
 	s.asked++
@@ -86,6 +86,90 @@ func (s *shifty) Hydrate(_ context.Context, _ tenancy.ID, _ provider.Change) (pr
 
 func (s *shifty) Normalize(_ provider.Hydrated, _ provider.Change) ([]record.Record, error) {
 	return nil, errors.New("not used")
+}
+
+func (s *shifty) VersionOrder() provider.VersionOrder {
+	s.askedOrder++
+	if s.askedOrder == 1 {
+		return provider.VersionOrderDecimal
+	}
+	// Valid, so a second call cannot be caught by the registration check. It just orders two
+	// versions differently, which is the whole danger.
+	return provider.VersionOrderBase64
+}
+
+// TestAVersionOrderNamesItselfAndKnowsWhatItIs covers the two methods an operator's refusal
+// message and the registry's own check are built on.
+//
+// Valid is the check, and the thing worth pinning is that it is a list of what IS known and not a
+// test for the zero value: a stray conversion (a value from a later program, a cast of an int) has
+// to be as invalid as VersionOrderUnset, or a provider could declare one and be ordered by the
+// default branch of a switch. String is what a start-up refusal and a dead letter quote, so an
+// unknown value has to say what it was rather than say nothing.
+func TestAVersionOrderNamesItselfAndKnowsWhatItIs(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		order provider.VersionOrder
+		valid bool
+		name  string
+	}{
+		{provider.VersionOrderUnset, false, "no version order"},
+		{provider.VersionOrderDecimal, true, "decimal"},
+		{provider.VersionOrderLexical, true, "lexical"},
+		{provider.VersionOrderBase64, true, "base64"},
+		{provider.VersionOrder(200), false, "unknown version order 200"},
+	} {
+		if got := tc.order.Valid(); got != tc.valid {
+			t.Errorf("VersionOrder(%d).Valid() = %v, want %v", uint8(tc.order), got, tc.valid)
+		}
+		if got := tc.order.String(); got != tc.name {
+			t.Errorf("VersionOrder(%d).String() = %q, want %q", uint8(tc.order), got, tc.name)
+		}
+	}
+}
+
+// TestNewRegistryRefusesAProviderWithNoVersionOrder is the start-up half of ADR 12 decision 1.
+//
+// How a version is spelled is the only thing that lets internal/pipeline decide which of two
+// versions of one entity is newer, and it cannot be worked out from the strings: two versions in
+// any fixed width encoding are the same length, and base64, a hash and a UUID are all fixed width
+// and none of them sorts by value in ASCII. So the provider declares it, and a provider that
+// declares nothing must not register. The alternative is a process that starts, accepts
+// deliveries, and dead-letters every entity that changes twice.
+//
+// The zero value is one of the cases below on purpose: forgetting the method body has to fail, not
+// merely returning something odd.
+func TestNewRegistryRefusesAProviderWithNoVersionOrder(t *testing.T) {
+	t.Parallel()
+	for _, order := range []provider.VersionOrder{
+		provider.VersionOrderUnset,
+		provider.VersionOrder(200), // a value from a later program, or a stray conversion
+	} {
+		_, err := provider.NewRegistry(fake.NewOrdering("ordered_by_nothing", order))
+		if !errors.Is(err, provider.ErrNoVersionOrder) {
+			t.Errorf("NewRegistry with %s gave %v, want ErrNoVersionOrder", order, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), "ordered_by_nothing") {
+			t.Errorf("the refusal should name the provider, which is a program constant: %v", err)
+		}
+	}
+	// And the three real orders register, so the refusal above is about the declaration and not
+	// about the check being stuck at "no".
+	for _, order := range []provider.VersionOrder{
+		provider.VersionOrderDecimal,
+		provider.VersionOrderLexical,
+		provider.VersionOrderBase64,
+	} {
+		reg, err := provider.NewRegistry(fake.NewOrdering("ordered", order))
+		if err != nil {
+			t.Fatalf("NewRegistry with %s: %v", order, err)
+		}
+		entry, ok := reg.Lookup("ordered")
+		if !ok || entry.VersionOrder() != order {
+			t.Errorf("the registry kept %s for a provider declaring %s", entry.VersionOrder(), order)
+		}
+	}
 }
 
 func TestTheRegistryAsksForAKeyOnceAndKeepsItsOwnCopy(t *testing.T) {
@@ -108,6 +192,43 @@ func TestTheRegistryAsksForAKeyOnceAndKeepsItsOwnCopy(t *testing.T) {
 	}
 	if p.asked != 1 {
 		t.Fatalf("Key was asked again after registration (%d times)", p.asked)
+	}
+}
+
+// TestTheRegistryAsksForAVersionOrderOnceAndKeepsItsOwnCopy is the test above, for the other thing
+// the registry validates and then stores.
+//
+// Entry.VersionOrder's doc comment promises that a provider which changes its answer after
+// start-up cannot change how a delivery already stored is ordered, and that promise is what the
+// whole of ADR 12 decision 1 rests on: the pipeline reads the order through the Entry precisely so
+// that it reads the one registration validated. Until this test existed, answering
+// e.p.VersionOrder() here survived the entire repository, because shifty's order was a constant
+// and no other provider changes its mind either.
+//
+// Both halves matter. Asking once is what makes the answer a copy rather than a cache of the
+// latest opinion, and the answer itself is what a pipeline would order a stored delivery by.
+func TestTheRegistryAsksForAVersionOrderOnceAndKeepsItsOwnCopy(t *testing.T) {
+	t.Parallel()
+
+	p := &shifty{}
+	reg, err := provider.NewRegistry(p)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	if p.askedOrder != 1 {
+		t.Fatalf("VersionOrder was asked %d times at registration, want exactly 1", p.askedOrder)
+	}
+	entry, ok := reg.Lookup("first")
+	if !ok {
+		t.Fatal("Lookup(first) missed")
+	}
+	if got := entry.VersionOrder(); got != provider.VersionOrderDecimal {
+		t.Fatalf("the entry answers %s, want %s: the registry followed the provider's later answer "+
+			"instead of the copy it validated, so a provider could change how a stored delivery is "+
+			"ordered after start-up", got, provider.VersionOrderDecimal)
+	}
+	if p.askedOrder != 1 {
+		t.Fatalf("VersionOrder was asked again after registration (%d times)", p.askedOrder)
 	}
 }
 

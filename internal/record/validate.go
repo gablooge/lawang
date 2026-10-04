@@ -155,10 +155,19 @@ const (
 	contentChars
 )
 
-// refuses reports whether the rule forbids c. It is for the three rules that read characters:
-// contentChars refuses one byte, and checkString looks for that byte without decoding the text.
+// refuses reports whether the rule forbids c, for every one of the four rules.
+//
+// checkString does not ask it for contentChars, because a text may be a megabyte and the one
+// character that rule forbids is a byte it can find without decoding. The arm is here all the
+// same, and it is first so that the control-character arm below cannot answer for contentChars
+// by accident: CleanText asks this question per character, and a rule that answered "every
+// control character" there would strip the newlines out of every text in the program.
+// TestTheCharacterRulesAgreeWithValidation holds this function and checkString to one verdict
+// over every code point, for all four rules, so the two cannot drift.
 func (rule charRule) refuses(c rune) bool {
 	switch {
+	case rule == contentChars:
+		return c == 0
 	case c < 0x20, c >= 0x7F && c <= 0x9F, c == 0x2028, c == 0x2029:
 		return true
 	case rule == oneLineChars:
@@ -268,3 +277,12 @@ func validName(s string, maxLen int, hyphen bool) bool {
 // the provider registry calls this, and a test holds the two to the same verdict on every
 // candidate. ADR 3 freezes the grammar at v0.1.0 in both directions, hyphen included.
 func ValidProviderKey(s string) bool { return validName(s, maxKind, false) }
+
+// ValidSource reports whether s may be a Record.Source: a lowercase letter followed by up to 63
+// of a-z, 0-9, underscore and hyphen, so at most 64 bytes.
+//
+// It is the rule Validate applies to Source, exported because Source is also where a sink's wire
+// name goes (principle 4). A sink checks a configured name once, where the configuration is read,
+// rather than meeting a bad one in MarshalJSON per record. Every provider key is a source name,
+// because the key grammar is this one without the hyphen and a quarter of the length.
+func ValidSource(s string) bool { return validName(s, maxSource, true) }

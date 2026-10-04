@@ -5,23 +5,41 @@
 *Lawang* is Javanese for door or gate: the thing every change passes through, and where it is
 decided who may see it.
 
-Lawang connects a workspace's SaaS tools (Slack, Microsoft Teams, Outlook, ClickUp, HubSpot),
-receives their webhooks directly, and turns every change into a clean, permission-stamped record
-delivered exactly once to your memory, search, or RAG system.
+Lawang connects a workspace's SaaS tools (ClickUp and Slack in v0.1.0, with Microsoft Teams,
+Outlook and HubSpot after it), receives their webhooks directly, and turns every change into a
+clean, permission-stamped record delivered exactly once to your memory, search, or RAG system.
 
 > **Status: pre-alpha.** The foundations are built (M0: configuration, id recipes, Postgres with
 > row-level security, the outbox), the record format is settled
-> ([schema](internal/record/record.v1.schema.json)), and the webhook edge now exists: the provider
-> interfaces, the registry and `/ingress/{provider}` with raw-body capture, a size cap and the
-> handshake hook. What is still missing is the half that makes a delivery belong to somebody:
-> signature verification against owned subscriptions, and the outbox insert. So no webhook is
-> stored yet, **and `lawang serve` does not mount the route at all**: an edge with no hub would
-> answer a provider without storing anything, so B07 is the item that wires it and until then a
-> POST to `/ingress/{provider}` is a 404 from the mux. The design
+> ([schema](internal/record/record.v1.schema.json)), and the accept path is now whole: the webhook
+> edge, and the hub behind it that resolves which tenant a delivery belongs to, verifies the exact
+> bytes against that tenant's own subscription, and writes the outbox row. `lawang serve` wires
+> both, so a signed delivery for a registered subscription is stored, a forged one is a 401 that
+> stores nothing, and one nobody can be shown to own is parked rather than routed. The pipeline
+> that turns a stored delivery into records exists too: it hydrates, normalizes, drops automation
+> noise, checks every record against the tenant of the row being drained, keeps the supersede chain
+> forward only (under the version spelling each provider declares, refusing what it cannot order
+> rather than guessing), and masks addresses, telephone numbers and bank accounts with the map from
+> placeholder to value kept locally. The three sinks are built as well: `http`, a strict `stub`
+> that refuses whatever the format refuses and remembers what it holds, and `jsonl` files for
+> development. The worker drain joins them up: it claims outbox rows across tenants, works each
+> one under its own tenant, commits the ledger rows and the records it prepared together,
+> delivers them, and records what came back, down to the single record a sink refused while the
+> rest of the batch landed. A crash between its two commits re-delivers what the first one
+> stored instead of losing it, a failing sink walks the retry ladder and parks, a sink that
+> refuses the request itself stalls without killing anything, and a replay brings a dead letter
+> back. The first provider package is here: **ClickUp** verifies its
+> `X-Signature`, parses a delivery, hydrates a task (and a comment's parent task) through a rate
+> limiter that refuses rather than waits, and normalizes a comment into the comment and its
+> parent, against payloads built from ClickUp's published documentation until B12 records real
+> ones. **It is not registered in the binary yet**, because hydration needs one API token per
+> tenant and the vault brings those, so every `/ingress/{provider}` segment is still a 404, and
+> `lawang worker` is not wired up yet either: the drain is a package, and the command needs the
+> per-tenant sink configuration that the vault and the operator API bring. The design
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in
 > [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the
-> point where it runs end to end against real providers.
+> point where it runs end to end against real ClickUp and Slack workspaces.
 
 ---
 
@@ -44,7 +62,8 @@ is the part that matters once the data lands in something an AI agent reads.
   disabled, subscriptions expire, and some providers never redeliver.
 - **Tenant isolation by construction.** Postgres row-level security on every table, fail closed.
   An incoming webhook's tenant comes from a subscription row Lawang owns, never from the
-  payload, and a delivery that more than one tenant could claim is refused rather than routed.
+  payload, and a delivery that more than one subscription row could claim is refused rather than
+  routed.
 - **No broker.** One Postgres, an outbox table, and a worker. The hand-off between accepting a
   webhook and delivering a record is a database row, so there is nothing else to run or lose.
 - **Credentials held safely.** A local encrypted vault by default, or a self-hosted
@@ -69,15 +88,20 @@ slow (fetching the full object, normalizing, delivering) happens in the worker, 
 retries on a backoff ladder and eventually parks as a replayable dead-letter state instead of
 getting lost.
 
-## Providers planned for v0.1
+## Providers
 
-| Provider | Ingest | Where visibility comes from |
-|---|---|---|
-| ClickUp | webhook (one per workspace) | list members |
-| Slack | Events API | channel members; DM participants |
-| Microsoft Teams | Graph subscription, renewed hourly | channel members |
-| Outlook | Graph subscription per mailbox, renewed | the mailbox owner |
-| HubSpot | reconcile-only by default, webhooks optional | portal owners |
+v0.1.0 ships two of these. The other three were cut from the release on 2026-10-03 so that the
+date would hold, not because the design changed: they are designed for throughout
+[docs/architecture.md](docs/architecture.md) and are the first entry under
+[After v0.1](docs/roadmap.md#after-v01).
+
+| Provider | In | Ingest | Where visibility comes from |
+|---|---|---|---|
+| ClickUp | v0.1.0 | webhook (one per workspace) | list members |
+| Slack | v0.1.0 | Events API | channel members; DM participants |
+| Microsoft Teams | after v0.1 | Graph subscription, renewed hourly | channel members |
+| Outlook | after v0.1 | Graph subscription per mailbox, renewed | the mailbox owner |
+| HubSpot | after v0.1 | reconcile-only by default, webhooks optional | portal owners |
 
 Adding a provider means adding one Go package that implements a small set of interfaces. See
 [docs/architecture.md](docs/architecture.md#extension-points).

@@ -65,26 +65,27 @@ deregisters the provider-side webhook; no table contains token material (checked
 scans the database after a full connect); the local vault refuses to start in production without a
 key.
 
-### M3 · The other four providers (L)
+### M3 · Slack, the second provider (M)
+
+v0.1.0 ships two providers. Outlook, Teams and HubSpot were cut from this release on 2026-10-03,
+to hold the release date rather than for any reason of design, and they are the first entry under
+[After v0.1](#after-v01).
 
 - **Slack:** Events API, the URL challenge (signature-checked when a signing secret is set), the
   replay window, channels and DMs as scopes, mrkdwn links unwrapped before masking
-- **Outlook:** a Graph subscription per mailbox, the `validationToken` echo as plain text,
-  `clientState` checks, mixed-subscription batches split per owner, direct Graph hydration
-- **Teams:** channel-message subscriptions, hourly expiry, reply threading, system events skipped
-- **HubSpot:** reconcile-only by default, signed webhooks as an option
-- the renewal sweep, including recovery when a provider has deleted the subscription
+- registrars for the two providers, and the renewal sweep, including recovery when a provider has
+  deleted the subscription
 - `/v1/subscriptions/health`
 
-**Done when:** each provider lands a real event at the sink from a real tenant, and each has
-signature-negative, handshake, and normalizer golden-file tests; an expiring subscription renews
-before it lapses under a fast-forwarded clock.
+**Done when:** ClickUp and Slack each land a real event at the sink from a real tenant, and Slack
+has signature-negative, handshake and normalizer golden-file tests; an expiring subscription
+renews before it lapses under a fast-forwarded clock.
 
 ### M4 · Reconciliation and access sync (M)
 
 - cursors, chunked reconcile passes with pacing between chunks and never inside a transaction
-- reconcilers for ClickUp, Slack and HubSpot
-- member sources for all five providers; the identity resolver (email join, domain-restricted)
+- reconcilers for ClickUp and Slack
+- member sources for ClickUp and Slack; the identity resolver (email join, domain-restricted)
 - membership diff against a local record of what was sent, pushed to sinks that accept it
 - provider read failures abort the pass instead of reading as "no members"
 
@@ -126,7 +127,7 @@ What carries over, what changes, and what is intentionally left behind.
 
 | Capability | Milestone | Status in the rewrite |
 |---|---|---|
-| Five providers with webhook ingest | M1, M3 | same |
+| Five providers with webhook ingest | M1, M3 | **changed:** v0.1.0 ships ClickUp and Slack; Outlook, Teams and HubSpot are after v0.1 |
 | Constant-time signature checks over raw bytes; handshakes | M1, M3 | same |
 | Tenant from the owned row; ambiguous owner refused | M1 | same |
 | Outbox accept with delivery dedupe; 202 before any provider I/O | M1 | same |
@@ -137,8 +138,8 @@ What carries over, what changes, and what is intentionally left behind.
 | Strict stub sink; record format enforced in CI | M1 | same, and the stub is strict from day one |
 | Wire name separate from the internal key | M1 | same, now sink configuration |
 | Local, Nango and Azure-app vaults; connect CLI | M2 | same |
-| Registrars and renewal with deleted-subscription recovery | M3 | same |
-| Reconciliation for ClickUp, Slack and HubSpot | M4 | **changed:** chunked commits, pacing outside transactions |
+| Registrars and renewal with deleted-subscription recovery | M3 | same, for the two providers v0.1.0 ships |
+| Reconciliation for ClickUp, Slack and HubSpot | M4 | **changed:** chunked commits, pacing outside transactions, and HubSpot after v0.1 |
 | Membership sync with a shadow diff and email identity join | M4 | **generalized** into access sync for any sink that accepts membership |
 | DMs made private through a flag | M1, M3 | **changed:** one uniform scope-membership rule, no private flag |
 | Worker as a single sequential loop | M0 | **changed:** independent goroutines; sweeps elected by advisory lock |
@@ -153,6 +154,12 @@ What carries over, what changes, and what is intentionally left behind.
 
 Roughly in priority order.
 
+- **Outlook, Teams and HubSpot.** Cut from v0.1.0 on 2026-10-03, when M1 had slipped and the
+  remaining items no longer fitted the release date. They are deferred, not dropped: the design
+  below them (the shared Graph client, the per-mailbox and per-channel subscription model, the
+  reconcile-only HubSpot path) is still in [architecture.md](architecture.md), and they are
+  tracked as B16, B17 and B18 under the `Post v0.1.0` milestone. Teams is the cheapest of the
+  three to add once the Graph client exists, because it shares it with Outlook.
 - **Deletions.** Providers that report deletes, and reconciliation that notices absences, emit
   `op: "delete"` records. Format v1 already defines them, so shipping this does not change the
   format ([ADR 4](adr/0004-record-format-v1.md)).
@@ -184,3 +191,8 @@ Each becomes a short decision record under `docs/adr/` when it is settled.
 | 8 | Configuration | environment only for v0.1 | Twelve-factor, container-friendly; a file format can come later |
 | 9 | License | Apache 2.0 | Patent grant, standard for Go infrastructure projects |
 | 10 | How the outbox claim finds the head of each ordering key | **settled:** a stored marker kept under the key's lock, see [ADR 10](adr/0010-outbox-head-marker.md) | Working the heads out on every poll cost 4 seconds at a million waiting rows, on a path that runs every second |
+| 11 | Where the webhook verification secret lives, what an unattributable delivery becomes, and what an accepted delivery is ordered by | **settled:** a subscription column, a parked row under the sentinel tenant, and the subscription it arrived on, see [ADR 11](adr/0011-hub-resolution.md) | The accept path derives the tenant from the secret, so a vault keyed by tenant cannot serve it; and routing a delivery two tenants could claim is how data crossed tenants in the predecessor |
+| 12 | What orders the supersede chain, what the ledger holds, and what a masked value's placeholder is | **settled:** the provider declares how it spells a version (`provider.VersionOrder`: decimal, lexical or base64, refused at registration when absent) and the pipeline orders only under that declaration, refusing by name what it cannot read, then arrival order for two records that carry the same version; one row per record PREPARED, keyed per entity; and a random placeholder with the map kept locally, see [ADR 12](adr/0012-ledger-supersede-masking.md) | ADR 4 left "monotonic version" undefined for an opaque string, and a chain that can point backwards replaces a newer record at the sink together with the scope access is decided on |
+| 13 | What a 2xx body whose members the `http` sink does not know should mean, and whether the request carries a protocol version | **settled:** both, see [ADR 13](adr/0013-sink-wire-protocol.md). A non-empty 2xx body must carry a member the sink knows (`rejected`) or it is unreadable, the request carries `{"v":1,...}`, the `rejected` member must be a list (`null` is unreadable), and a receiver refusing the version answers 426 or 400, which halt and kill no record; round 3 inverted the 4xx default, so an unrecognised 4xx halts and 422 is the whole per-record refusal band | A receiver that misspelled the member, or wrote it for a later version, had every record of the batch marked delivered and the refused one lost with nothing in `last_error`; and the protocol freezes with v0.1, so a version cannot be added later without being a change |
+| 14 | Where a per-record dead letter lives, when every outbox transition takes one row and one delivery | **settled:** the records of a delivery are rows of their own (`outbox_record`), see [ADR 14](adr/0014-prepared-records.md). That table is also what the drain's first commit stores, which it had to have anyway: the ledger holds what was prepared, so a worker that died between the two commits could not derive its records again | `sink.DeliveryResult.Rejected` had nothing behind it, so a batch with one refusal in it could only be marked delivered (losing the refused record) or killed (losing the records that landed), and architecture section 11 has promised the per-record dead letter since before B04 |
+| 15 | What a ClickUp delivery identifies, what shape a ClickUp registration takes (ADR 11 decision 5 left this to B11 and B14), and how a ClickUp version is spelled | **settled:** see [ADR 15](adr/0015-clickup-provider.md). A delivery carries the webhook id and no workspace id, so a subscription records the webhook id in `external_id` and the workspace in `resource`, which is what the upsert keys on: one row per workspace per tenant. The unique-index question ADR 11 left open is closed with a per-tenant partial unique index on the REGISTRATION id (migration 00006), which refuses the two rows of one tenant that would park a delivery for ever and leaves Microsoft Graph's several rows of one tenant on one workspace alone, since each carries its own subscription id. The version is decimal epoch milliseconds, the later of the entity's own timestamp and the delivery's event time, so a move between lists always moves it | A registration shape that records no webhook id parks every delivery of a workspace for ever, and a version that does not move on a move leaves ADR 4 decision 7's A to B and back to A case for the ledger to dead-letter |
