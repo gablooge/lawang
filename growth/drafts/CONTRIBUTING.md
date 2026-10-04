@@ -1,14 +1,27 @@
 # Contributing to Lawang
 
+> **This file is a draft.** It lives in `growth/drafts/` and is not in force. It takes effect only
+> if the maintainer moves it to the repository root. Passages marked
+> `[maintainer: confirm or change]` are claims only they can settle. Delete this block and those
+> markers on the way.
+
 Thank you for looking at this. This page says what you need, how to run the checks, and what kind
 of review your pull request will get. Please read the review section: it is not the usual one.
 
 ## Where the project is today
 
-Lawang is pre-alpha. Milestone M0 is done: configuration, the id recipes, Postgres with row-level
-security, and the outbox. Nothing ingests a webhook yet. There is no release, no container image
-and no quickstart. The README's status paragraph is the honest summary, and
-[docs/backlog.md](docs/backlog.md) is the work queue.
+Lawang is pre-alpha. There is no release, no container image and no quickstart.
+
+This page does not say what is built, on purpose. A status written down twice goes out of date in
+one of the two places, and the one a contributor reads first is the one that misleads them. Two
+places are kept current, and they are the answer:
+
+- The status paragraph at the top of [README.md](README.md): what runs today, in prose.
+- [docs/backlog.md](docs/backlog.md): the work queue, item by item, with what is done and what is
+  next. Item BNN is issue #NN on GitHub, and the issue carries the real state.
+
+Read both before you write anything. The project moves quickly enough that a fortnight-old
+impression of it is usually wrong.
 
 This matters for your pull request. The backlog is ordered, and each item depends on the ones
 above it. A change that belongs to a later item is usually better as an issue today than as code.
@@ -36,8 +49,9 @@ are small, self-contained, and need no provider account.
 Docker runs two things. The integration tests start a real Postgres with testcontainers, and
 `make sqlc` runs sqlc from a pinned image, so nobody has to install sqlc itself.
 
-You do not need a provider account (Slack, ClickUp, Microsoft, HubSpot) to contribute. You do not
-need any AI tool either, even though the maintainer uses one (see "The review you will get").
+You do not need a provider account to contribute: not ClickUp or Slack, which v0.1.0 connects, and
+not Microsoft or HubSpot, which come after it. You do not need any AI tool either, even though the
+maintainer uses one (see "The review you will get").
 
 ## Build and run
 
@@ -171,9 +185,33 @@ review, decides what matters, and merges. If the agent and you disagree twice ab
 point, that is a decision for the maintainer, not a bug, and the pull request is labelled
 `review:needs-maintainer` and waits for them.
 
-**How long it takes.** Usually hours, not weeks. One person maintains this in their spare time, so
-there is no service level agreement and no promise. If a pull request has been quiet for a while,
-a polite comment on it is welcome.
+**It is not one review. Expect up to three rounds.** The cycle is written down in `CLAUDE.md`
+under "The cycle for one item". The reviewer posts its findings. You answer every one of them,
+with a fix or with a reason why it is wrong, and push. The reviewer reads your new commits and
+reviews again. Three rounds is the limit: if blocking findings survive the third, or the same
+point is disputed twice, the pull request is labelled `review:needs-maintainer` and waits for a
+person to decide. Rounds can also happen after an approval, when a later fix gets a delta review
+of just the new commits. Pull request #47 is a worked example, with three full rounds and three
+delta reviews. This is normal here and it is not a judgement on your change, but it does mean the
+exchange is longer than one review, and all of it is on the record in public.
+
+**How long it takes.** This depends on whether your change is on the backlog queue, and a change
+from outside the project is not. Measured from this repository's own pull requests on 2026-10-04:
+
+| Kind of pull request | First review | Opened to merged |
+|---|---|---|
+| A backlog item, in queue order | 16 to 103 minutes (#47, #51, #53, #56, #57) | 11 and 12 days for the two slowest (#48, #49), which waited on the branch below them |
+| Anything else | two weeks. #35 and #46 each got a first review 15 days after they were opened, and #45 had none after 14 days | none of the three had merged |
+
+So the honest recent range for a pull request from outside the queue is **days to weeks**, and the
+longest wait on record is the one a contributor would be in. One person maintains this in their
+spare time. There is no service level agreement, no promise and no target: the table is a
+measurement of the past, not a commitment about the future, and it may get better or worse.
+
+Two things make it so, and both are mechanisms rather than moods. The queue comes first, because
+the backlog is what gets the project to a release. And every round above is a person deciding to
+sit down and run the cycle. A quiet fortnight is capacity, not disregard, and a polite comment on
+a quiet pull request is welcome.
 
 **A finding is not a rejection.** Most pull requests here, including the maintainer's own, get
 findings. That is what the review is for. You have two good answers to any finding: fix it, or
@@ -190,7 +228,8 @@ surprised, not because anyone expects you to try.
 **One more thing about pull requests from forks.** For a pull request from a fork, the
 maintainer may not run the agent at all, because running it means running a stranger's build and
 tests on their own machine. Expect a review by hand plus CI in that case. It may take a little
-longer.
+longer. `[maintainer: confirm or change]` No fork pull request has arrived yet, so this describes
+an intention rather than a habit. The reasoning is on issue #29.
 
 ## Who decides
 
@@ -200,10 +239,12 @@ and the project says so rather than implying otherwise.
 
 What that means in practice:
 
-- The order of work is [docs/backlog.md](docs/backlog.md). A change that jumps the queue may wait,
-  even when it is good.
-- Answers usually come within hours, sometimes within a day or two. There is no guarantee. A quiet
-  week is capacity, not disregard.
+- The order of work is [docs/backlog.md](docs/backlog.md). A change that jumps the queue waits for
+  the queue, even when it is good. That single mechanism explains the waiting times in "How long
+  it takes" above, and it is the thing to plan around: a change that lines up with the current
+  backlog item is looked at quickly, and one that does not may sit.
+- There is no guarantee on any answer. A quiet week, or a quiet fortnight, is capacity and not
+  disregard.
 - A "no" is a real possible answer, and you should get a reason with it.
 
 ## Licence
