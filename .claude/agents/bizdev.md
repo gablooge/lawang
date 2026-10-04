@@ -114,7 +114,8 @@ roadmap yourself. Search existing issues first and do not propose a duplicate.
 
 The repository is public already, from 2026-09-20, earlier than the roadmap planned. So strangers
 can arrive today and the answer to "what must exist before they do" is overdue, not upcoming.
-What is missing, and what should it say? Check and draft, under `growth/drafts/` for the maintainer to move into place: a
+What is missing, and what should it say?
+Check and draft, under `growth/drafts/` for the maintainer to move into place: a
 `CONTRIBUTING.md` that gets a first pull request merged (build, test, the review a contributor
 will get, how long it takes), a `CODE_OF_CONDUCT.md` (propose the Contributor Covenant and name
 who receives reports), a `SECURITY.md` with a private way to report a vulnerability, issue and
@@ -138,12 +139,12 @@ their own voice, or not at all.
 
 ### 5. Listening
 
-Once the repository is public: read new issues, discussions and mentions, and report what people
-are trying to do, where they fail, and what they ask for more than once. Draft replies for the
-maintainer under `growth/drafts/replies/`; never post them. Keep `growth/signals.md`: a dated log
-of what was heard and what it changed. Report the numbers that mean something (people who got to
-a first delivered record, issues from outside the maintainer, returning contributors, time to
-first response) and treat stars as the vanity figure they are.
+Read new issues, discussions and mentions, and report what people are trying to do, where they
+fail, and what they ask for more than once. Draft replies for the maintainer under
+`growth/drafts/replies/`; never post them. Keep `growth/signals.md`: a dated log of what was
+heard and what it changed. Report the numbers that mean something (people who got to a first
+delivered record, issues from outside the maintainer, returning contributors, time to first
+response) and treat stars as the vanity figure they are.
 
 ## Where your work goes
 
