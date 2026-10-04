@@ -180,8 +180,47 @@ func (q *Queries) Get(ctx context.Context, id string) (GetRow, error) {
 	return i, err
 }
 
+const halt = `-- name: Halt :execrows
+UPDATE outbox
+   SET next_attempt_at = now() + make_interval(secs => $1::float8),
+       last_error = $2, lease_until = NULL, lease_token = NULL,
+       attempts = GREATEST(attempts - 1, 0)
+ WHERE id = $3 AND lease_token = $4::text AND state IN ('pending', 'prepared')
+`
+
+type HaltParams struct {
+	PauseSeconds float64
+	LastError    string
+	ID           string
+	LeaseToken   string
+}
+
+// A failure that the ladder must not walk: the sink refused the request itself, or Lawang could
+// not even build the delivery (no sink for the tenant, a sink that broke its contract). The row
+// keeps its state and its head marker, so nothing of its entity passes it, and it is claimable
+// again after the pause.
+//
+// attempts goes back down, because this attempt is not one the ladder may count. Two things rest
+// on that: Fail indexes the ladder by the attempt count, so a halting sink would otherwise walk
+// the ladder to its end and dead-letter rows that architecture section 11 says must never be
+// dead-lettered; and the drain parks a row whose attempts have run away from the ladder with no
+// recorded failure, which a halt would otherwise trip.
+func (q *Queries) Halt(ctx context.Context, arg HaltParams) (int64, error) {
+	result, err := q.db.Exec(ctx, halt,
+		arg.PauseSeconds,
+		arg.LastError,
+		arg.ID,
+		arg.LeaseToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const lockOrderingKey = `-- name: LockOrderingKey :exec
-SELECT pg_advisory_xact_lock(hashtextextended($1::text || chr(31) || $2::text, 0))
+SELECT pg_advisory_xact_lock(
+         hashtextextended($1::text || chr(31) || $2::text, 0) | (-9223372036854775808)::bigint)
 `
 
 type LockOrderingKeyParams struct {
@@ -209,13 +248,21 @@ type LockOrderingKeyParams struct {
 // miss each other just the same. store begins every transaction READ COMMITTED by name for that
 // reason, whatever default_transaction_isolation says. Two keys that hash alike only wait for each
 // other, which is harmless. The claim never takes it.
+//
+// The high bit of the key is set, which puts every ordering-key lock in the negative half of
+// Postgres's one advisory-lock namespace. internal/pipeline clears it, so its entity locks are
+// the non-negative half, and an ordering-key value can never equal an entity-key value. That is
+// what makes the cross-module rule ("ascending by key", see internal/pipeline/queries.sql and
+// ADR 12 decision 1) a total order without assuming the two hashes never collide. Each half
+// still holds 63 bits, and a collision WITHIN a half is a wait, not a deadlock.
 func (q *Queries) LockOrderingKey(ctx context.Context, arg LockOrderingKeyParams) error {
 	_, err := q.db.Exec(ctx, lockOrderingKey, arg.TenantID, arg.OrderingKey)
 	return err
 }
 
 const lockOrderingKeyOf = `-- name: LockOrderingKeyOf :exec
-SELECT pg_advisory_xact_lock(hashtextextended(tenant_id::text || chr(31) || ordering_key, 0))
+SELECT pg_advisory_xact_lock(
+         hashtextextended(tenant_id::text || chr(31) || ordering_key, 0) | (-9223372036854775808)::bigint)
   FROM outbox
  WHERE id = $1
 `
@@ -223,6 +270,8 @@ SELECT pg_advisory_xact_lock(hashtextextended(tenant_id::text || chr(31) || orde
 // LockOrderingKey for a row known only by its id. Runs bound to the row's tenant, before Replay
 // and before the finishing transitions. It reads the row without locking it (ordering_key never
 // changes), so the advisory lock always comes before any row lock.
+//
+// The same key as LockOrderingKey, high bit and all: the two have to name one lock.
 func (q *Queries) LockOrderingKeyOf(ctx context.Context, id string) error {
 	_, err := q.db.Exec(ctx, lockOrderingKeyOf, id)
 	return err
@@ -300,6 +349,49 @@ func (q *Queries) MarkPrepared(ctx context.Context, arg MarkPreparedParams) (int
 	return result.RowsAffected(), nil
 }
 
+const markRecordDead = `-- name: MarkRecordDead :execrows
+UPDATE outbox_record
+   SET state = 'dead', dead_reason = $1, last_error = $2, finished_at = now()
+ WHERE outbox_id = $3 AND record_id = $4 AND state = 'prepared'
+`
+
+type MarkRecordDeadParams struct {
+	DeadReason string
+	LastError  string
+	OutboxID   string
+	RecordID   string
+}
+
+// One record the sink refused. The rest of the batch is delivered by the statement below, in the
+// same transaction, so a delivery with one refusal in it loses neither the dead letter nor the
+// records that landed.
+func (q *Queries) MarkRecordDead(ctx context.Context, arg MarkRecordDeadParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markRecordDead,
+		arg.DeadReason,
+		arg.LastError,
+		arg.OutboxID,
+		arg.RecordID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markRecordsDelivered = `-- name: MarkRecordsDelivered :exec
+UPDATE outbox_record
+   SET state = 'delivered', finished_at = now()
+ WHERE outbox_id = $1 AND state = 'prepared'
+`
+
+// Every record of the delivery that is still open. It runs after MarkRecordDead has taken the
+// refused ones out of that set, which is what makes "a record not named as refused was taken"
+// true of what is stored.
+func (q *Queries) MarkRecordsDelivered(ctx context.Context, outboxID string) error {
+	_, err := q.db.Exec(ctx, markRecordsDelivered, outboxID)
+	return err
+}
+
 const park = `-- name: Park :one
 INSERT INTO outbox (id, tenant_id, provider, delivery_id, ordering_key, raw_body,
                     state, is_head, dead_reason, finished_at)
@@ -344,6 +436,51 @@ func (q *Queries) Park(ctx context.Context, arg ParkParams) (string, error) {
 	return id, err
 }
 
+const preparedRecords = `-- name: PreparedRecords :many
+SELECT record_id, document, op, kind
+  FROM outbox_record
+ WHERE outbox_id = $1 AND state = 'prepared'
+ ORDER BY pos
+`
+
+type PreparedRecordsRow struct {
+	RecordID string
+	Document []byte
+	Op       string
+	Kind     string
+}
+
+// What a claim of this delivery still has to deliver, in delivery order. A record that has
+// already been delivered is not sent again, and a dead letter waits for a replay to bring it
+// back, so a re-drain after a crash offers exactly what is left.
+//
+// op and kind come back with the document because record.Reopen needs them: they are in the
+// record's seal and not in its id, so the document cannot be checked for them on its own.
+func (q *Queries) PreparedRecords(ctx context.Context, outboxID string) ([]PreparedRecordsRow, error) {
+	rows, err := q.db.Query(ctx, preparedRecords, outboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PreparedRecordsRow
+	for rows.Next() {
+		var i PreparedRecordsRow
+		if err := rows.Scan(
+			&i.RecordID,
+			&i.Document,
+			&i.Op,
+			&i.Kind,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const promoteNextHead = `-- name: PromoteNextHead :exec
 UPDATE outbox
    SET is_head = true
@@ -372,6 +509,32 @@ func (q *Queries) PromoteNextHead(ctx context.Context, arg PromoteNextHeadParams
 	return err
 }
 
+const release = `-- name: Release :execrows
+UPDATE outbox
+   SET lease_until = NULL, lease_token = NULL, attempts = GREATEST(attempts - 1, 0)
+ WHERE id = $1 AND lease_token = $2::text AND state IN ('pending', 'prepared')
+`
+
+type ReleaseParams struct {
+	ID         string
+	LeaseToken string
+}
+
+// Gives a claimed row back without working it, for a worker that is shutting down: the lease is
+// cleared, so another replica (or this one after a restart) can take it at once, and the attempt
+// is given back, because nothing was attempted.
+//
+// Without it, a rolling restart would spend an attempt on every row a draining worker had
+// claimed but not reached, and enough restarts in a row would walk a row past the end of its
+// ladder and park it as abandoned although nothing was ever wrong with it.
+func (q *Queries) Release(ctx context.Context, arg ReleaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, release, arg.ID, arg.LeaseToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const replay = `-- name: Replay :execrows
 UPDATE outbox r
    SET seq = DEFAULT,
@@ -384,7 +547,11 @@ UPDATE outbox r
             AND u.state IN ('pending', 'prepared')
        ),
        attempts = 0, next_attempt_at = now(), dead_reason = '', finished_at = NULL
- WHERE r.id = $1 AND r.state = 'dead'
+ WHERE r.id = $1
+   AND (r.state = 'dead'
+        OR (r.state = 'delivered'
+            AND EXISTS (SELECT 1 FROM outbox_record x
+                         WHERE x.outbox_id = r.id AND x.state = 'dead')))
 `
 
 // Dead letters are a row state, so replay is an UPDATE. Runs after LockOrderingKeyOf.
@@ -398,6 +565,15 @@ UPDATE outbox r
 //
 // A row that died after it was prepared goes back to prepared, not pending: its ledger rows and
 // prepared records are committed, and a prepared row is never prepared again.
+//
+// A DELIVERED row is replayable too, and only while one of its records is a dead letter. That is
+// the other half of the per-record dead letter: a delivery whose batch held one refusal finished
+// as delivered, so without this clause the refused record could never be offered again, and the
+// promise of architecture section 11 would be a dead letter nothing can replay. The row comes
+// back prepared (it has a prepared_at), and ReviveDeadRecords brings its dead records back in
+// the same transaction; the records that landed stay delivered and are not sent again. A
+// delivered row with no dead record is not replayable: there is nothing left to offer, and
+// making it claimable again would deliver a finished delivery for nothing.
 func (q *Queries) Replay(ctx context.Context, id string) (int64, error) {
 	result, err := q.db.Exec(ctx, replay, id)
 	if err != nil {
@@ -433,6 +609,62 @@ func (q *Queries) Retry(ctx context.Context, arg RetryParams) (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const reviveDeadRecords = `-- name: ReviveDeadRecords :execrows
+UPDATE outbox_record
+   SET state = 'prepared', dead_reason = '', last_error = '', finished_at = NULL
+ WHERE outbox_id = $1 AND state = 'dead'
+`
+
+// Replay for the per-record dead letters of one delivery: they go back to prepared and are
+// offered again. Runs in Replay's transaction, after the row itself has been made claimable.
+func (q *Queries) ReviveDeadRecords(ctx context.Context, outboxID string) (int64, error) {
+	result, err := q.db.Exec(ctx, reviveDeadRecords, outboxID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const storePreparedRecords = `-- name: StorePreparedRecords :exec
+
+INSERT INTO outbox_record (outbox_id, record_id, pos, document, op, kind)
+SELECT $1, r.record_id, (r.n - 1)::int, d.document, o.op, k.kind
+  FROM unnest($2::text[]) WITH ORDINALITY AS r(record_id, n)
+  JOIN unnest($3::bytea[]) WITH ORDINALITY AS d(document, n) USING (n)
+  JOIN unnest($4::text[]) WITH ORDINALITY AS o(op, n) USING (n)
+  JOIN unnest($5::text[]) WITH ORDINALITY AS k(kind, n) USING (n)
+`
+
+type StorePreparedRecordsParams struct {
+	OutboxID  string
+	RecordIds []string
+	Documents [][]byte
+	Ops       []string
+	Kinds     []string
+}
+
+// The statements below work the records of one delivery (outbox_record). They all run bound to
+// the row's tenant, as the application role: the table carries no tenant of its own and its
+// policy asks the delivery's row for one, so a statement with the wrong tenant bound, or none,
+// reaches no row at all.
+// The records of one delivery, in the order they must be delivered. One statement for a whole
+// delivery, not one per record, and the position comes from the array's own ordinality so that
+// nothing has to be numbered twice.
+//
+// It runs after MarkPrepared, which holds the lease and the state: a worker whose lease was taken
+// over is refused there and never reaches this, so two workers cannot both store the records of
+// one delivery and meet on the primary key.
+func (q *Queries) StorePreparedRecords(ctx context.Context, arg StorePreparedRecordsParams) error {
+	_, err := q.db.Exec(ctx, storePreparedRecords,
+		arg.OutboxID,
+		arg.RecordIds,
+		arg.Documents,
+		arg.Ops,
+		arg.Kinds,
+	)
+	return err
 }
 
 const strandedKeys = `-- name: StrandedKeys :many
@@ -492,4 +724,33 @@ func (q *Queries) StrandedKeys(ctx context.Context, arg StrandedKeysParams) ([]s
 		return nil, err
 	}
 	return items, nil
+}
+
+const work = `-- name: Work :one
+SELECT provider, state, (CASE WHEN state = 'pending' THEN raw_body END)::bytea AS raw_body
+  FROM outbox
+ WHERE id = $1
+`
+
+type WorkRow struct {
+	Provider string
+	State    string
+	RawBody  []byte
+}
+
+// What a claim needs in order to work its row, in one statement: the provider the delivery was
+// accepted under, the state it is in, and the stored body.
+//
+// The body comes back only for a row that has not been prepared yet. A prepared row is delivered
+// from the records it stored and is never read again (architecture 3.2, step 7), so reading its
+// raw_body would be up to a megabyte of a webhook body fetched on every re-drain and every halt,
+// for nothing.
+//
+// Runs bound to the row's tenant, as the application role. The worker role cannot run it: it is
+// granted neither raw_body nor state, which is the point of the two-transaction drain.
+func (q *Queries) Work(ctx context.Context, id string) (WorkRow, error) {
+	row := q.db.QueryRow(ctx, work, id)
+	var i WorkRow
+	err := row.Scan(&i.Provider, &i.State, &i.RawBody)
+	return i, err
 }

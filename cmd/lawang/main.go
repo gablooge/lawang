@@ -22,7 +22,8 @@ const usageHead = `Usage: lawang <command>
 
 Commands:
   serve     run the operator API and the webhook edge
-  worker    drain the outbox and run the maintenance sweeps
+  worker    drain the outbox and run the maintenance sweeps (NOT WIRED UP YET: the drain is a
+            package, and the command needs a sink per tenant, which arrives with the vault)
   migrate   apply database migrations, as the non-superuser application role
             "migrate bootstrap" prints the one-time SQL an administrator runs first
   version   print the version

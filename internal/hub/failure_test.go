@@ -15,7 +15,8 @@ import (
 // with "parked" or "stored", which would lose the delivery for good.
 //
 // Each case removes the one table the step under test uses. That is also the only way to reach
-// these branches: every other path through the hub works.
+// these branches: every other path through the hub works. The outbox goes with CASCADE because
+// the records of a delivery hang off it (migration 00005), and the hub writes neither.
 func TestADatabaseFailureIsSaidToBeOne(t *testing.T) {
 	t.Parallel()
 	cases := map[string]struct {
@@ -36,7 +37,7 @@ func TestADatabaseFailureIsSaidToBeOne(t *testing.T) {
 			why: "the second lookup fails the same way as the first",
 		},
 		"the accept of a resolved delivery": {
-			drop:     "DROP TABLE lawang.outbox",
+			drop:     "DROP TABLE lawang.outbox CASCADE",
 			provider: func() provider.Provider { return fake.New(fake.DefaultKey) },
 			why:      "an owner was found and the row could not be written, which is not poison",
 		},
@@ -67,7 +68,7 @@ func TestParkingThatFailsIsAnErrorAndNotAVerdict(t *testing.T) {
 	t.Parallel()
 	e := setup(t)
 	h, entry := e.hub(fake.New(fake.DefaultKey), hub.Options{})
-	testdb.Exec(t, e.tdb.AdminURL, "DROP TABLE lawang.outbox")
+	testdb.Exec(t, e.tdb.AdminURL, "DROP TABLE lawang.outbox CASCADE")
 
 	verdict, err := h.Accept(e.ctx, entry, signed(delivery("W9", "S9", "1"), secretA))
 	if err == nil {

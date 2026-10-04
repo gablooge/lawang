@@ -12,7 +12,7 @@
 //	})
 //
 // Normalize does the network I/O and touches no transaction. Prepare does the database work and
-// makes no call to anything outside this deployment. The caller (the worker, B10) owns the
+// makes no call to anything outside this deployment. The caller (internal/worker) owns the
 // transaction, so it can commit the ledger rows together with whatever else it stores for the row
 // it is draining, which is what architecture 3.2 step 6 asks for.
 //
@@ -60,6 +60,10 @@ var ErrUnknownProvider = errors.New("pipeline: no such provider")
 // ErrNotAWebhookSource reports a stored delivery whose provider cannot parse one. Nothing can read
 // those bytes, now or later.
 var ErrNotAWebhookSource = errors.New("pipeline: the provider does not receive deliveries")
+
+// ErrTxNotBoundToTenant reports a Prepare whose transaction is bound to another tenant, or to
+// none. It is a wiring mistake in the caller, and checkBound says what it costs to find it late.
+var ErrTxNotBoundToTenant = errors.New("pipeline: the transaction is not bound to the tenant being prepared for")
 
 // ErrNotSealedForTenant reports a record that record.Seal did not mint for the tenant of the
 // outbox row being drained, or that was changed after it was sealed.
@@ -296,7 +300,7 @@ func hydrateAndNormalize(ctx context.Context, prov provider.Provider, t tenancy.
 	deg, ok := prov.(provider.Degrader)
 	if !ok {
 		// Nothing to degrade to, so the change waits for the provider's API to come back. The
-		// retry ladder dead-letters it when the attempts run out (B10).
+		// retry ladder dead-letters it when the attempts run out (internal/worker).
 		return nil, false, fmt.Errorf("hydrate: %w", hydrateErr)
 	}
 	recs, degradeErr := deg.Degrade(c)
@@ -335,6 +339,9 @@ func (p *Pipeline) Prepare(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, n 
 	}
 	if _, err := tenancy.Parse(tenant.String()); err != nil {
 		return failed(out), fmt.Errorf("%w: %w", ErrDeadLetter, err)
+	}
+	if err := checkBound(ctx, tx, tenant); err != nil {
+		return failed(out), err
 	}
 	// Fail closed on the version order. A Normalized built by Normalize carries the order the
 	// registry validated at start-up; one that did not come from Normalize carries the zero
@@ -396,6 +403,41 @@ func (p *Pipeline) Prepare(ctx context.Context, tx pgx.Tx, tenant tenancy.ID, n 
 		return failed(out), err
 	}
 	return out, nil
+}
+
+// checkBound refuses a transaction that is not bound to the tenant whose work is about to be
+// done in it.
+//
+// Prepare is handed a transaction and a tenant by its caller, and nothing but this makes the two
+// agree. Without it a disagreement is not an error but a silence: row-level security hides the
+// tenant's ledger rows, so every record looks new, and then refuses the insert. That arrives as
+// an ordinary database error, which the caller puts on the retry ladder, and the ladder spends
+// every attempt it has and dead-letters the delivery over a mistake no attempt could ever come
+// right. The error says which two disagreed and nothing else: both are tenant ids.
+//
+// It is a dead letter, like the other refusal in this package that can only be a bug of ours
+// (ErrNotSealedForTenant): the next attempt runs the same code with the same transaction. Named,
+// so that an operator reading last_error sees a wiring mistake rather than "internal error".
+//
+// The check runs on every delivery, including one with no records, because it is about the
+// transaction and not about what is in the delivery: a caller that passes the wrong transaction
+// should hear about it on its first delivery and not on its first delivery that happens to carry
+// a record. It costs one round trip (measured elsewhere at well under a millisecond, against a
+// 200 ms budget for the whole path).
+// Which errors are dead letters here is the same distinction the masker makes a few lines down:
+// the two refusals that are about the caller are named, and everything else IS the database (a
+// cancelled context, a lost connection), which the next attempt may well carry.
+func checkBound(ctx context.Context, tx pgx.Tx, tenant tenancy.ID) error {
+	bound, err := tenancy.Current(ctx, tx)
+	switch {
+	case errors.Is(err, tenancy.ErrNoTenantBound), errors.Is(err, tenancy.ErrInvalidID):
+		return fmt.Errorf("%w: %w: %w", ErrDeadLetter, ErrTxNotBoundToTenant, err)
+	case err != nil:
+		return fmt.Errorf("pipeline: %w", err)
+	case bound != tenant:
+		return fmt.Errorf("%w: %w: bound to %s, preparing for %s", ErrDeadLetter, ErrTxNotBoundToTenant, bound, tenant)
+	}
+	return nil
 }
 
 // failed is what Prepare returns beside an error: the counters it had reached, and no records.

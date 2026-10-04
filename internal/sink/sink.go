@@ -74,19 +74,20 @@ type Sink interface {
 // other copy, counted as taken. Nothing in the branch produces such a batch: pipeline.Prepared
 // holds one row per record and a sealed id is one version of one entity in one scope.
 //
-// # What B10 still needs, and does not have
+// # What is behind Rejected
 //
-// internal/outbox cannot express a per-record dead letter yet. Every transition takes a Claimed,
-// which is one outbox row and one delivery: MarkDelivered(ctx, c), MarkDead(ctx, c, cause),
-// Fail(ctx, c, ladder, cause). One delivery carries several records (pipeline.Prepared.Records)
-// and dead_reason is a column on the row, so "dead-letter each Rejection and mark the rest
-// delivered" has no API behind it. B10 can mark the row delivered, which loses the dead letter
-// and the refused record with it, or kill the row, which kills the records that landed.
+// A per-record dead letter in the outbox, which B10 added for this: the records of a delivery
+// are rows of their own (outbox_record), and outbox.MarkDelivered takes the refused ones beside
+// the claim, kills exactly those and marks the rest delivered, in one transaction
+// (docs/adr/0014-prepared-records.md). Until then every outbox transition took one row and one
+// delivery, so a batch with one refusal in it left a worker two moves and both were wrong:
+// marking the row delivered lost the dead letter and the refused record with it, and killing
+// the row killed the records that landed.
 //
-// This is older than the two-answer contract: Rejected predates it and architecture section 11
-// has promised a per-record dead letter since before B04. It is written here, on B10's backlog
-// line and on issue #10 so that the outbox API B10 needs is a decision someone makes on purpose
-// rather than a corner cut at the keyboard.
+// A record named here that was not in the batch, or named twice, is not a dead letter: the
+// worker reads the whole answer as unreadable then, marks nothing delivered and sends the batch
+// again, because a sink that answers about records it was not given has said nothing
+// trustworthy about the ones it was.
 type DeliveryResult struct {
 	// Rejected names the records that did not get through, one entry each. Every other record
 	// of the batch landed, so each of these dead-letters on its own (architecture section 11).

@@ -44,6 +44,12 @@ One binary, two roles, one database.
 
 Other subcommands: `migrate`, `connect <provider>`, `reconcile <tenant> <provider>`, `version`.
 
+**`lawang worker` is not wired up yet** (as of B10). The drain is a package, `internal/worker`,
+used by its tests and by B12, and the command exits with "not built yet": a drain needs a sink
+per tenant, and that configuration arrives with the vault (B13) and the operator API (B14).
+This table describes the role the command will have, and everything else in this document
+describes the drain as it is built.
+
 There is **no message broker**. The only queue is the `outbox` table. Retries and the dead-letter
 queue are row states, not topics, so replaying a dead letter is an `UPDATE`, not a re-publish.
 
@@ -269,11 +275,17 @@ and it costs parallelism: one subscription's deliveries drain one at a time (ADR
 5. Normalize, drop automation noise, compute the record id, check the record against the claimed
    row's tenant (`record.SealedFor`), skip ids already in the ledger, link the supersede chain
    forward only, mask PII.
-6. Commit the ledger rows and the prepared records together, then deliver to the sink.
-7. Commit the delivered state. A crash between steps 6 and 7 re-drains the prepared records, and
-   the sink's idempotency turns the repeat into a no-op. A row that is already `prepared` is
-   delivered from what step 6 stored and is **not** prepared again: its ids are in the ledger, so
-   re-deriving them would skip every one.
+6. Commit the ledger rows and the prepared records together. The prepared records are rows of
+   their own (`outbox_record`, one per record of the delivery, holding the document the sink
+   receives), because the ledger holds what was **prepared** and so a second attempt that
+   derived the records again would skip every one of them
+   ([ADR 14](adr/0014-prepared-records.md)). Then deliver to the sink, outside the transaction.
+7. Commit the delivered state: the row `delivered`, every record the sink refused `dead` with
+   its own cause, and every other record of the delivery `delivered`, in one transaction. A
+   crash between steps 6 and 7 re-drains the prepared records, and the sink's idempotency turns
+   the repeat into a no-op. A row that is already `prepared` is delivered from what step 6
+   stored and is **not** prepared again: its ids are in the ledger, so re-deriving them would
+   skip every one.
 
 Steps 3 to 5 are `internal/pipeline` ([ADR 12](adr/0012-ledger-supersede-masking.md)), in two
 calls, because step 4 talks to a provider's API and steps 5 and 6 hold a transaction, and those
@@ -282,6 +294,24 @@ does 3, 4 and the gate outside any transaction; `Prepare` does the rest inside t
 worker opened in step 2, so the worker can commit the ledger rows with everything else it stores.
 Everything `Prepare` refuses is classified once: an error that wraps `pipeline.ErrDeadLetter` is
 one the same bytes will produce again, and anything else goes back on the retry ladder.
+
+**Three outcomes, and a fourth that nobody writes.** A failed attempt is one of three things,
+and the difference between them is what is destroyed. **Retry** puts the row on the backoff
+ladder, which dead-letters it at the end of it: everything that may work next time. **Dead
+letter** parks it at once: only what the same bytes will refuse again, which is
+`pipeline.ErrDeadLetter`. **Halt** leaves the row exactly where it is, claimable again after a
+pause, and does not walk the ladder: the sink refusing the request itself rather than its
+contents (section 11), a tenant whose sink cannot be built, and any answer from a sink that its
+own contract does not allow. The last of those is the fail-closed default, because an
+unforeseen case must stall and not destroy, and a halt gives its attempt back so that it can
+never walk a row to its dead letter by accident.
+
+The fourth is a worker that dies or hangs: it writes nothing at all, so its lease expires and
+the row is claimed again, forever, holding every later version of its entity behind it.
+`attempts` is incremented by the claim and read by nothing else, so the drain compares it with
+the ladder **before it does any work**, and parks a row that has been claimed past the end of
+the ladder with no failure recorded (`dead_reason` "attempts exhausted without a recorded
+failure"). That is the only trace such a worker leaves.
 
 **Outbox row states.** `pending` to `prepared` (step 6) to `delivered` (step 7), or to `dead`. A
 claim is a **lease** (`lease_until` plus a `lease_token`), not a held lock, because the work spans
@@ -317,6 +347,19 @@ Different entities do not wait for each other (two keys that hash alike do, harm
 transaction that accepts several deliveries holds several of these locks until it commits, so it
 should accept in a stable key order or be ready to retry a deadlock.
 
+**One namespace, one order.** Postgres has a single advisory-lock namespace (a 64 bit key, with
+no classid split), and two modules take locks in it: the outbox over (tenant, ordering key),
+and `internal/pipeline` over (tenant, provider, external id) for the supersede chain. The rule
+for any transaction that ever holds both is **take every advisory lock ascending by key**
+([ADR 12](adr/0012-ledger-supersede-masking.md) decision 1). It is a total order with no
+premise attached, because the namespace is split by construction: the outbox sets the high bit
+of its key and the pipeline clears it, so an ordering-key value is always negative, an
+entity-key value is always non-negative, and ascending order puts the ordering key first by
+itself. Each module keeps 63 bits, and a collision within a module is a wait and not a
+deadlock. Nothing in the drain holds both today, since step 6 takes only entity locks and step
+7 only the ordering key's, but the rule is written down because the two orders deadlock against
+each other and nothing in either module would show it.
+
 The same lock keeps the head marker. The transitions that finish a row take it too, before
 anything else, so the writers of one key (accept, replay, delivered, dead) run strictly one
 after the other. Without that, an accept and a finish of the same entity can miss each other: the
@@ -344,6 +387,12 @@ treats it like any other late arrival of an old version. A row that died after s
 it (`prepared_at`) and is replayed as `prepared`, so it is delivered again but never prepared
 again.
 
+A **delivered** row is replayable too, and only while one of its records is a dead letter: that
+is the other half of the per-record dead letter, since a delivery whose batch held one refusal
+finished as delivered and the refused record would otherwise have nowhere to come back from.
+The replay brings those records back and the row with them, and the records that landed stay
+delivered and are not offered again. A delivered row with nothing dead in it is not replayable.
+
 The claim picks its rows on its statement snapshot and leases each on its latest version, so it
 re-checks on the locked row everything that can change in between: the marker, and `due_at` (the
 lease and the backoff). Both are columns of the locked row itself, so the re-check never compares
@@ -359,13 +408,24 @@ being able to read one back, and it cannot write `is_head`, so it can lease a he
 one. Payloads are read afterwards, as the application role bound to the claimed row's tenant.
 
 **What a failure leaves behind.** `last_error` and `dead_reason` are plain text that operators
-read and every backup carries, so they never hold token material, a URL, or text written by a
-remote system. The outbox does not take an error string at all. A failure is recorded as an
+read and every backup carries, so they never hold token material, a URL, or a sentence written
+by a remote system. The outbox does not take an error string at all. A failure is recorded as an
 `outbox.Cause`: one of the outbox's own classifications (section 11), the HTTP status, and the
 remote system's error code if it looks like one (short, and nothing but letters, digits, `_`, `-`
 and `.`), otherwise the word "withheld". The reason is the obvious call it rules out: the error
 of an HTTP client quotes the request URL, and the query string is where many sinks and providers
 carry their API key.
+
+**The error code is the one exception, and it is deliberate.** It is chosen by the receiver, or
+by a `Sink` implementation that is not one of this repository's, and `Cause.WithCode` is a shape
+filter and not a trust boundary: 64 bytes of that alphabet is a shape a bot token, a base64url
+run and a hex run all fit, so a caller that passes a secret as the code stores a secret. It is
+kept because a dead letter with the receiver's own code in it is the one an operator can act on,
+and nothing but the code is kept: a `Detail` is for a log line and never reaches a column, and a
+worker checks a `Detail` it did not build against `sink.KnownDetail` before it even logs one. A
+reader of this paragraph should not conclude that nothing a sink chose is written down. One
+thing is, by name, and `internal/worker`'s marker test names the attribute and the two columns
+it reaches.
 
 ### 3.3 Reconciliation
 
@@ -1023,7 +1083,8 @@ internal/
   tenancy/            tenant context and RLS binding
   store/              pgx pool, preflight, transaction helpers, migrate
   testdb/             a real Postgres for integration tests, as the application role
-  outbox/             accept insert, FIFO-head claim, retry ladder, dead letters
+  outbox/             accept insert, FIFO-head claim, retry ladder, the records of a delivery,
+                      dead letters per row and per record, halt and replay
   ingress/            the /ingress/{provider} HTTP edge: raw body, size cap, handshake
   hub/                the subscription table, verify, resolve owner, accept, park
   pipeline/           normalize, gate, ledger, supersede, mask, deliver
@@ -1050,8 +1111,14 @@ until the shape has stopped moving.
 
 The worker runs each concern as its own goroutine under one cancellable context:
 
-- **Drain:** a small pool of goroutines, each claiming a batch with `SKIP LOCKED`. Adding worker
-  replicas adds drain capacity with no coordination. That holds because a poll costs what it
+- **Drain:** a small pool of goroutines, each claiming a batch with `SKIP LOCKED`. **The pool is
+  sized against the connection pool**, not against the CPU: every goroutine holds a database
+  connection for as long as a row's transaction lasts, and the sweeps of the same process share
+  that pool, so more drain goroutines than connections do not drain faster, they wait and
+  starve the sweeps. `internal/worker` defaults to at most `pool_max_conns - 1` goroutines and
+  refuses a configured pool that leaves the rest of the process nothing. `pool_max_conns`
+  travels in `LAWANG_DATABASE_URL`, and pgx's default is `max(4, NumCPU)`, which on a small
+  container is 4. Adding worker replicas adds drain capacity with no coordination. That holds because a poll costs what it
   returns (section 3.2): it reads neither the backlog nor the rows other replicas have in flight,
   so more pollers do not mean more scanning of the same waiting rows, and an idle poll is a few
   pages. What does not scale with replicas is one entity: its versions deliver one at a time by
@@ -1122,13 +1189,16 @@ Each of these came from a real defect or a near miss in the Python predecessor.
 | A resolved delivery that can never be stored (an ordering key the table refuses) | unstorable | parked as poison, answered 2xx, so the provider does not retry what cannot work |
 | Hydration fails | degradable | deliver a minimal record, the change is still tracked |
 | Normalizer fails | non-retryable | dead-letter with the reason; fix and replay |
-| Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands. A sink reports it as a `Rejection` and never as a whole-batch action, so a record is never killed without having been offered |
+| Sink rejects one record | non-retryable | that record dead-letters; the rest of the batch lands. A sink reports it as a `Rejection` and never as a whole-batch action, so a record is never killed without having been offered. The records of a delivery are rows of their own, so the dead letter is per record and the row still finishes as delivered ([ADR 14](adr/0014-prepared-records.md)); replaying the row brings exactly the dead records back |
 | Sink rejects a whole request of a batch that was split across several (**422**, the whole refusal band) | non-retryable | each record of that request dead-letters as its own `Rejection`; the other requests of the batch are still sent and keep their own outcome |
 | Sink refuses the request itself rather than anything in it: **every 4xx that is not 401, 403, 408, 422 or 429**, which is the default for a status this sink does not recognise | halt | the row stays prepared, nothing is marked delivered and **no record is dead-lettered**: none of these says anything about a record, and an operator changes a credential, a number (`MaxRequestBytes`), the endpoint or the receiver; ops is alerted. Dead-lettering them killed every record of every chunk of every batch on that endpoint, permanently, with `last_error` reading "sink rejected the record (status NNN)", so an endpoint typo (404) or a large bearer token behind a small header buffer (431) destroyed a tenant's records quietly ([ADR 13](adr/0013-sink-wire-protocol.md)) |
 | Sink rejects the credential (401) or lacks a grant (403) | halt | the row stays prepared; nothing is marked delivered, including anything an earlier request of the same batch landed, so the whole batch is sent again once an operator has fixed it; ops is alerted |
 | A record in a batch is not sealed for the tenant it is being delivered under | non-retryable | that record dead-letters as its own `Rejection` with `internal error (code wrong_tenant)` and is not sent, written or stored; the rest of the batch goes. Both `internal/pipeline` and every `Deliver` check it, because the tenant is in no field of the envelope and nothing downstream can see the mistake |
 | Sink 5xx, timeout, connection error | retryable | backoff ladder, then dead-letter; nothing is marked delivered, including anything an earlier request of the same batch landed, and replay is always safe because a sink is idempotent on the record id |
 | Sink answers 2xx and does not say what it did with the batch (the answer does not parse, is not a JSON object, carries members but none of them `rejected`, has a `rejected` that is not a list including `null`, or names a record that was not sent or names one twice) | retryable | nothing is marked delivered and the whole batch is sent again: a sink that is idempotent on the record id loses nothing by a repeat, and a guess here loses a record |
+| No sink can be built for the tenant (none is configured, or the vault did not answer) | fail closed | halt: nothing is delivered, nothing is killed, no attempt is charged, and the row is offered again after the halt pause. An operator connects a sink, or the vault comes back, and the next claim delivers |
+| A sink answers in a way the `Sink` contract does not allow: an error that is not a `*sink.Fault`, or a `Fault` with an action this version does not know | fail closed | halt. Nothing is known about what reached the receiver, so retrying would walk a ladder that ends in a dead letter and dead-lettering would destroy records over a bug of ours. An unforeseen case stalls, it does not destroy |
+| A claimed row whose worker dies or hangs, every time | unreported | the drain compares `attempts` with the ladder at claim time, before any work, and parks a row past the end of it as `attempts exhausted without a recorded failure`. Without it the row is taken over forever and every later version of its entity waits behind it |
 | Vault unreachable | fail closed | retry on the ladder; nothing is delivered unverified |
 | Accept path out of time (a saturated pool, a slow database) | retryable | 503 with a `Retry-After`, nothing stored |
 

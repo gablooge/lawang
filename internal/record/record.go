@@ -25,6 +25,7 @@ package record
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -385,4 +386,100 @@ func (r Record) Seal(provider string, tenant tenancy.ID) (Record, error) {
 		return Record{}, err
 	}
 	return r, nil
+}
+
+// ErrNotThisTenantsRecord reports a stored document whose id is not the one this deployment
+// would mint for the record it holds, under the provider and the tenant it was read back for.
+// See Reopen.
+var ErrNotThisTenantsRecord = errors.New("record: the document does not carry the id this tenant's recipe mints for it")
+
+// ErrNotTheRecordStored reports a stored document that is a valid record of this tenant and is
+// not the one the row beside it says was stored: its id, its Op or its Kind is another's. See
+// Reopen and Stored.
+//
+// Who is expected to ask: nothing in the delivery path, and that is deliberate. A drain treats
+// every Reopen error the same way, as a dead letter, because none of them is retryable and the
+// same bytes produce the same answer next time. It is exported and separate from
+// ErrNotThisTenantsRecord for the operator surface of B25, which has to say which of the two
+// happened, and for a test that has to show a fix caught the case it was written for rather
+// than some other refusal.
+var ErrNotTheRecordStored = errors.New("record: the document is not the record the row beside it says was stored")
+
+// Stored is one record as the store holds it: the document, plus the fields of the seal that
+// the id cannot carry.
+//
+// The id hashes the provider, the external id, the version, the scope and the tenant, so
+// minting it again from a document checks all five. The seal covers two more, Op and Kind, and
+// the seal type says why they are in it: an upsert turned into a tombstone after sealing, or a
+// message turned into a task, would go out under the id of what it was, where a sink that is
+// idempotent on the id drops it as a repeat. Those two cannot be checked from the document
+// alone, because a document edited in one of them agrees with itself: it re-seals to the id it
+// already carries, and Validate sees nothing wrong. So they travel beside it, in columns of
+// their own, and Reopen holds the document against them.
+//
+// ID is the record id of the row itself (outbox_record.record_id), which is what a delivery is
+// keyed, leased and dead-lettered on. Checking it is what stops a document from being replaced
+// wholesale by another self-consistent record of the same tenant, which would be delivered
+// while the outbox went on accounting for the row under the id it still holds.
+type Stored struct {
+	// ID is the record id the row is keyed on.
+	ID string
+	// Op and Kind are what the record was sealed as.
+	Op   Op
+	Kind Kind
+	// Document is the bytes MarshalJSON wrote.
+	Document []byte
+}
+
+// Reopen reads back a record this deployment sealed and stored, and returns a Record that is
+// sealed for tenant again.
+//
+// It is for the one caller that has to deliver a record it did not seal in this process: the
+// worker's second commit (architecture 3.2, step 7), which delivers what its first commit
+// stored, possibly after a crash and from another process. Decoding alone is not enough there,
+// because a decoded record knows no tenant (the tenant is in no field of the envelope), so
+// SealedFor is false for it and every sink would refuse it as another tenant's record.
+//
+// It is not a way around the seal. The id is minted again from the fields the document carries
+// and from provider and tenant, and a document whose own id is not the one that comes out is
+// ErrNotThisTenantsRecord. What the id does not hash, s.Op and s.Kind, is held against the
+// document, and so is s.ID, and a document that disagrees with any of them is
+// ErrNotTheRecordStored. Between them that is every field the seal covers, which is what a
+// tripwire test in this package holds the seal to. So a document edited in the DOCUMENT ALONE
+// (in any sealed field), a document stored for one tenant and read back for another, a
+// document read back under the wrong provider, and a document swapped for another record of
+// the same tenant are all refused here rather than delivered to somebody.
+//
+// That qualifier is the whole of the claim, and it is narrower than the seal's. In process the
+// seal is a private field no outside caller can write; here both sides of every comparison are
+// columns of one row. Reopen holds the document against what the row says beside it, so it
+// catches an edit to one side and cannot catch a writer who edits both sides to agree. No
+// unkeyed check can: a seal digest in a column would be recomputable by anything that can write
+// the document, so it would catch exactly the same edits and no more. What answers a writer who
+// holds the table is the grants on it and the operator surface that shows which field moved,
+// not a column beside the document.
+//
+// It also cannot catch a change to a field that is in neither the id nor the seal (the title,
+// the text, the author), which is exactly what MarshalJSON cannot catch for a record this
+// process sealed: one id is one version of one entity, in one scope, with one op and one kind,
+// and the content is whatever that version said (ADR 4).
+func Reopen(s Stored, provider string, tenant tenancy.ID) (Record, error) {
+	var stored Record
+	if err := json.Unmarshal(s.Document, &stored); err != nil { // strict: the whole format, and then Validate
+		return Record{}, err
+	}
+	sealed, err := stored.Seal(provider, tenant)
+	if err != nil {
+		return Record{}, err
+	}
+	if sealed.ID != stored.ID {
+		// Neither id is in the error. One is a hash of the tenant, and the pair is the evidence
+		// of whatever went wrong, which belongs where the document is and not in a log line.
+		return Record{}, ErrNotThisTenantsRecord
+	}
+	// Fails closed: a caller that carries nothing beside the document matches nothing here.
+	if s.ID != stored.ID || s.Op != stored.Op || s.Kind != stored.Kind {
+		return Record{}, ErrNotTheRecordStored
+	}
+	return sealed, nil
 }

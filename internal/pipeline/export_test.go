@@ -43,7 +43,7 @@ var CompareVersions = compareVersions
 // prevent. A later item reaching for it in a log line or a metric label would undo the masking
 // without touching a file the masker owns. The tests need it because the finding half is worth
 // testing with no database in sight, so it lives here, the way RecordsOf, ValidIBAN, ValidPhone
-// and EntityKeys already do.
+// and LockOrder already do.
 type (
 	// Secret is one value the masker found.
 	Secret = foundSecret
@@ -73,7 +73,12 @@ func (s Scan) Apply(field string, tokens map[Secret]string, maxChars int) (strin
 	return s.inner.apply(field, tokens, maxChars)
 }
 
-// EntityKeys is the order the entity locks of one delivery are taken in. It is exported for the
-// test that pins that order, because a deadlock is what a wrong order costs and a deadlock is not
-// something a test can produce on demand.
-var EntityKeys = entityKeys
+// LockOrder is the order the entity locks of one delivery are taken in, over the lock keys the
+// database computed. It is exported for the test that pins that order, because a deadlock is
+// what a wrong order costs and a deadlock is not something a test can produce on demand.
+var LockOrder = lockOrder
+
+// EntityIDs is the entities a delivery asks lock keys for, each once. It is exported beside
+// LockOrder so that the test can show what the two do and do not promise: this one dedupes, and
+// the other one orders.
+var EntityIDs = entityIDs

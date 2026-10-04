@@ -121,6 +121,58 @@ superseding X and one orphaned in the middle of the chain, with no constraint vi
 one delivery are taken in sorted order, so two deliveries carrying the same entities can queue but
 cannot deadlock.
 
+**Sorted by the lock key, which is the value that is locked** (changed in B10, issue #10). The
+first version of this sorted the external ids and locked `hashtextextended` of them, which is a
+64 bit hash, so a collision broke the order the sorting exists to create: with external ids
+`A < B < C` and `hash(A) = hash(C)`, a delivery carrying `{A, B}` took the two locks in the
+opposite order to one carrying `{B, C}`, and that is a deadlock and not a wait. At 64 bits it
+would not have happened, and the retry ladder would have carried the aborted transaction if it
+had, but the sentence "two entities whose keys collide only wait for each other" was not true
+while the thing sorted and the thing locked were different values. The keys of a delivery are
+now asked of Postgres in one statement and sorted as keys (`EntityLockKeys` and `lockOrder` in
+`internal/pipeline`), which costs one round trip per delivery and makes the sentence true.
+
+**The order between this lock and the outbox's.** Postgres has one advisory-lock namespace, a
+64 bit key with no classid split, and two modules take locks in it: `internal/outbox` over
+(tenant, ordering key), and this one over (tenant, provider, external id). The rule for any
+transaction that ever holds both is one sentence: **take every advisory lock ascending by key**.
+Nothing in the drain holds both today (B10's step 6 takes only entity locks and its step 7 only
+the ordering key's), and the rule is written down here, and in a comment in both `queries.sql`
+files, because the next thing that works an outbox row and a chain in one transaction (a
+reconciliation pass, a repair, a batch finisher) would otherwise pick an order by accident.
+
+**The namespace is split so that the rule needs no premise** (changed in B10 round 2, review of
+pull request #56). The outbox ORs the high bit into its key and this module ANDs it out, so an
+ordering-key value is always negative, an entity-key value is always non-negative, and the two
+sets are disjoint by construction. Ascending order therefore puts every ordering-key lock before
+every entity lock on its own, which is what the rule used to say in two clauses ("the
+ordering-key lock first, then the entity locks").
+
+The two clauses were a total order only while no ordering-key value ever equalled an
+entity-key value, and nothing enforced that. With `K` an ordering key whose value equals entity
+key `b`, a transaction holding `{K, a, b}` takes `K`, `a`, `b` while a `Prepare` holding
+`{b, K}` takes `b`, `K`, and the two deadlock. That is a hash collision, so it would not have
+happened, which is the same "at 64 bits it would not have happened" reasoning the decision
+above exists to delete: a rule whose safety rests on an unstated and unenforced premise is not
+a rule. (The two formulas cannot collide other than by hash: the outbox hashes
+`tenant \x1f provider:subscription` and this hashes `tenant \x1f provider \x1f external_id`,
+and a provider key admits neither `:` nor `\x1f`, so the strings always differ.)
+
+The cost is one bit: each module has 63 bits instead of 64, so a collision within a module is
+about twice as likely and is still a wait and not a deadlock. The alternative considered was
+the two-argument `pg_advisory_xact_lock(int4, int4)` with a classid per module, which is
+structural in the same way but cuts each key to 32 bits.
+
+**That alternative was refused on cost, not on correctness**, and the distinction matters for
+whoever reopens the question. Under "take every advisory lock ascending by key" a collision
+inside a module is a wait in either design, so 32 bit keys would not bring the deadlock back.
+What they would bring is false contention between unrelated entities: by the birthday bound,
+any collision among 10,000 keys in a 32 bit space is already about a 1 percent chance, and at
+100,000 keys about one colliding pair is expected, which is unrelated work serializing for no
+reason. At 63 bits neither number is reachable. Each half is pinned by a test that reads
+`pg_locks` inside the transaction that holds the lock, one per module, so neither formula can
+quietly lose its bit.
+
 ### 2. The chain is per entity, and the ledger holds what was prepared
 
 `record_ledger` has one row per record id, keyed `(tenant_id, record_id)`, and a partial unique
@@ -416,8 +468,9 @@ telephone number and an IBAN, in `Title` and `Text` only.
 - **The A, B, A window stays open until an operator acts.** That is ADR 4's decision, not a new
   one: the dead letter and the counter are what make it visible, and the record stays at the sink
   in the scope the entity has left until the dead letter is dealt with.
-- **The entity advisory lock is one statement per entity per delivery**, and it makes a second
-  delivery of one entity wait rather than fail. It is cheap and it is not free.
+- **The entity advisory lock is one statement per entity per delivery, plus one for the whole
+  delivery** (the statement that asks for the keys, since B10), and it makes a second delivery
+  of one entity wait rather than fail. It is cheap and it is not free.
 - **The external id's byte bound is stricter than the format's**, so a record the format allows can
   be refused here. Nothing a provider mints comes near it, and the refusal is by name.
 - **A degraded record's scope is a contract and not an enforcement.** The pipeline cannot compare a

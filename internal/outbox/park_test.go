@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/gablooge/lawang/internal/outbox"
 	"github.com/gablooge/lawang/internal/tenancy"
@@ -168,11 +169,25 @@ func TestParkRefusesWhatItCannotRecord(t *testing.T) {
 	if _, _, err := e.ob.Park(e.ctx, "fake", []byte(`{}`), outbox.ParkReason(200)); !errors.Is(err, outbox.ErrNoParkReason) {
 		t.Errorf("Park with an unknown reason = %v, want ErrNoParkReason", err)
 	}
-	if _, _, err := e.ob.Park(e.ctx, "", []byte(`{}`), outbox.ParkNoOwner); err == nil {
-		t.Error("Park accepted an empty provider, which would hash into the delivery id as nothing")
-	}
-	if _, _, err := e.ob.Park(e.ctx, "fa\x00ke", []byte(`{}`), outbox.ParkNoOwner); err == nil {
-		t.Error("Park accepted a provider Postgres cannot store")
+	// These two are refused before any statement runs, which is the whole point of asking:
+	// SQLSTATE 22021 and a CHECK violation are what the caller gets otherwise, and neither can
+	// be told from an outage. "an error came back" is therefore not the assertion, because
+	// Postgres supplies one of those either way. The same gap was found in PrepareIn's test by
+	// the round 2 review of B10.
+	for name, providerKey := range map[string]string{
+		"an empty provider, which would hash into the delivery id as nothing": "",
+		"a provider Postgres cannot store":                                    "fa\x00ke",
+	} {
+		_, _, err := e.ob.Park(e.ctx, providerKey, []byte(`{}`), outbox.ParkNoOwner)
+		if err == nil {
+			t.Errorf("Park accepted %s", name)
+			continue
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			t.Errorf("Park with %s was refused by Postgres (SQLSTATE %s), not by this package: %v",
+				name, pgErr.Code, err)
+		}
 	}
 	if got := e.countRows(); got != 0 {
 		t.Errorf("a refused park stored %d rows", got)

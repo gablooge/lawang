@@ -1,4 +1,24 @@
--- name: LockEntity :exec
+-- name: EntityLockKeys :many
+-- The advisory lock key of each entity of one delivery, in one round trip. The caller sorts them
+-- and takes them in that order (pipeline.lockOrder), which is what LockEntityKey below is for.
+--
+-- The key is what is sorted AND what is locked, which is the point of computing it here rather
+-- than locking one entity at a time. The locks used to be taken in the order of the external
+-- ids while the lock itself was over a 64 bit hash of them, so a hash collision broke the order
+-- the sorting exists to create: with external ids A < B < C and hash(A) = hash(C), a delivery
+-- carrying {A, B} took the two locks in the opposite order to one carrying {B, C}, which is a
+-- deadlock and not a wait. Sorting the hashes makes that unwritable instead of improbable, and
+-- two entities whose keys collide now really do only wait for each other.
+--
+-- The high bit is cleared, which puts every entity lock in the non-negative half of Postgres's
+-- one advisory-lock namespace. internal/outbox sets it on its ordering keys, so the two halves
+-- are disjoint by construction: see the order below.
+SELECT DISTINCT
+       (hashtextextended(@tenant_id::text || chr(31) || @provider::text || chr(31) || e, 0)
+          & 9223372036854775807::bigint)::bigint AS lock_key
+  FROM unnest(@external_ids::text[]) AS e;
+
+-- name: LockEntityKey :exec
 -- Serializes the readers and writers of one entity's supersede chain. The pipeline reads the head,
 -- demotes it and inserts a new head, and two transactions doing that for one entity at once can
 -- corrupt the chain without violating a single constraint: both read head X, the first demotes X
@@ -23,16 +43,47 @@
 -- defense, for the shapes the ordering key does not cover: one entity reached through two
 -- subscriptions of one tenant, and a reconciliation pass running beside the live feed.
 --
--- Two entities whose lock strings hash alike do NOT merely wait for each other, which is worth
--- writing down because the sorting above is what keeps it harmless. The sort is over the external
--- id and the lock is over its 64 bit hash, so a collision breaks the order the sort exists to
--- create: with external ids A < B < C and hash(A) = hash(C), a delivery carrying {A, B} takes the
--- two locks in the opposite order to one carrying {B, C}, and that is a deadlock rather than a
--- wait. At 64 bits it will not happen, and the retry ladder would carry the aborted transaction if
--- it did. Sorting by the hash instead of by the external id is what would make it impossible, and
--- that is B10's (issue #10), which owns the lock key.
-SELECT pg_advisory_xact_lock(
-  hashtextextended(@tenant_id::text || chr(31) || @provider::text || chr(31) || @external_id::text, 0));
+-- Two entities whose keys collide only wait for each other, which is harmless. That sentence is
+-- true because the thing sorted and the thing locked are now the same value: see EntityLockKeys.
+--
+-- # The order between this lock and the outbox's
+--
+-- Postgres has ONE advisory lock namespace for the one-argument form this code uses, a 64 bit
+-- key, and two modules take locks in it: internal/outbox over (tenant, ordering key), and this
+-- one over (tenant, provider, external id). The rule for a transaction that ever holds both is
+-- one sentence: **take every advisory lock ascending by key**.
+--
+-- (The two-argument pg_advisory_xact_lock(int4, int4) would give each module a classid of its
+-- own. It was refused on cost and not on correctness: under the rule below a collision inside
+-- a module is a wait either way, so 32 bit keys would not bring the deadlock back, they would
+-- add false contention between unrelated entities, which starts to matter around 10,000 keys
+-- per module. ADR 12 decision 1 has the arithmetic.)
+--
+-- That is a total order, and it needs no premise about the two modules' keys, because the
+-- namespace is split by construction. The outbox sets the high bit of its key and this
+-- statement clears it, so an ordering-key value is always negative, an entity-key value is
+-- always non-negative, and the two sets are disjoint. Ascending order therefore puts every
+-- ordering-key lock before every entity lock on its own, which is the order the rule used to
+-- state as two clauses ("the ordering-key lock first, then the entity locks").
+--
+-- The split is the point. The rule used to be two clauses over one undivided namespace, and it
+-- was a total order only while no ordering-key value ever equalled an entity-key value. Nothing
+-- enforced that, and it is exactly the "at 64 bits it will not happen" reasoning the paragraph
+-- above exists to delete: with K an ordering key equal to entity key b, a transaction holding
+-- {K, a, b} takes K then a then b, while a Prepare holding {b, K} would take b then K, and the
+-- two deadlock. (The two formulas cannot collide other than by hash: the outbox hashes
+-- tenant \x1f provider:subscription and this hashes tenant \x1f provider \x1f external_id, and
+-- a provider key admits neither ':' nor \x1f, so the strings always differ.) Each half still
+-- holds 63 bits, and a collision WITHIN a half is a wait and not a deadlock, which is what the
+-- paragraph above is about.
+--
+-- Nothing in the drain holds both today. The worker prepares a delivery in a transaction that
+-- takes only entity locks, and finishes it in a later transaction that takes only the ordering
+-- key's (internal/outbox, finishIn). The rule is written down because the next thing that works
+-- an outbox row and a chain in one transaction (a reconciliation pass, a repair, a batch
+-- finisher) would otherwise pick an order by accident. ADR 12, decision 1 states it beside this
+-- paragraph.
+SELECT pg_advisory_xact_lock(@lock_key::bigint);
 
 -- name: EntityHead :one
 -- The newest record prepared for one entity: what a new record supersedes, and the scope the move
