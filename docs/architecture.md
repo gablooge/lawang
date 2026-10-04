@@ -596,6 +596,7 @@ Three deterministic keys, minted in exactly one package (`internal/ids`) so the 
 | accept | `delivery_id = blake3(provider, raw_body)`, unique per tenant | an identical re-send is an accept no-op |
 | record | `id = "rec_" + blake3(provider, external_id, version, scope, tenant)[:32]` | worker re-drains, backfill overlaps and cosmetically different re-sends all collapse to one id |
 | subscription | unique on `(tenant, provider, resource)` | re-registering updates in place, never duplicates, and the row keeps its id |
+| subscription | unique on `(tenant, provider, external_id)` where the registration id is not empty | a registration id identifies one row of a tenant, so a delivery that names it has one candidate of that tenant and is never parked as an ambiguous owner on a registrar's mistake (ADR 15, decision 3) |
 
 Parts are joined with a `0x1F` separator so `("ab","c")` never collides with `("a","bc")`. A part
 that is empty or itself contains `0x1F` is refused with an error rather than hashed: an empty tenant
@@ -896,6 +897,20 @@ whose every record fails in `Seal`. It calls `Key()` exactly once, at registrati
 its own copy of the string from then on, which is what makes `outbox.Delivery.Provider` a constant
 of the program rather than a decoded path segment.
 
+**A normalizer cleans before it seals, and the harness is what makes forgetting hard.** The
+record format refuses and never repairs ([ADR 4](adr/0004-record-format-v1.md) decision 9):
+`Seal` fails on an `author.display` holding an invisible or bidirectional-formatting character,
+and on a `title` that is not one line. Real data has both, so `internal/record` has one cleaner
+per cleanable field class (`CleanDisplay`, `CleanTitle`, `CleanText`), each bounded to its
+field's limit, and every normalizer calls the right one before it builds a record. Cleaning a
+title turns what the one-line rule refuses into a space and trims the result. **No identifier is
+ever cleaned**: removing a character from an external id, a version, an author id or a container
+id makes it a different id, so one entity would get two identities and be delivered twice; a
+sender-controlled identifier needs an injective encoding or a hash of its own. A fixture with a
+clean name passes whether a normalizer cleans or not, so the rule is held by
+`internal/provider/providertest`, a conformance harness of values real sources really send, which
+every provider's own tests run over its own payloads.
+
 **Three things a provider author has to know, and what the hub does about each.**
 
 - `Handshake` runs on **unauthenticated bytes, on every delivery**, not only on a challenge,
@@ -936,6 +951,13 @@ degraded path to take. `Reconciler` and `MemberSource` still wait for the items 
 decide the types they take: `Cursor` is B19's (reconciliation) and `ScopeMembers` is B23's (access
 sync). An interface written before its types are settled is a shape every later item has to
 rewrite, and the rewrite is not free once a provider package implements it.
+
+The first package to implement any of them is `internal/provider/clickup` (B11):
+`Provider` and `WebhookSource`, and deliberately not `Degrader`, because a ClickUp webhook body
+does not carry the list a task is in and a degraded record would need a guessed scope
+([ADR 15](adr/0015-clickup-provider.md)). It is **not registered in `cmd/lawang` yet**: hydration
+needs one API token per tenant, which the vault (B13) and `lawang connect` (B14) supply, so the
+registry is still built empty and every `/ingress/{provider}` is still a 404.
 
 `Credential` is the one exception, and it is deliberately not a shape yet. `Registrar` cannot be
 written without naming it, and what a credential holds is B13's decision (the vault) and B14's

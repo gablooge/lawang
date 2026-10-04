@@ -28,8 +28,12 @@ clean, permission-stamped record delivered exactly once to your memory, search, 
 > rest of the batch landed. A crash between its two commits re-delivers what the first one
 > stored instead of losing it, a failing sink walks the retry ladder and parks, a sink that
 > refuses the request itself stalls without killing anything, and a replay brings a dead letter
-> back. **No provider is
-> registered yet**, so every `/ingress/{provider}` segment is a 404 until ClickUp lands, and
+> back. The first provider package is here: **ClickUp** verifies its
+> `X-Signature`, parses a delivery, hydrates a task (and a comment's parent task) through a rate
+> limiter that refuses rather than waits, and normalizes a comment into the comment and its
+> parent, against payloads built from ClickUp's published documentation until B12 records real
+> ones. **It is not registered in the binary yet**, because hydration needs one API token per
+> tenant and the vault brings those, so every `/ingress/{provider}` segment is still a 404, and
 > `lawang worker` is not wired up yet either: the drain is a package, and the command needs the
 > per-tenant sink configuration that the vault and the operator API bring. The design
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in

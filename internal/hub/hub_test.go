@@ -394,12 +394,14 @@ func TestADeliveryWithNoUsableKeysIsParkedWithoutALookup(t *testing.T) {
 func TestMoreCandidatesThanTheHubWillVerifyAreParked(t *testing.T) {
 	t.Parallel()
 	e := setup(t)
-	// Two tenants is the limit here, and three subscriptions match the delivery's keys. The first
-	// two hold secrets that do not verify, so a hub that simply cut the set short would answer 401
+	// Three subscriptions match the delivery's keys, one per tenant: the registration id is
+	// unique within a tenant (`subscriptions_one_registration_per_tenant`), so three rows sharing
+	// one are three tenants' rows, which is the shape this bound exists for anyway. The first two
+	// hold secrets that do not verify, so a hub that simply cut the set short would answer 401
 	// and a hub that verified them all would route to the third.
 	e.register(tenantA, "one", "W1", "S1", secretA)
 	e.register(tenantB, "two", "W1", "S1", secretB)
-	e.register(tenantB, "three", "W1", "S1", []byte("the third secret"))
+	e.register(tenantC, "three", "W1", "S1", []byte("the third secret"))
 	h, entry := e.hub(fake.New(fake.DefaultKey), hub.Options{MaxCandidates: 2})
 
 	if got := e.accept(h, entry, signed(delivery("W1", "S1", "1"), []byte("the third secret"))); got != ingress.Parked {
