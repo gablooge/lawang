@@ -329,6 +329,10 @@ func TestNormalizeRefuses(t *testing.T) {
 		{"a task with no date_updated", `{"id":"86a1b2","name":"n","list":{"id":"901100"}}`},
 		{"a task with a date_updated that is not a number", `{"id":"86a1b2","name":"n","date_updated":"yesterday","list":{"id":"901100"}}`},
 		{"a task updated in the year 70000", `{"id":"86a1b2","name":"n","date_updated":"2000000000000000","list":{"id":"901100"}}`},
+		// A valid millisecond value padded out to twenty-six digits. strconv.ParseInt accepts
+		// leading zeros, so maxDigits is the only thing that refuses this, and without it the
+		// task normalizes as if the date were well formed.
+		{"a task with a zero-padded date_updated of twenty-six digits", `{"id":"86a1b2","name":"n","date_updated":"00000000000001791100000000","list":{"id":"901100"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, api := newHydrating(t)

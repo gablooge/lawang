@@ -29,11 +29,17 @@ const maxID = 64
 // maxDigits bounds a ClickUp time, which is epoch milliseconds as a decimal string. Nineteen
 // digits is what an int64 holds, so a longer run is refused here rather than overflowing.
 //
-// No test can tell this bound from its absence, and that is not a gap: strconv.ParseInt below
-// refuses the same strings with the same error, so removing the width arm changes no answer. It
-// is kept, like Verify's digest-length test, because bounding an input before converting it is
-// the shape the rest of this package uses, and because the arm that would otherwise carry it is
-// a library's range check rather than this package's own rule.
+// The arm is not redundant with strconv.ParseInt below, and removing it changes answers.
+// ParseInt refuses an over-long VALUE; this arm refuses an over-long STRING, which is the wider
+// set, because leading zeros are legal to ParseInt. Delete the arm and
+// "00000000000001791100000000" parses to 1791100000000, where today it is refused as a time
+// that is not epoch milliseconds. Nothing between the wire and here bounds the length of that
+// string (json.Unmarshal into a string, historyDate.UnmarshalJSON, digits), so a padded run of
+// any width arrives straight from a webhook body or an API response.
+//
+// Two cases pin it, one per path: TestAHistoryDateThatCannotBeReadIsSkipped's "a zero-padded
+// date of twenty-six digits" and TestNormalizeRefuses's "a task with a zero-padded date_updated
+// of twenty-six digits".
 const maxDigits = 19
 
 // subject is what a delivery is about: which entity changed, and therefore what is hydrated.

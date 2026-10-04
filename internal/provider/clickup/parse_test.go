@@ -136,6 +136,11 @@ func TestAHistoryDateThatCannotBeReadIsSkipped(t *testing.T) {
 		// digit check and into strconv's own refusal.
 		{"a date larger than an int64", `[{"id":"1","date":"9999999999999999999"}]`, updated},
 		{"a date of twenty digits", `[{"id":"1","date":"12345678901234567890"}]`, updated},
+		// Zero padding is legal to strconv.ParseInt, so this one is refused by the width bound
+		// and by nothing else: without it the padded run parses to later and becomes the
+		// version. It arrives here straight off the wire, since nothing between json.Unmarshal
+		// and epochMillis bounds the length of the string.
+		{"a zero-padded date of twenty-six digits", `[{"id":"1","date":"` + strings.Repeat("0", 13) + later + `"}]`, updated},
 		{"a readable date beside one that is not", `[{"id":"1","date":null},{"id":"2","date":"` + later + `"}]`, later},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
