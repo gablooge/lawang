@@ -65,16 +65,25 @@ variables, the exit codes and the word `help`, but not the command list. A comma
 `switch` would stay in the usage text and mislead.
 
 **Smallest version that helps:** a test that reads the `Commands:` block of the usage text, takes
-the first word of each line, and for each one calls `run` with that word and an empty environment.
-The exit code must not be 2 and the output must not contain `unknown command`. All three of
-`serve`, `worker` and `migrate` exit 1 rather than 2, for two different reasons: `serve` and
-`migrate` refuse to start without configuration, and `worker` returns `errNotBuilt` ("not built
-yet, see docs/backlog.md") because the command is still a stub, which
-`TestRunStubbedRolesExitNonZero` pins. Exit 1 is the expected result in both cases, and it is
-different from "I do not know this word".
+the first word of every line that starts at the two-space indent, and for each one calls `run`
+with that word and an empty environment. The exit code must not be 2 and the output must not
+contain `unknown command`. The indent rule matters: the `worker` and `migrate` entries wrap onto a
+second line, indented twelve spaces, so taking the first word of every line without that rule
+gives seven candidates (`serve`, `worker`, `package,`, `migrate`, `"migrate`, `version`, `help`)
+instead of five, and the two spurious ones exit 2 with `unknown command`, which is exactly the
+pair the test asserts against. With an empty environment, `version` and `help` exit 0 and `serve`,
+`worker` and `migrate` all exit 1 for one reason and not two: `run` loads the configuration after
+the `switch` has chosen the command, and `config.Load` refuses, because an unset `LAWANG_ENV`
+means production and production has no default for `LAWANG_DATABASE_URL`. The stub closure is
+never reached. `worker` does have a second way to exit 1, `errNotBuilt` ("not built yet, see
+docs/backlog.md"), once configuration loads, and that is what `TestRunStubbedRolesExitNonZero`
+pins: it passes `LAWANG_ENV=development`, which gives the database URL a default, so the stub can
+be reached at all. Either way the exit code is 1, and 1 is different from "I do not know this
+word".
 
-**Done when:** the test passes today; it fails when a line is removed from the usage text; it fails
-when a case is removed from the `switch`. Say in the pull request which of those two you tried.
+**Done when:** the test passes today; it fails when a command line is removed from the usage
+text; it fails when a case is removed from the `switch`. Say in the pull request which of those
+two you tried.
 
 **Size:** S.
 
