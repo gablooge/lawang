@@ -10,8 +10,8 @@ Three rules:
    their own voice or not at all.
 2. **Every claim about another project or a community carries a link and the date it was read.**
    Comparisons go stale. Re-check before relying on one.
-3. **Written as if the people described will read it**, because once the repository is public they
-   can. The maintainer reviews this directory before that happens and decides what stays.
+3. **Written as if the people described will read it**, because the repository is public and they
+   can. The maintainer decides what belongs here and what does not.
 
 Proposals for the backlog are not files here. They are issues with the label `growth`, which the
 maintainer accepts, rejects or re-orders.
