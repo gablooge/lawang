@@ -35,7 +35,14 @@ clean, permission-stamped record delivered exactly once to your memory, search, 
 > ones. **It is not registered in the binary yet**, because hydration needs one API token per
 > tenant and the vault brings those, so every `/ingress/{provider}` segment is still a 404, and
 > `lawang worker` is not wired up yet either: the drain is a package, and the command needs the
-> per-tenant sink configuration that the vault and the operator API bring. The design
+> per-tenant sink configuration that the vault and the operator API bring. **All of it is
+> demonstrated together even so**: [`internal/acceptance`](internal/acceptance) composes the edge,
+> the hub, the ClickUp provider, the pipeline, the drain and the strict sink over a real Postgres
+> and a real socket, with a fake ClickUp API behind the provider, and every line of M1's acceptance
+> criteria has a test there that runs in CI. The one half that cannot run in CI is the live one,
+> against a real workspace through a tunnel, which is what proves the signature check agrees with
+> ClickUp rather than with a fixture the tests signed themselves. It is built, behind the `live`
+> build tag, and it has not been run yet. The design
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in
 > [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the
