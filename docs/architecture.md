@@ -487,6 +487,15 @@ covers the URL and none is configured: it is handed the registry, so it knows wh
 registered, and a scheme says so by implementing `provider.URLSigner`. A deployment that could not
 accept one single delivery should not get as far as binding a socket.
 
+**The vault's key is a refusal too, and a harder one.** `LAWANG_VAULT_KEY` is what provider
+credentials are sealed with, and production refuses to produce a configuration at all without it,
+so no role starts (`config.Load`, [ADR 16](adr/0016-vault-key-source.md)). Development, which has
+to be asked for by name, generates one per process instead, and there is no backend selector in
+front of that rule: the generating branch is reached only by naming development, so no other input
+can reach it. The key is held by the process and never written to the database, which is what makes
+a backup of the credential table worth nothing on its own; the same property means a lost key is
+every tenant connecting its providers again, not a recovery.
+
 **Row-level security.** Every tenant-scoped table has RLS enabled and forced, with the policy keyed
 on a transaction-local setting. If the setting is missing, a query returns zero rows. Three roles:
 
@@ -505,7 +514,10 @@ write of any kind, and nothing at all on any other table. It cannot read a subsc
 `resource` or when it was created, it cannot see the outbox, and it cannot see the tenants table.
 The `secret` is the webhook verification secret, which is the one credential the accept path needs
 and is deliberately not a vault entry: the vault is keyed by tenant, and this is the path that does
-not know the tenant yet ([ADR 11](adr/0011-hub-resolution.md)).
+not know the tenant yet ([ADR 11](adr/0011-hub-resolution.md)). It is also still in a plain column
+after B13: ADR 11 assigned encrypting it to that item, B13 did not do it, and
+[ADR 16](adr/0016-vault-key-source.md) decision 6 says why, what the plain column costs and which
+item owns it now (B14).
 
 **A helper-role transaction is cross-tenant until it ends.** Permissive policies are ORed together,
 so once a helper role's policy applies (`TO lawang_worker USING (true)`, for example), binding a
@@ -886,7 +898,10 @@ type MemberSource interface {
 	Scopes(ctx context.Context, s Subscription) ([]ScopeMembers, error) // fails loudly, never empty-on-error
 }
 
-// Vault holds provider credentials. Raw tokens never reach a plain table.
+// Vault holds provider credentials. Raw tokens never reach a plain table. Every method fails
+// closed: nothing stored, a backend that cannot be reached, and a stored value that cannot be
+// decrypted are refusals, and none of them is ever an empty credential with a nil error
+// (internal/vault, B13).
 type Vault interface {
 	Store(ctx context.Context, t Tenant, provider string, c Credential) error
 	Fetch(ctx context.Context, t Tenant, provider string) (Credential, error)
@@ -961,7 +976,8 @@ every provider's own tests run over its own payloads.
 the ingress edge is built on them. `Subscription`, `Registrar` and `URLSigner` land with B07, which
 is the item that decides what a subscription is: the hub resolves deliveries against those rows and
 the subscriptions table stores them. `Degrader` lands with B08, which is the item that has a
-degraded path to take. `Reconciler` and `MemberSource` still wait for the items that
+degraded path to take. `Vault` lands with B13, in `internal/vault`, which is also the item that
+gives `Credential` its contents. `Reconciler` and `MemberSource` still wait for the items that
 decide the types they take: `Cursor` is B19's (reconciliation) and `ScopeMembers` is B23's (access
 sync). An interface written before its types are settled is a shape every later item has to
 rewrite, and the rewrite is not free once a provider package implements it.
@@ -973,18 +989,55 @@ does not carry the list a task is in and a degraded record would need a guessed 
 needs one API token per tenant, which the vault (B13) and `lawang connect` (B14) supply, so the
 registry is still built empty and every `/ingress/{provider}` is still a 404.
 
-`Credential` is the one exception, and it is deliberately not a shape yet. `Registrar` cannot be
-written without naming it, and what a credential holds is B13's decision (the vault) and B14's
-(`connect`), so it is declared the way `Hydrated` is, as an opaque type. Every signature that names
-it is stable from now on, and B13 gives it contents without touching one of them. What is already
-settled about it is where it may go: it is secret material, so it never reaches a log line, an
-error, a plain table or a record.
+`Credential` is the one exception at the provider interface, and it stays opaque there. `Registrar`
+cannot be written without naming it, and no two providers' credentials have a field in common, so
+`provider.Credential` is declared the way `Hydrated` is. **B13 gave it contents without touching a
+signature**: a `vault.Credential` is a set of named secret fields (`token`, `client_secret`,
+`access_token`), built by `vault.NewCredential`, which refuses a field name that is not one and a
+value that is empty, is only whitespace, or has whitespace at either end (a token pasted out of a
+file keeps the newline, and a header value carrying one is refused by `net/http` on the first
+request, which reads as "the provider could not be reached"). Where it may go was settled before
+it had contents, and the
+type now keeps that promise itself rather than leaving it to its callers: `String`, `GoString` and
+`LogValue` print the field names and never a value, and `MarshalJSON` returns an error, so a
+credential cannot be serialized into an HTTP body, a record or a JSON log line by accident. The one
+encoder that writes one is the vault's own, and what it writes goes straight into AES-GCM.
+
+**The `Vault` seam, as built (B13, `internal/vault`).** Three implementations, and a deployment
+uses one:
+
+- `local` seals a credential with AES-256-GCM under a master key from the environment and stores
+  the envelope in this deployment's own Postgres (`vault_credentials`, migration 00007). The
+  envelope is a format byte, the id of the key it was sealed under, and what GCM produced, and it
+  is authenticated with the tenant and the provider, so a row moved between tenants or providers
+  no longer decrypts. The format byte is what makes a plaintext row a refusal by name
+  (`ErrNotSealed`) rather than a decryption failure, and the table's CHECK refuses the same shape
+  on the way in. The key source, what a KMS would change, and why rotation is not built are
+  [ADR 16](adr/0016-vault-key-source.md).
+- `nango` holds nothing locally and asks a self-hosted Nango over HTTP: the connection id is the
+  Lawang tenant id and the provider config key is the Lawang provider key, and an answer about any
+  other connection is refused rather than handed out.
+- `azureapp` is the Microsoft Graph client-credentials vault: the credential is an app
+  registration's client secret, which lives in configuration, and what the vault hands out is an
+  access token cached per tenant **and** provider. Its consumers (B16, B17) are deferred, so it has
+  no v0.1.0 consumer; whether it ships is the maintainer's call (`docs/backlog.md`, the cut list).
+
+**One credential is deliberately outside all three.** The webhook verification secret stays in a
+plain `subscriptions.secret` column: the accept path needs it before it knows the tenant, and
+every `Vault` method takes one, so serving it is a second seam beside the vault rather than a
+caller of it. ADR 11 assigned the encryption to B13, B13 left the column as it is, and
+[ADR 16](adr/0016-vault-key-source.md) decision 6 records the deferral, what the plain column
+costs and which item owns it now (B14).
+
+Nothing in `cmd/lawang` builds a vault yet. `lawang connect` and the operator API (B14) are the
+items that do, which is also where the per-tenant sink configuration arrives, so the provider
+registry stays empty until then.
 
 Built-in implementations planned for v0.1:
 
 | Seam | Implementations |
 |---|---|
-| Vault | `local` (AES-GCM, key from the environment), `nango` (self-hosted), `azureapp` (client-credentials for Microsoft Graph) |
+| Vault | `local` (AES-256-GCM, key from `LAWANG_VAULT_KEY`, [ADR 16](adr/0016-vault-key-source.md)), `nango` (self-hosted, HTTP only), `azureapp` (client-credentials for Microsoft Graph, no v0.1.0 consumer) |
 | Sink | `http` (the format above), `stub` (strict test double), `jsonl` (files, for development) |
 | Hydration | direct provider API clients; an MCP-backed hydrator is on the roadmap as an alternative |
 | Identity | email join (normalized, domain-restricted); replaceable |
