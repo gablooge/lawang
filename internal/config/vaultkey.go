@@ -111,12 +111,17 @@ func (k MasterKey) IsZero() bool { return !k.set }
 // process ends.
 func (k MasterKey) Generated() bool { return k.generated }
 
-// Bytes returns a copy of the key, or nil when there is none. It is a copy so that a caller
-// cannot change what the configuration holds, and it is the one way out of this type: everything
-// else about a MasterKey is redacted.
+// Bytes returns a copy of the key, or nil when there is none. It is the one way out of this type:
+// everything else about a MasterKey is redacted.
 //
 // Its caller is vault.NewLocal, which reads it once at start-up and keeps the AES key schedule
 // rather than the key.
+//
+// The copy is explicitness rather than protection, and the mutation run of item B13 says so: the
+// receiver is a value, so k is already a copy of the caller's MasterKey and k.key[:] could not
+// alias the one in a Config either way. It is written out because that argument depends on the
+// receiver staying a value, and a pointer receiver added later would turn the short spelling into
+// a slice into the configuration.
 func (k MasterKey) Bytes() []byte {
 	if !k.set {
 		return nil

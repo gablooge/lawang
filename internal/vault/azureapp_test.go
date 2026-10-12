@@ -99,6 +99,12 @@ func (f *fakeAuthority) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if f.status != 0 {
+		if f.status >= 300 && f.status <= 399 {
+			// A redirect with somewhere to go, so that a client which followed one would really
+			// make a second request. Without the Location header, Go would not follow it and the
+			// case below would pass for a client that does follow them.
+			w.Header().Set("Location", "/another-directory/oauth2/v2.0/token")
+		}
 		w.WriteHeader(f.status)
 		_, _ = w.Write([]byte(f.body))
 		return
@@ -435,6 +441,39 @@ func TestAzureAppNeverPutsTheClientSecretInTheURLOrAnError(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), azureClientSecret) {
 		t.Errorf("the refusal carries the client secret: %v", err)
+	}
+}
+
+// TestAzureAppDoesNotFollowARedirect is about the one request in the program whose body carries a
+// client secret. Go would send that body on to the new location when it stays on one host and
+// drop the request when it does not, and this vault answers the 3xx as itself instead.
+//
+// The client here is the test server's, passed in, which is the case that matters: a redirect
+// policy only set on the default client would leave this to whoever hands one in.
+func TestAzureAppDoesNotFollowARedirect(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			t.Parallel()
+			f := newFakeAuthority(t)
+			f.status = status
+			v := f.serving(t, nil)
+
+			got, err := v.Fetch(context.Background(), tenantA, graphProvider)
+			if err == nil {
+				t.Fatalf("a %d was accepted: %v", status, got)
+			}
+			if !errors.Is(err, vault.ErrUnavailable) {
+				t.Errorf("err = %v, want ErrUnavailable", err)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprint(status)) {
+				t.Errorf("the refusal does not name the status: %v", err)
+			}
+			if seen := f.seen(); len(seen) != 1 {
+				t.Errorf("the redirect was followed: %d requests", len(seen))
+			}
+		})
 	}
 }
 

@@ -186,15 +186,16 @@ func validFieldName(name string) bool {
 // name no value, because the value is the secret.
 func validValue(value string) error {
 	switch {
-	case value == "":
-		return errors.New("the value is empty, and an empty credential authenticates nothing")
 	case strings.TrimSpace(value) == "":
-		// Whitespace is the other way a credential arrives as nothing: a secret manager entry
-		// that holds a newline, a copied line with only spaces on it, or an issuer answering
-		// with " " for a token. It would go into an Authorization header as a space and be
-		// answered 401, which is the retry ladder the empty-value rule above exists to prevent.
-		// Only an all-whitespace value is refused: a PEM-encoded key ends in a newline.
-		return errors.New("the value is whitespace, and a credential of whitespace authenticates nothing")
+		// Empty, and whitespace, in one rule: a secret manager entry that holds only a newline, a
+		// copied line with spaces on it, and an issuer answering " " for a token all arrive as a
+		// credential that authenticates nothing, which is a request answered 401 and a retry
+		// ladder spent on a credential that was never there. They are one case and not two
+		// because TrimSpace covers the empty string as well, and a separate case for it was a
+		// branch no input could reach on its own (the mutation run of item B13 found it
+		// surviving). Only an ALL-whitespace value is refused: a PEM-encoded key ends in a
+		// newline.
+		return errors.New("the value is empty or only whitespace, and such a credential authenticates nothing")
 	case len(value) > maxValueLen:
 		return fmt.Errorf("the value is longer than %d bytes", maxValueLen)
 	case !utf8.ValidString(value):

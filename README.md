@@ -42,7 +42,14 @@ clean, permission-stamped record delivered exactly once to your memory, search, 
 > criteria has a test there that runs in CI. The one half that cannot run in CI is the live one,
 > against a real workspace through a tunnel, which is what proves the signature check agrees with
 > ClickUp rather than with a fixture the tests signed themselves. It is built, behind the `live`
-> build tag, and it has not been run yet. The design
+> build tag, and it has not been run yet. **The vault is built too**, which is where those API
+> tokens will come from: a credential is sealed with AES-256-GCM under a key from the environment
+> and stored as an envelope that names its format and its key, so a database backup without the key
+> is worth nothing, a row moved between tenants no longer decrypts, and a plaintext row is refused
+> by name rather than handed out. A deployment that already runs Nango can point at that instead,
+> and Microsoft Graph's client credentials have an implementation of their own. Production refuses
+> to start without a key. Nothing builds a vault in the binary yet: the command that connects a
+> provider is the next item. The design
 > is written down in [docs/architecture.md](docs/architecture.md), the build order in
 > [docs/roadmap.md](docs/roadmap.md),
 > and day-to-day progress in [docs/backlog.md](docs/backlog.md). The first release, v0.1.0, is the

@@ -90,16 +90,22 @@ func NewNango(opts NangoOptions) (*Nango, error) {
 		// unauthenticated request per lookup and spend a retry ladder on a wiring mistake.
 		return nil, errors.New("vault: NewNango needs a SecretKey")
 	}
-	client := opts.HTTPClient
-	if client == nil {
-		client = &http.Client{
-			Timeout: DefaultNangoTimeout,
-			// A redirect would be followed with the Authorization header still on the request
-			// when it stays on one host, and silently dropped when it does not. Neither belongs
-			// on a path that carries the secret key, so a 3xx comes back as itself.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}
+	client := &http.Client{Timeout: DefaultNangoTimeout}
+	if opts.HTTPClient != nil {
+		// A copy, so that the redirect policy below is this package's and the caller's client is
+		// left as it was. Everything else about it (its transport, its timeout, its cookie jar)
+		// is the caller's and is kept.
+		copied := *opts.HTTPClient
+		client = &copied
 	}
+	// A redirect is never followed, whoever built the client. Go would send the Authorization
+	// header on to the new location while it stays on one host and drop it silently when it does
+	// not, and neither belongs on a path that carries this deployment's secret key, so a 3xx
+	// comes back as itself. It is set here rather than only on the default client because a
+	// caller that passes one in (a test, or a deployment with its own transport) would otherwise
+	// decide this, and the 302 case of TestNangoRefusesEveryStatusThatIsNotTheOneAskedFor is
+	// what found that.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Nango{base: base, secret: opts.SecretKey, client: client}, nil
 }
 

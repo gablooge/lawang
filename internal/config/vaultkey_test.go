@@ -3,8 +3,10 @@ package config
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -166,8 +168,8 @@ func TestTheKeyLoadCarriesIsTheOneTheVariableHeld(t *testing.T) {
 	if cfg.VaultKey.Generated() {
 		t.Error("a configured key is reported as generated")
 	}
-	// Bytes hands out a copy: a caller that edits it cannot change the configuration, and two
-	// callers cannot change each other's.
+	// A caller that edits what Bytes handed it cannot change the configuration. (The value
+	// receiver is what makes that true today; see Bytes.)
 	got[0] ^= 0xFF
 	if again := cfg.VaultKey.Bytes(); !bytes.Equal(again, want) {
 		t.Error("editing the result of Bytes changed the configuration")
@@ -193,12 +195,32 @@ func TestTheVaultKeyIsNeverPrinted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the test key is not base64: %v", err)
 	}
-	var asNumbers strings.Builder
+	// Both spellings Go prints a byte array in: "%v" of an array separates with a space and a
+	// slice of numbers in source or in JSON separates with a comma. Only checking one of them
+	// would clear a %#v that prints the array, which is the leak this test exists for.
+	var spaced, commaed strings.Builder
 	for i, b := range raw {
 		if i > 0 {
-			asNumbers.WriteString(", ")
+			spaced.WriteString(" ")
+			commaed.WriteString(",")
 		}
-		fmt.Fprintf(&asNumbers, "%d", b)
+		fmt.Fprintf(&spaced, "%d", b)
+		fmt.Fprintf(&commaed, "%d", b)
+	}
+	// Every spelling of the key a printer could produce: base64, the two number forms, the raw
+	// bytes as a string (what a text log of string(key) would hold), and hex. A list with only
+	// one of them on it would clear four ways of leaking the key.
+	asBytes := []string{
+		spaced.String(),
+		commaed.String(),
+		string(raw),
+		// What a text log or a %q prints for those bytes: the handlers escape them, so the raw
+		// spelling above would not match what one actually wrote. The JSON handler is lossier
+		// still (invalid UTF-8 becomes U+FFFD), and the assertion further down that every
+		// printed form must say whether a key is configured is what covers that one.
+		strings.Trim(strconv.Quote(string(raw)), `"`),
+		hex.EncodeToString(raw),
+		strings.ToUpper(hex.EncodeToString(raw)),
 	}
 
 	printed := map[string]string{}
@@ -219,8 +241,10 @@ func TestTheVaultKeyIsNeverPrinted(t *testing.T) {
 		if strings.Contains(out, testVaultKey) {
 			t.Errorf("%s holds the key: %s", where, out)
 		}
-		if strings.Contains(out, asNumbers.String()) {
-			t.Errorf("%s holds the key as bytes: %s", where, out)
+		for _, spelling := range asBytes {
+			if strings.Contains(out, spelling) {
+				t.Errorf("%s holds the key as bytes: %s", where, out)
+			}
 		}
 		// It says there is one, which is what an operator debugging a vault needs.
 		if !strings.Contains(out, "configured") {

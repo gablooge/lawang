@@ -92,6 +92,12 @@ func (f *fakeNango) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if f.status != 0 {
+		if f.status >= 300 && f.status <= 399 {
+			// A redirect with somewhere to go, so that a client which followed one would really
+			// make a second request. Without the Location header, Go would not follow it and the
+			// "a redirect is not followed" case would pass for a client that does follow them.
+			w.Header().Set("Location", "/connection/somebody-else?provider_config_key="+otherProvider)
+		}
 		w.WriteHeader(f.status)
 		_, _ = w.Write([]byte(f.body))
 		return

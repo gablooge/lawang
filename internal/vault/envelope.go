@@ -79,9 +79,17 @@ const aadLabel = "lawang.vault.v1"
 // The parts are joined with 0x1F and the encoding is unambiguous because of what the parts can
 // be: checkArgs has already held the tenant to ^[A-Za-z0-9_-]{1,64}$ and the provider key to ADR
 // 3's grammar, so neither can contain the separator and no two different pairs can produce the
-// same bytes. The header is appended as read, so a flipped format byte or a rewritten key id
-// fails authentication too, which is what makes a ciphertext that is valid under another key
-// still a refusal after its header has been made to look local.
+// same bytes.
+//
+// The header is appended as read, and that part changes nothing today, deliberately and
+// knowingly. A rewritten key id is refused by open before the tag is checked, and a rewritten
+// format byte before that, so no input this package can be given tells the two apart: the
+// mutation run of item B13 took the header out of this function and every test still passed. It
+// is kept because the key id is only a reliable name for a key while it is authenticated, and the
+// first reader that accepts more than one key (a rotation, ADR 16) has to be able to trust it.
+// A reader should not conclude from this comment that a ciphertext sealed under another key and
+// relabelled is accepted: it is refused, by the key id, which
+// TestACiphertextValidUnderAnotherKeyIsRefused shows.
 func aad(t tenancy.ID, providerKey string, header []byte) []byte {
 	b := make([]byte, 0, len(aadLabel)+len(t)+len(providerKey)+len(header)+3)
 	b = append(b, aadLabel...)

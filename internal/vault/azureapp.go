@@ -158,14 +158,16 @@ func NewAzureApp(opts AzureAppOptions) (*AzureApp, error) {
 		}
 		apps[key] = app
 	}
-	client := opts.HTTPClient
-	if client == nil {
-		client = &http.Client{
-			Timeout: DefaultAzureTimeout,
-			// A redirect on a request whose body carries a client secret is never followed.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}
+	client := &http.Client{Timeout: DefaultAzureTimeout}
+	if opts.HTTPClient != nil {
+		// A copy, for the reason NewNango copies one: the redirect policy below is this
+		// package's, and the caller's client is left as it was.
+		copied := *opts.HTTPClient
+		client = &copied
 	}
+	// A redirect on a request whose body carries a client secret is never followed, whoever built
+	// the client (TestAzureAppDoesNotFollowARedirect).
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	now := opts.Now
 	if now == nil {
 		now = time.Now

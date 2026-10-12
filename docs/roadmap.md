@@ -187,7 +187,7 @@ Each becomes a short decision record under `docs/adr/` when it is settled.
 | 4 | Final field names in the record format | **settled:** format v1, see [ADR 4](adr/0004-record-format-v1.md). The proposal's names are kept, a `format` version field is added, `meta.raw_ref` is dropped, and the scope is hashed into the record id | This is a public contract once v0.1 ships, so it should settle before M1 finishes |
 | 5 | Default hydration path | direct API clients | Three of five providers needed them anyway |
 | 6 | One binary with modes, or two binaries | one binary | Simpler releases; roles are just subcommands |
-| 7 | Vault encryption key source | environment master key for v0.1, a KMS interface later | Keeps the local setup dependency-free |
+| 7 | Vault encryption key source | **settled:** an environment master key (`LAWANG_VAULT_KEY`, 32 bytes of base64) for v0.1, a KMS interface later, see [ADR 16](adr/0016-vault-key-source.md). Production refuses to start without one and development generates one per process; every envelope names the format and the key it was sealed under, so a KMS is additive; rotation is named as something the `Vault` interface cannot express yet | Keeps the local setup dependency-free, and keeps a database backup worth nothing on its own |
 | 8 | Configuration | environment only for v0.1 | Twelve-factor, container-friendly; a file format can come later |
 | 9 | License | Apache 2.0 | Patent grant, standard for Go infrastructure projects |
 | 10 | How the outbox claim finds the head of each ordering key | **settled:** a stored marker kept under the key's lock, see [ADR 10](adr/0010-outbox-head-marker.md) | Working the heads out on every poll cost 4 seconds at a million waiting rows, on a path that runs every second |
