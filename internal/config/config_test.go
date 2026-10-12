@@ -10,6 +10,14 @@ import (
 	"testing"
 )
 
+// testVaultKey and otherTestVaultKey are throwaway master keys for these tests: 32 random bytes
+// each, generated for this file and used nowhere else. No real key is in this repository, and no
+// value in ~/.config/lawang is ever copied into one (CLAUDE.md).
+const (
+	testVaultKey      = "nkZRlm6ZDL1Ue/EppsiSb6fvhqx8yBGHsqNjFavpR+w="
+	otherTestVaultKey = "SADzDr41Yg9ePjvWAhMrsLlgdBZe6h4Lgki1Obx3u0Q="
+)
+
 func env(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
@@ -17,6 +25,7 @@ func env(m map[string]string) func(string) string {
 func TestLoadUnsetEnvironmentIsProduction(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
 		"LAWANG_DATABASE_URL": "postgres://app@db:5432/lawang",
+		"LAWANG_VAULT_KEY":    testVaultKey,
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -62,6 +71,7 @@ func TestLoadUnknownEnvironmentIsAnError(t *testing.T) {
 	_, err := Load(env(map[string]string{
 		"LAWANG_ENV":          "dev",
 		"LAWANG_DATABASE_URL": "postgres://app@db:5432/lawang",
+		"LAWANG_VAULT_KEY":    testVaultKey,
 	}))
 	if err == nil || !strings.Contains(err.Error(), "LAWANG_ENV") {
 		t.Fatalf("err = %v, want a LAWANG_ENV error", err)
@@ -90,7 +100,7 @@ func TestLoadDatabaseURLErrorsNeverEchoTheValue(t *testing.T) {
 		"missing host": "postgres://leakuser:hunter2@/leakdb",
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": raw}))
+			_, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": raw, "LAWANG_VAULT_KEY": testVaultKey}))
 			if err == nil {
 				t.Fatal("Load accepted a bad database URL")
 			}
@@ -112,12 +122,14 @@ func TestLoadErrorsNeverEchoAnyValue(t *testing.T) {
 		"LAWANG_LOG_LEVEL",
 		"LAWANG_LOG_FORMAT",
 		"LAWANG_PUBLIC_BASE_URL",
+		"LAWANG_VAULT_KEY",
 	}
 
 	for _, name := range validated {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(env(map[string]string{
 				"LAWANG_DATABASE_URL": "postgres://app@db:5432/lawang",
+				"LAWANG_VAULT_KEY":    testVaultKey,
 				name:                  secret,
 			}))
 			if err == nil {
@@ -131,7 +143,7 @@ func TestLoadErrorsNeverEchoAnyValue(t *testing.T) {
 	}
 
 	t.Run("all at once", func(t *testing.T) {
-		all := map[string]string{"LAWANG_DATABASE_URL": "mysql://leakuser:hunter2@leakhost:3306/leakdb"}
+		all := map[string]string{"LAWANG_DATABASE_URL": "mysql://leakuser:hunter2@leakhost:3306/leakdb", "LAWANG_VAULT_KEY": testVaultKey}
 		for _, name := range validated {
 			all[name] = secret
 		}
@@ -158,6 +170,7 @@ func TestLoadRefusesABadListenAddress(t *testing.T) {
 	} {
 		_, err := Load(env(map[string]string{
 			"LAWANG_DATABASE_URL": "postgres://app@db:5432/lawang",
+			"LAWANG_VAULT_KEY":    testVaultKey,
 			"LAWANG_LISTEN_ADDR":  addr,
 		}))
 		if err == nil || !strings.Contains(err.Error(), "LAWANG_LISTEN_ADDR") {
@@ -180,6 +193,7 @@ func TestLoadAcceptsEveryOrdinaryListenAddress(t *testing.T) {
 	} {
 		cfg, err := Load(env(map[string]string{
 			"LAWANG_DATABASE_URL": "postgres://app@db:5432/lawang",
+			"LAWANG_VAULT_KEY":    testVaultKey,
 			"LAWANG_LISTEN_ADDR":  addr,
 		}))
 		if err != nil {
@@ -195,6 +209,7 @@ func TestLoadAcceptsEveryOrdinaryListenAddress(t *testing.T) {
 func TestConfigNeverPrintsTheDatabaseURL(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
 		"LAWANG_DATABASE_URL": "postgres://leakuser:hunter2@leakhost:5432/leakdb",
+		"LAWANG_VAULT_KEY":    testVaultKey,
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -222,7 +237,7 @@ func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load accepted an invalid environment")
 	}
-	for _, want := range []string{"LAWANG_DATABASE_URL", "LAWANG_LOG_LEVEL", "LAWANG_LOG_FORMAT"} {
+	for _, want := range []string{"LAWANG_DATABASE_URL", "LAWANG_VAULT_KEY", "LAWANG_LOG_LEVEL", "LAWANG_LOG_FORMAT"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s: %v", want, err)
 		}
@@ -232,6 +247,7 @@ func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
 		"LAWANG_DATABASE_URL": "postgresql://app@db/lawang",
+		"LAWANG_VAULT_KEY":    testVaultKey,
 		"LAWANG_LISTEN_ADDR":  "127.0.0.1:9000",
 		"LAWANG_LOG_LEVEL":    "debug",
 		"LAWANG_LOG_FORMAT":   "TEXT",
@@ -266,6 +282,7 @@ var validSamples = map[string][]string{
 	"LAWANG_DATABASE_URL":    {"postgres://app@db/lawang", "postgresql://app@db:5432/lawang"},
 	"LAWANG_LISTEN_ADDR":     {":9000", "127.0.0.1:9000"},
 	"LAWANG_PUBLIC_BASE_URL": {"https://lawang.example.test", "https://lawang.example.test/prefix"},
+	"LAWANG_VAULT_KEY":       {testVaultKey, otherTestVaultKey},
 }
 
 // recordingBases is the full cross product of the states of every documented variable: unset,
@@ -286,11 +303,11 @@ func recordingBases(t *testing.T) []map[string]string {
 		// A state only drives the path it is named for if Load really takes it that way. A sample
 		// that has rotted into a refused value would silently leave the accepted path undriven.
 		for _, state := range accepted {
-			if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": "postgres://app@db/lawang", v.Name: state})); err != nil {
+			if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": "postgres://app@db/lawang", "LAWANG_VAULT_KEY": testVaultKey, v.Name: state})); err != nil {
 				t.Fatalf("%s: Load refuses the state %q that stands for an accepted value: %v", v.Name, state, err)
 			}
 		}
-		if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": "postgres://app@db/lawang", v.Name: "x"})); err == nil {
+		if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": "postgres://app@db/lawang", "LAWANG_VAULT_KEY": testVaultKey, v.Name: "x"})); err == nil {
 			t.Fatalf("%s: Load accepts \"x\", which stands for a refused value", v.Name)
 		}
 		states := append([]string{"", "x"}, accepted...)
@@ -360,7 +377,7 @@ func TestVariablesStateTheDefaultsLoadApplies(t *testing.T) {
 		doc[v.Name] = v.Default
 	}
 
-	prod, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": "postgres://app@db/lawang"}))
+	prod, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": "postgres://app@db/lawang", "LAWANG_VAULT_KEY": testVaultKey}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -435,12 +452,12 @@ func TestVariablesStateTheValuesLoadAccepts(t *testing.T) {
 		}
 		enumerated[v.Name] = true
 		for _, value := range v.Values {
-			if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": dbURL, v.Name: value})); err != nil {
+			if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": dbURL, "LAWANG_VAULT_KEY": testVaultKey, v.Name: value})); err != nil {
 				t.Errorf("%s=%s is documented as accepted, but Load refuses it: %v", v.Name, value, err)
 			}
 		}
 		for _, value := range unlisted {
-			_, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": dbURL, v.Name: value}))
+			_, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": dbURL, "LAWANG_VAULT_KEY": testVaultKey, v.Name: value}))
 			if err == nil {
 				t.Errorf("%s=%s is not documented, but Load accepts it", v.Name, value)
 				continue
@@ -462,7 +479,7 @@ func TestVariablesStateTheValuesLoadAccepts(t *testing.T) {
 	original := values[0]
 	values[0] = "edited"
 	defer func() { values[0] = original }()
-	if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": dbURL, "LAWANG_ENV": "edited"})); err == nil {
+	if _, err := Load(env(map[string]string{"LAWANG_DATABASE_URL": dbURL, "LAWANG_VAULT_KEY": testVaultKey, "LAWANG_ENV": "edited"})); err == nil {
 		t.Error("editing the result of Variables changed what Load accepts")
 	}
 }
@@ -714,6 +731,7 @@ func TestLoadCarriesThePublicBaseURLThrough(t *testing.T) {
 	const dbURL = "postgres://app@db/lawang"
 	cfg, err := Load(env(map[string]string{
 		"LAWANG_DATABASE_URL":    dbURL,
+		"LAWANG_VAULT_KEY":       testVaultKey,
 		"LAWANG_PUBLIC_BASE_URL": "https://lawang.example.test/",
 	}))
 	if err != nil {
@@ -725,6 +743,7 @@ func TestLoadCarriesThePublicBaseURLThrough(t *testing.T) {
 
 	_, err = Load(env(map[string]string{
 		"LAWANG_DATABASE_URL":    dbURL,
+		"LAWANG_VAULT_KEY":       testVaultKey,
 		"LAWANG_PUBLIC_BASE_URL": "postgres://app:hunter2@db:5432/lawang",
 	}))
 	if err == nil {

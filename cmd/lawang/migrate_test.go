@@ -19,6 +19,8 @@ func runMigrate(t *testing.T, databaseURL string) (code int, printed string) {
 		switch k {
 		case "LAWANG_DATABASE_URL":
 			return databaseURL
+		case "LAWANG_VAULT_KEY":
+			return testVaultKey
 		case "LAWANG_LOG_FORMAT":
 			return "text"
 		}

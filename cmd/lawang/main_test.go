@@ -68,6 +68,11 @@ func TestRunNeverPrintsAnUnknownCommand(t *testing.T) {
 	}
 }
 
+// testVaultKey is a throwaway vault master key for these tests: 32 random bytes in base64,
+// generated for this file. The commands that must start need one, because production refuses to
+// start without a vault key (config.Load, ADR 16). No real key is in this repository.
+const testVaultKey = "dLK+kAr1e8FuFDSNtcD9QX2RJ/GNWHeA40f0e1n66uk="
+
 func TestRunRefusesExtraArguments(t *testing.T) {
 	// No command may ignore an argument it does not take: "serve --listen :9090" would otherwise
 	// start on the default port with no warning.
@@ -235,6 +240,8 @@ func TestRunServeExitsZeroAfterACleanShutdown(t *testing.T) {
 		switch k {
 		case "LAWANG_DATABASE_URL":
 			return tdb.URL
+		case "LAWANG_VAULT_KEY":
+			return testVaultKey
 		case "LAWANG_LISTEN_ADDR":
 			return "127.0.0.1:0"
 		case "LAWANG_LOG_FORMAT":
@@ -293,6 +300,62 @@ func TestRunServeExitsZeroAfterACleanShutdown(t *testing.T) {
 	}
 	if out.String() != "" {
 		t.Errorf("serve wrote to stdout: %s", out.String())
+	}
+}
+
+// TestRunRefusesToStartWithoutAVaultKey is the third "Done when" clause of item B13 at the layer
+// an operator meets: a missing key in production is a startup error, for every role, before
+// anything is served.
+//
+// Everything else in the environment is valid and the database is real, so the only thing wrong is
+// the missing key, and the refusal cannot be somebody else's. The deadline is what makes a
+// regression a failure rather than a hang: a role that wrongly started is stopped by it and exits
+// 0, which the exit code assertion reports.
+func TestRunRefusesToStartWithoutAVaultKey(t *testing.T) {
+	tdb := testdb.New(t)
+	getenv := func(k string) string {
+		switch k {
+		case "LAWANG_DATABASE_URL":
+			return tdb.URL
+		case "LAWANG_LISTEN_ADDR":
+			return "127.0.0.1:0"
+		}
+		return ""
+	}
+	for _, cmd := range []string{"serve", "worker", "migrate"} {
+		t.Run(cmd, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			var out, errOut bytes.Buffer
+			code := run(ctx, []string{cmd}, getenv, &out, &errOut)
+			if code != 1 {
+				t.Errorf("exit = %d, want 1: %s", code, errOut.String())
+			}
+			if !strings.Contains(errOut.String(), "invalid configuration") ||
+				!strings.Contains(errOut.String(), "LAWANG_VAULT_KEY") {
+				t.Errorf("stderr is not a configuration refusal naming the missing key: %s", errOut.String())
+			}
+			if ctx.Err() != nil {
+				t.Error("run was still going at the deadline: the role started instead of refusing")
+			}
+		})
+	}
+
+	// The control: the same environment with a key starts. Without it, this test would pass for a
+	// binary that refuses to start whatever it is given. "migrate" is the role that finishes on
+	// its own, so it is the one that can be run to completion here.
+	withKey := func(k string) string {
+		if k == "LAWANG_VAULT_KEY" {
+			return testVaultKey
+		}
+		return getenv(k)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	var out, errOut bytes.Buffer
+	if code := run(ctx, []string{"migrate"}, withKey, &out, &errOut); code != 0 {
+		t.Errorf("migrate with a vault key: exit = %d, want 0: %s", code, errOut.String())
 	}
 }
 
@@ -390,6 +453,8 @@ func TestRunNeverPrintsTheListenAddress(t *testing.T) {
 				switch k {
 				case "LAWANG_DATABASE_URL":
 					return tdb.URL
+				case "LAWANG_VAULT_KEY":
+					return testVaultKey
 				case "LAWANG_LISTEN_ADDR":
 					return tc.addr
 				}

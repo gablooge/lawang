@@ -44,6 +44,18 @@ type Config struct {
 	// URL a signature covers out of (ingress.Options.PublicBaseURL, architecture 4); backlog
 	// item B07 wires it, because the edge is not mounted until a hub exists.
 	PublicBaseURL string
+
+	// VaultKey is the master key the local vault seals provider credentials with
+	// (vault.NewLocal, LAWANG_VAULT_KEY). Production refuses to start without one and
+	// development generates one, so a Config that exists carries a key; see Load, ADR 16 and
+	// open decision 7.
+	//
+	// Nothing in the binary builds a vault yet: a vault is used by "lawang connect" and the
+	// operator API, which are backlog item B14, the way PublicBaseURL above was read here before
+	// B07 mounted the edge. The key is validated at start-up even so, because the alternative is
+	// a deployment that comes up, accepts deliveries, and refuses every credential operation
+	// afterwards.
+	VaultKey MasterKey
 }
 
 // defaultListenAddr is where serve listens when LAWANG_LISTEN_ADDR is unset.
@@ -109,6 +121,19 @@ func Variables() []Variable {
 				"provider registered it starts and serves as usual.",
 		},
 		{
+			Name: "LAWANG_VAULT_KEY",
+			Doc: "The vault's master key: 32 bytes in standard base64 with padding, 44 " +
+				"characters, as printed by \"openssl rand -base64 32\". It is what provider " +
+				"credentials are sealed with (AES-256-GCM), it is held by this process and " +
+				"never written to the database, and a backup of the database is worth nothing " +
+				"without it. Hex is not accepted, because 64 hex characters are also valid " +
+				"base64 and a value that can be read two ways is a key half the rows were " +
+				"never encrypted under. Keep it in the deployment's secret store, and keep the " +
+				"old one: a credential sealed under a key is readable with that key alone.",
+			Default: "none, it is required in production. Development generates one per process, " +
+				"so a credential stored in development cannot be read again after a restart.",
+		},
+		{
 			Name:    "LAWANG_LOG_LEVEL",
 			Doc:     "The lowest level that is logged. Case does not matter.",
 			Values:  slices.Clone(logLevelValues),
@@ -142,13 +167,16 @@ func (c Config) LogValue() slog.Value {
 		// Not redacted: it is a public hostname, it is what a provider posts to, and an operator
 		// debugging a signature failure needs to see the spelling the process actually holds.
 		slog.String("public_base_url", c.PublicBaseURL),
+		// Where the vault's key came from, never the key: see MasterKey.
+		slog.Any("vault_key", c.VaultKey),
 	)
 }
 
-// String covers %v, %+v and %s, so printing a Config cannot leak the database URL either.
+// String covers %v, %+v and %s, so printing a Config cannot leak the database URL either, or the
+// vault's master key, which MasterKey redacts for itself.
 func (c Config) String() string {
-	return fmt.Sprintf("{Env:%s DatabaseURL:%s ListenAddr:%s LogLevel:%s LogFormat:%s PublicBaseURL:%s}",
-		c.Env, redacted, c.ListenAddr, c.LogLevel, c.LogFormat, c.PublicBaseURL)
+	return fmt.Sprintf("{Env:%s DatabaseURL:%s ListenAddr:%s LogLevel:%s LogFormat:%s PublicBaseURL:%s VaultKey:%s}",
+		c.Env, redacted, c.ListenAddr, c.LogLevel, c.LogFormat, c.PublicBaseURL, c.VaultKey)
 }
 
 // GoString covers %#v.
@@ -205,6 +233,27 @@ func Load(getenv func(string) string) (Config, error) {
 		} else {
 			cfg.PublicBaseURL = base
 		}
+	}
+
+	// The vault's master key. Production refuses to start without one, and that refusal is the
+	// whole of "a missing key in production is a startup error": there is no backend selector in
+	// front of it and no second way in, so no input can reach the development branch below with
+	// LAWANG_ENV set to anything but "development".
+	//
+	// Development generates one instead, which is what keeps a local setup dependency-free (ADR
+	// 16). What that costs is in the variable's documented default: the key goes with the process.
+	switch v := getenv("LAWANG_VAULT_KEY"); {
+	case v != "":
+		key, err := ParseMasterKey(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("LAWANG_VAULT_KEY: %w", err))
+		} else {
+			cfg.VaultKey = key
+		}
+	case cfg.Env == Development:
+		cfg.VaultKey = newGeneratedMasterKey()
+	default:
+		errs = append(errs, errors.New("LAWANG_VAULT_KEY: required in production"))
 	}
 
 	if v := strings.ToLower(getenv("LAWANG_LOG_LEVEL")); v != "" {

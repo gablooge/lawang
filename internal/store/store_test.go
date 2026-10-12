@@ -750,6 +750,9 @@ func TestEveryPolicySaysWhatTheDesignSaysItSays(t *testing.T) {
 		"subscriptions/resolver_read":    {"r", "lawang_resolver", "true", "", "deriving the tenant is the resolver's whole job (migration 00003)"},
 		"record_ledger/tenant_isolation": {"*", "public", byTenantID, byTenantID, "the supersede chain is per tenant (migration 00004)"},
 		"redaction_map/tenant_isolation": {"*", "public", byTenantID, byTenantID, "personal data by construction (migration 00004)"},
+		"vault_credentials/tenant_isolation": {"*", "public", byTenantID, byTenantID,
+			"a tenant's provider credentials, sealed, and readable by nobody else: no helper role " +
+				"is granted anything on this table (migration 00007, ADR 16)"},
 	}
 
 	db := open(t, "")
