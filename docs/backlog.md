@@ -13,8 +13,15 @@ stays true.
 Every item is also a GitHub issue with the same number: **B03 is
 [#3](https://github.com/gablooge/lawang/issues/3)**, B17 is #17, and so on. Each milestone is a
 [GitHub milestone](https://github.com/gablooge/lawang/milestones) carrying the target date from
-the table below. GitHub holds the status (open, closed, comments); this file holds the order, the
-dates and the log.
+the table below, once the maintainer has applied it. GitHub holds the status (open, closed,
+comments); this file holds the order, the dates and the log.
+
+**The milestone due dates are stale as this is written.** The replan of 2026-10-12 moved the table
+below and deliberately left the milestone objects alone, because applying new due dates on GitHub
+is the maintainer's step. On 2026-10-12 all six of M1 to M6 still hold the pre-replan dates, which
+are the window ends of the old table: M1 Oct 7, M2 Oct 9, M3 Oct 11, M4 Oct 14, M5 Oct 16 and M6
+Oct 17, between 6 and 28 days earlier than the windows below. **Until they are applied, this file
+is the dates and GitHub is not.**
 
 1. Take the first unchecked item. Items are ordered so each one only depends on items above it.
 2. Do it on a branch named after the item (`b03-store-rls`), with tests, until its **Done when**
@@ -24,7 +31,9 @@ dates and the log.
    `main`, and tick the checklist in the issue.
 4. If an item turns out to be two days of work, split it here and open a new issue under the same
    milestone before continuing, rather than letting it sprawl.
-5. When a date moves, change it in the table below and on the GitHub milestone together.
+5. When a date moves, change it in the table below and on the GitHub milestone together. The
+   2026-10-12 replan is the open exception noted above: the table moved and the six milestone
+   objects are waiting on the maintainer, so the two are out of step until then.
 
 Items marked **(needs you)** cannot be finished by code alone: they need a real provider account,
 a secret, or a decision. The code and the fake-provider tests still land; the real-tenant check is
@@ -47,7 +56,10 @@ Windows are inclusive of both end dates, which is how the heading gets 58 days f
 Nov 14. M0 and most of M1 are history and are left as they were measured. M1's window is an
 overrun and not a plan: B05 to B11 are done, and only B12 is still open in it, with Oct 12 and
 Oct 13 allocated to it. The forward plan is the 34 days from **2026-10-12 to 2026-11-14**, which
-carry the fifteen items left.
+carry the fifteen items left. Oct 12 falls in both windows, as the last of the 25 measured days and
+the first of the 34 forward ones. The heading counts it once (25 + 34 - 1 = 58), and the forward
+plan has 33 unspent days rather than 34, because Oct 12 is also one of the eight days with no
+backlog movement counted below.
 
 **The plan slipped, and on 2026-10-03 it was cut.** M1 was due Sep 29 and was not finished. At that
 point 22 items were left against the 15 days to Oct 17, and the one buffer day was already spent,
@@ -66,7 +78,8 @@ included. After it M1's window was an overrun rather than a plan, and of the res
 ran at one a day: M3 was 3 items in 2 days, M4 was 4 in 3, M5 was 3 in 2 and M6 was 2 in 1. So
 the cut did not only spend the buffer, it raised the rate the plan assumed: about a quarter more
 overall, half as much again in M3 and M5, a third more in M4, and double in M6. That raised rate
-was never met, which is why the dates moved nine days later.
+was never met, which is why the dates moved again on 2026-10-12, nine days afterwards. Nine days
+is when, not how far: v0.1.0 went from Oct 17 to Nov 14, which is 28 days later.
 
 **On 2026-10-12 the dates moved, and the scope did not.** Still the two providers the maintainer
 chose on 2026-10-03, with the same fifteen items; v0.1.0 is now targeted at **2026-11-14** instead
@@ -93,19 +106,26 @@ stalls are most of the history rather than an interruption to it. Items merged o
 those 25 (Sep 19, 20, 21, Oct 2, 3, 4), and the two gaps (Sep 22 to Oct 1, while #48 sat approved
 and #49 sat `review:needs-maintainer`, and Oct 5 to Oct 12, with no backlog movement at all)
 account for 18 of the 25 on their own. Two faster numbers are equally present in the
-same history and neither is projected here: 1.45 days per item if the current stall is excluded
-and only the days up to the last merge are counted, and three items in two days over the best
-stretch. Building on either would repeat the mistake the wait table in
+same history and neither is projected here: 1.55 days per item if the current stall is excluded and
+only the days up to the last merge are counted (Sep 18 to Oct 4 inclusive, 17 days, on the same
+Sep 18 anchor the 2.27 uses; the same recipe anchored at the first merge instead, Sep 19, is 16
+days and gives 1.45), and five items over the best two days, Sep 19 to Sep 20, four of them merging
+on Sep 19 alone. Building on either would repeat the mistake the wait table in
 [`growth/drafts/CONTRIBUTING.md`](../growth/drafts/CONTRIBUTING.md) made three times, in `6423935`,
 `10a951a` and `c0da12e`: a figure that looks measured and is not.
 
 **There is no buffer.** Fifteen items at 2.27 days is 34.1 days and the window is 34, so the next
 stall of the kind that has already happened twice moves this date again. Two further caveats
 belong next to the number. The eleven items it was measured on are the foundational ones, and the
-fifteen left include four that need the maintainer rather than code (B12, B20, B29, and #52).
-Rounding whole days onto each milestone also leaves M1 and M6 tighter than the measured rate (both
-at 2.0 days per item, against M2's 2.5 and 2.33 in M3 and M5). The total is right at 2.27 and
-absorbs it, but neither of those two milestones has slack inside it.
+fifteen left include three that need the maintainer rather than code (B12, B20 and B29), with a
+fourth maintainer decision, #52, gating B15. Rounding whole days onto each milestone also leaves
+**three of the six forward windows tighter than the measured 2.27**: M1 and M6 at 2.0 days per item
+and M4 at 2.25, against M2's 2.5 and 2.33 in M3 and M5. M4 is the one that matters most of the
+three, being the longest forward window and the one carrying the most items, 4 items in the 9 days
+from Oct 26 to Nov 3. The total does not absorb that rounding. Thirty-four days for fifteen items
+is 2.2667, which rounds to the same 2.27 but is under the measured 2.2727, so it is the shortfall
+in the first sentence of this paragraph restated rather than a cancellation of it. Neither those
+three milestones nor the plan as a whole has slack inside it.
 
 The cut list below used to start with HubSpot signed webhooks and then Teams. Both of those went
 with B18 and B17. What is left to cut, in this order, if the plan slips again, and to move to
@@ -337,15 +357,24 @@ The log records what was true on its date and is not rewritten.)
 
 | By | What | For |
 |---|---|---|
-| Oct 13 | A ClickUp workspace, an API token, and a tunnel (cloudflared or ngrok). **Was due Oct 7 and is overdue**, and B12 is the one item M1 still has open | B12 |
+| Oct 12 | A ClickUp workspace, an API token, and a tunnel (cloudflared or ngrok). **Was due Oct 7 and is overdue**, and B12 is the one item M1 still has open. The one row that cannot land before the window it feeds, explained below | B12 |
 | Oct 18 | A Slack app with a signing secret in a test workspace, in hand before M3 opens on Oct 19 | B15, B20 |
 | Oct 18 | A decision on the record `kind` set and the 512-byte scope-id bound, both of which freeze with v0.1.0 ([#52](https://github.com/gablooge/lawang/issues/52)) | by B15, backstop B29 |
 | Nov 10 | The schema `$id` confirmed or replaced, since it freezes with the release and is in code (`internal/record/record.v1.schema.json`, `record.SchemaID`). Due before M6 opens, so that it is settled when B29 runs and is not changed on release day ([ADR 4](adr/0004-record-format-v1.md)) | B29 |
 | Nov 14 | A decision to go public, and a final read of the README | B29 |
 
 These dates moved with the schedule on 2026-10-12, and the two ordering constraints behind them
-are unchanged: **#52 is settled before B15**, and the **schema `$id` before B29**. The first row
-is the one that is already late, and the Oct 12 to Oct 13 window for B12 assumes it arrives.
+are unchanged: **#52 is settled before B15**, and the **schema `$id` before B29**. Three of the five
+rows land before the window they feed, and say so: the Slack app and #52 on Oct 18 for an M3 that
+opens Oct 19, the schema `$id` on Nov 10 for an M6 that opens Nov 11. The last row is release day
+by definition, since the decision to go public is B29 and B29 is Nov 14. **The first row is the one
+real exception**, and it cannot follow the rule any more. It was due Oct 7, B12's Oct 12 to Oct 13
+window is already open as this is written, and the earliest the credential can now arrive is the
+day the window opens. That leaves B12 the single day of Oct 13 against a measured 2.27 days per
+item, on an item whose **Done when** needs a live run through a real tunnel and then review. That
+is the whole of M1's 2.0 days per item, one of the three forward windows called tighter than
+measured above. Anything later than Oct 12 overruns M1 again, and the windows in the schedule are
+contiguous, so every date after it moves with it.
 
 The Azure app registration (with a test mailbox and team) and the HubSpot developer test portal
 are not needed for v0.1.0 any more. They are needed again whenever B16, B17 or B18 is picked up,
@@ -383,4 +412,4 @@ anything worth remembering.
 | 2026-10-04 | B11, B12 | **The "recorded payloads with secrets scrubbed" criterion moved from B11 to B12**, on the maintainer's decision, after the review of #57 raised it as a question rather than waving it through. B11 is not a "(needs you)" item: it is given no workspace, no token and no tunnel, so it can neither record nor have anything to scrub, and its criterion now says what it does prove, golden tests against payloads synthesized from the published documentation. (The credentials themselves are not the question: `clickup.env` exists and the token works. B11 is simply not the item that uses it.) B12 already needs all three and is where the recording belongs, so its criterion now says the recorded payloads **replace** B11's fixtures rather than sitting beside them, and that every question in `internal/provider/clickup/testdata/README.md` is confirmed or corrected. **Worth remembering: the criterion is what the work is judged against, so moving one is the maintainer's call and never the implementer's.** The first submission of #57 ticked the box with the shortfall spelled out in four places, which was honest, and then the issue's copy of the line was edited after the pull request opened to match what had been built, which was not. Issue #11's checklist still carries that edited wording; reverting it is the maintainer's. |
 | 2026-10-04 | B11 | Round 2 of review on #57, and the lesson is about method rather than about any one guard. **A mutation sweep that asks "does a test fail when I delete this guard" measures the wrong thing.** Two answers look identical: the guard is proven, and something else refuses first. `Hydrate`'s `tenancy.Parse` guard died under that question and was reported swept, but what refused in its test was the test double: `fixedToken` began `if t == "" { return "", errors.New(...) }`, so both assertions passed on the double. `CLAUDE.md`'s "a test double must reject whatever the real system rejects" is the rule that builds those masking layers, so the package is full of them by design and the question has to be **"which layer produced this refusal"**, asked by reading the call path before anything is deleted. The sweep was redone that way: list every layer between the input and the guard (doubles, earlier guards in the same function, the decoder, the fake server), prove the input reaches the guard with no earlier layer refusing it, then mutate and check the test fails for the guard's own reason, not merely that it fails. It found four more: `Hydrate`'s `tokens.Token` error path (masked by the empty-token guard, because the only erroring double returned `("", err)`); `newAPI`'s `CheckRedirect` (no test at all); `api.comment`'s "this is the last page" break (masked by the loop bound, since nothing asserted a request count on a short page); and **`Verify`'s hex-decode arm**, which matters most: `hex.DecodeString` returns the bytes decoded before its error, so a correct digest followed by anything that is not hex decodes to exactly the right 32 bytes and, without the arm, verifies. Every valid signature would have had unboundedly many accepted spellings, and the sixteen other refusal cases could not see it because `hmac.Equal` answers all of them. Two mutants were called equivalent and said so at the line. **Round 3 found one of those two claims false**, and the row below records it: `Verify`'s digest-length test is equivalent, `epochMillis`'s `maxDigits` width arm is not. **A second documentation claim was overshooting and a green test was the counterexample:** architecture section 5 said the new index meant a delivery naming a registration id "is never parked as an ambiguous owner", but the candidate set is the union of two probes and the by-workspace probe returns exactly the rows the partial predicate leaves out, so one tenant can still present two candidates. The row now says what the index does (it bounds the by-registration probe) and a paragraph says what it does not do, with `TestARegistrationIDOnOneOfTwoRowsIsStillAmbiguous` holding the boundary. The index was also the first `subscriptions` refusal `hub.validate` cannot pre-check, so it reached callers as a driver error: `Register` now maps SQLSTATE 23505 on `subscriptions_one_registration_per_tenant` to `hub.ErrSubscriptionConflict`, a sentinel beside `ErrInvalidSubscription`, with the constraint name in one place and no tenant, resource, registration id or secret in the message. Two measured figures of this item's were wrong and are re-measured here rather than quoted: `UNIQUE (provider, external_id)` fails **14** hub tests (not nine), its partial form 10 plus one in `clickup`; and removing `record.CleanDisplay` from the normalizer fails **seven** of the harness's twelve cases (not six), so that comment now carries no count at all. **Worth remembering: a number written into an ADR is one a later reader will not re-derive, and this item got two of them wrong.** Also corrected: nothing should read as "no ClickUp account exists". One does, and the token works; B11 simply is not the item that uses it, so the documents now say no account **was used**. |
 | 2026-10-04 | B11 | Round 3 of review on #57, one blocking finding, and it is a comment this branch added rather than code. `epochMillis`'s `maxDigits` width arm was declared an equivalent mutant on the grounds that `strconv.ParseInt` "refuses the same strings with the same error". **It does not: `ParseInt` accepts leading zeros.** The arm refuses an over-long *string*; `ParseInt` refuses an over-long *value*, and zero padding is the gap between the two sets. Measured: with the arm deleted, a twenty-six digit zero-padded time parses and is accepted, where today it is refused, and nothing between the wire and the guard bounds the length (`json.Unmarshal` into a string, `historyDate.UnmarshalJSON`, `digits`), so such a time arrives straight from a webhook body or an API response. The code was right and the comment was the defect, which is the worse kind: it told a later reader, in the file, to delete a guard that is the only thing narrowing an input rule on a network-facing path. The comment now says what is true, and two cases pin the arm, one per path: `TestAHistoryDateThatCannotBeReadIsSkipped`'s "a zero-padded date of twenty-six digits" and `TestNormalizeRefuses`'s "a task with a zero-padded date_updated of twenty-six digits". With both cases removed the mutant is green again, which is what made it look equivalent. **The method lesson, which is the point of the row:** the three-step sweep of round 2 (list the layers, prove the input reaches the guard, mutate and check the test fails for the guard's own reason) is sound, and step 3 simply was not executed here. A library-behaviour argument was written in its place and the argument was wrong. **An equivalence claim is a claim like any other and needs the run, not the reasoning.** Every other such claim in this branch has now had its run, and one of them did not survive it. `Verify`'s digest-length test is equivalent (`hmac.Equal` was probed over every digest length other than 32 rather than argued from `subtle.ConstantTimeCompare`). `occurredAt`'s `y < 1000`, `commentRecord`'s `validID` and `scopeFor`'s error arm are unreachable and already declared as such at the line: the first two survive deletion of the arm with the package still green, and `scopeFor`'s was swept over the whole `validID` character class at both length bounds, 192 list ids, none of which `record.ScopeID` refuses. `Register`'s `Code == uniqueViolation` is equivalent defensive redundancy, kept. **But `delivery.externalID`'s default arm is reachable, and this row first said it was not** (and named it as `parseDelivery`'s, which has no subject switch at all). `Normalize` calls `externalID` on an `Object` it never parsed, so the zero `Object` reaches the arm, because `handled[""]` is the zero subject, and `TestNormalizeRefuses`'s "an object from somewhere else" covers it at count 1 for that subtest alone. What hid it is the masking layer this very row is about: with the arm falling through to the task form the package is still green, because `externalID != c.ExternalID` refuses one check later, `validID` on the task id would refuse the check after that, and no `Change` can carry `"clickup:task:"` in the first place because `validID` refuses an empty task id upstream. No wrong answer today, so the cost is to the reader again: the comment at the arm said it could not be reached, while a comment inside the function that calls it says the opposite and is right. Both now say what is true, and the arm names the checks that refuse what it would let through. **The rule was broken inside the sentence stating it. A reachability claim is a claim like any other, and this row was written from reading rather than from a run.** |
-| 2026-10-12 | replan | Not an item. The dates moved to **2026-11-14** and the scope did not: still the two providers chosen on 2026-10-03, still the same fifteen items left. **The cause is not the scope cut**, which did what it was asked to do. It is eight days with no backlog movement (Oct 5 to Oct 12) on top of review cycles that ran far past the three rounds `CLAUDE.md` plans for. Counting numbered rounds, nine of the ten item pull requests reached a third, four went past it (#48 four, #57 four, #53 five, #49 twelve), and counting delta reviews as well the mean is 5.2 review passes per item, so the three-round limit is the exception here and not the rule. The rate: eleven items finished over the 25 days from 2026-09-18 to 2026-10-12, which is **2.27 days per finished item end to end with review**, taken from this Log, the merge dates on GitHub and the rounds on each pull request. Fifteen left at that rate is 34.1 days, and the 34 days from Oct 12 end on Nov 14. The rate keeps the idle days in deliberately: items merged on 6 of those 25 days (Sep 19, 20, 21, Oct 2, 3, 4) and two gaps account for 18 of the 25 on their own, so the stalls are the history rather than an interruption to it. The faster readings in the same history (1.45 days per item counting only to the last merge, three items in two days over the best stretch) are recorded here and projected nowhere, because building on them is what the wait table in `growth/drafts/CONTRIBUTING.md` had to be corrected for three times in `6423935`, `10a951a` and `c0da12e`. **No buffer:** 34.1 days of work in a 34-day window, and four of the fifteen items need the maintainer rather than code. The GitHub milestone due dates are the maintainer's to apply; this file carries the new windows. |
+| 2026-10-12 | replan | Not an item. The dates moved to **2026-11-14** and the scope did not: still the two providers chosen on 2026-10-03, still the same fifteen items left. **The cause is not the scope cut**, which did what it was asked to do. It is eight days with no backlog movement (Oct 5 to Oct 12) on top of review cycles that ran far past the three rounds `CLAUDE.md` plans for. Counting numbered rounds, nine of the ten item pull requests reached a third, four went past it (#48 four, #57 four, #53 five, #49 twelve), and counting delta reviews as well the mean is 5.2 review passes per item, so the three-round limit is the exception here and not the rule. The rate: eleven items finished over the 25 days from 2026-09-18 to 2026-10-12, which is **2.27 days per finished item end to end with review**, taken from this Log, the merge dates on GitHub and the rounds on each pull request. Fifteen left at that rate is 34.1 days, and the 34 days from Oct 12 end on Nov 14. The rate keeps the idle days in deliberately: items merged on 6 of those 25 days (Sep 19, 20, 21, Oct 2, 3, 4) and two gaps account for 18 of the 25 on their own, so the stalls are the history rather than an interruption to it. The faster readings in the same history (1.55 days per item counting only the 17 days to the last merge on the same Sep 18 anchor, 1.45 if anchored at the first merge instead, and five items over the best two days, Sep 19 to Sep 20) are recorded here and projected nowhere, because building on them is what the wait table in `growth/drafts/CONTRIBUTING.md` had to be corrected for three times in `6423935`, `10a951a` and `c0da12e`. **No buffer:** 34.1 days of work in a 34-day window, three of the fifteen items need the maintainer rather than code (B12, B20 and B29) and a fourth decision (#52) gates B15, and three of the six forward windows assume a rate the project has not reached (M1 and M6 at 2.0 days per item, M4 at 2.25, against the measured 2.2727, with the 34-day total itself at 2.2667). The GitHub milestone due dates are the maintainer's to apply, and on this date all six of M1 to M6 still hold the pre-replan dates, so **"How to work this file" now says the two are out of step and that this file is the dates until they are applied**; the windows here are the new ones. |
