@@ -19,6 +19,11 @@ rewriting rows, what a KMS would mean for the shape of the `Vault` interface, an
 would take. The last one matters most to a later reader, because the honest answer today is that
 the interface cannot express it.
 
+Decision 6 was added during the review of B13 and is about what the key does **not** reach:
+[ADR 11](0011-hub-resolution.md) had assigned `subscriptions.secret` to this item, and the item
+deferred it. A deferral that is nowhere written down is indistinguishable, later, from an item
+that forgot.
+
 ## Decision
 
 ### 1. The key is one environment variable, and production has no default for it
