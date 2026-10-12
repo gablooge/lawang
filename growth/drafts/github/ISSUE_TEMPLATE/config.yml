@@ -1,0 +1,12 @@
+# A template is a help, not a gate, so a blank issue stays possible.
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/gablooge/lawang/security/advisories/new
+    about: Never open a public issue for a security problem. This opens a private advisory that only the maintainer can read. The policy is in SECURITY.md.
+  - name: What is built today
+    url: https://github.com/gablooge/lawang/blob/main/docs/backlog.md
+    about: Lawang is pre-alpha. The backlog says which parts exist and which are still planned.
+  - name: The design
+    url: https://github.com/gablooge/lawang/blob/main/docs/architecture.md
+    about: The trust model, the record format and the extension points. Most "how does it work" questions are answered here.
