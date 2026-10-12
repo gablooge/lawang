@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/gablooge/lawang/internal/hub/hubdb"
 	"github.com/gablooge/lawang/internal/ids"
@@ -30,6 +31,30 @@ const maxIDLen = 64
 // one into the wrong field must not have it echoed into a log.
 var ErrInvalidSubscription = errors.New("hub: invalid subscription")
 
+// ErrSubscriptionConflict reports a subscription that is unusable beside the ones this tenant
+// already has: a second row of one tenant and provider carrying a registration id another row
+// already carries. A delivery naming that id would select both rows, one registration has one
+// secret so both would verify, and the hub would park it as an ambiguous owner for ever
+// (migration 00006, ADR 15 decision 3).
+//
+// It stands beside ErrInvalidSubscription rather than wrapping it, because validate never saw
+// this: the row is well formed on its own and wrong only relative to the table. Together the two
+// are the whole of "the caller sent something unusable", which is what separates a registrar
+// mistake an operator must fix from a database outage worth retrying. A caller classifying the
+// two checks both.
+//
+// Like ErrInvalidSubscription, the message names no value: what collided is a tenant, a resource
+// and a registration id, on a row that also carries a secret.
+var ErrSubscriptionConflict = errors.New("hub: subscription conflict")
+
+// registrationIndex is the unique index migration 00006 adds. The name lives here, next to the
+// one query that can trip it, so that mapping the driver's error back to a sentinel is one place
+// and not a string in every caller.
+const registrationIndex = "subscriptions_one_registration_per_tenant"
+
+// uniqueViolation is SQLSTATE 23505, which is what a unique index refuses a row with.
+const uniqueViolation = "23505"
+
 // Subscriptions is the subscription table: what the accept path resolves owners in, and what a
 // Registrar's results are written to.
 //
@@ -51,6 +76,14 @@ func NewSubscriptions(db *store.DB) *Subscriptions { return &Subscriptions{db: d
 // resource that is empty or unstorable, a delivery key over what the table stores, a row with
 // neither delivery key, and an empty secret. Refusing here rather than storing is what keeps
 // "every delivery is a 401" from being a thing an operator can configure by accident.
+//
+// One refusal is the table's rather than validate's, and it is the only one that depends on what
+// this tenant has already registered: a row carrying a registration id another row of this tenant
+// and provider already carries is ErrSubscriptionConflict (migration 00006, ADR 15 decision 3).
+// It cannot be pre-checked, because the collision is with a row and not with the input. A caller
+// separating "the operator sent something unusable" from "something else went wrong" therefore
+// tests both ErrInvalidSubscription and ErrSubscriptionConflict; anything else from here is the
+// second kind.
 //
 // It does not refuse a row that carries only one of the two delivery keys, and it could not: which
 // keys a provider puts on a delivery is the provider's business, and the candidate lookup asks
@@ -103,6 +136,15 @@ func (s *Subscriptions) Register(ctx context.Context, sub provider.Subscription)
 		return nil
 	})
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation && pgErr.ConstraintName == registrationIndex {
+			// No value from the row and nothing from the driver's message: PgError.Error()
+			// leaves Detail out, but Detail is where the key values are, and a future pgx that
+			// printed it would put a registration id into every caller's log.
+			return provider.Subscription{}, fmt.Errorf(
+				"%w: another subscription of this tenant and provider already carries this registration id",
+				ErrSubscriptionConflict)
+		}
 		return provider.Subscription{}, fmt.Errorf("hub: register subscription: %w", err)
 	}
 	return stored, nil

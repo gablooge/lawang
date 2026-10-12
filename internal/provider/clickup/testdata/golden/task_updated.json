@@ -1,0 +1,35 @@
+[
+  {
+    "format": "lawang.record/v1",
+    "id": "rec_bcf9845e8d1e1357ba296d412185f6ce",
+    "op": "upsert",
+    "source": "clickup",
+    "kind": "task",
+    "external_id": "clickup:task:86a1b2",
+    "version": "1791100000000",
+    "supersedes": null,
+    "occurred_at": "2026-10-04T07:46:40Z",
+    "title": "placeholder task name, edited",
+    "text": "A placeholder description. Reach the placeholder owner at owner@example.invalid.",
+    "author": {
+      "id": "183",
+      "display": "placeholder-author"
+    },
+    "container": {
+      "kind": "list",
+      "id": "901100"
+    },
+    "visibility": {
+      "scope": "clickup:list:901100",
+      "audience": "group"
+    },
+    "origin": {
+      "automation": false,
+      "untrusted": false
+    },
+    "edges": {
+      "reply_parent": null
+    },
+    "meta": {}
+  }
+]

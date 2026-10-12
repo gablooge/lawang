@@ -1,0 +1,30 @@
+{
+  "event": "taskCommentPosted",
+  "history_items": [
+    {
+      "id": "2800803631413624919",
+      "type": 1,
+      "date": "1791100600000",
+      "field": "comment",
+      "parent_id": "86a1b2",
+      "data": {},
+      "source": null,
+      "user": {
+        "id": 184,
+        "username": "placeholder-commenter",
+        "email": "commenter@example.invalid",
+        "color": "#4caf50",
+        "initials": "PC",
+        "profilePicture": null
+      },
+      "before": null,
+      "after": null,
+      "comment": {
+        "id": "648893191",
+        "date": "1791100600000"
+      }
+    }
+  ],
+  "task_id": "86a1b2",
+  "webhook_id": "7fa3ec74-0000-4000-8000-000000000001"
+}

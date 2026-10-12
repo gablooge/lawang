@@ -106,9 +106,16 @@ provider (B11), where there is something to measure.
 ### 4. The candidate set is every row either delivery key could select, not the rows one of them does
 
 A subscription is registered with a workspace id, with the registration's own id, or with both,
-because that is what the provider gives us: a ClickUp webhook names a workspace and a Microsoft
-Graph notification names the subscription. A delivery that carries both keys can therefore belong
+because that is what the provider gives us: a Slack event names a team and a Microsoft Graph
+notification names the subscription. A delivery that carries both keys can therefore belong
 to a row that recorded only the other one.
+
+> **Corrected by [ADR 15](0015-clickup-provider.md) (B11), 2026-10-04.** This paragraph said "a
+> ClickUp webhook names a workspace". It does not: a ClickUp task webhook carries `webhook_id`,
+> `task_id` and nothing that identifies the workspace, so a ClickUp delivery names the
+> registration and never the workspace. Nothing else in this decision rested on it, because the
+> candidate lookup unions over the keys a delivery actually carries, but decision 5 below did,
+> and it is corrected there too.
 
 So each key a delivery carries runs its own equality probe, on its own index, and the candidate set
 is the union of what they return. Each probe also filters on the other key, so a key that both the
@@ -160,14 +167,35 @@ wrote, so the operator sees the two rows to compare and whether the collision is
 or across two.
 
 **The cost, which belongs to B11 (#11).** A tenant in this state receives nothing for that
-workspace, permanently, until a human removes the collision. It is not an exotic shape: ClickUp
-issues one webhook secret per workspace, so a registration design that writes one subscription row
-per list, each carrying the workspace id and that one secret, produces it on the first delivery.
-The answer is in the registration shape rather than in the hub: at most one subscription row per
-(provider, workspace) per tenant, with any finer scoping carried inside that row. Two rows of one
-tenant on one workspace with *different* secrets resolve correctly today and are not the case at
-issue. Whether the table should enforce the rule with a unique index needs the real registration
-shape, so it is B11's and B14's to settle, not this one's.
+workspace, permanently, until a human removes the collision. The answer is in the registration
+shape rather than in the hub: at most one subscription row per (provider, workspace) per tenant,
+with any finer scoping carried inside that row. Two rows of one tenant on one workspace with
+*different* secrets resolve correctly today and are not the case at issue.
+
+> **Settled, and the worked example corrected, by [ADR 15](0015-clickup-provider.md) (B11),
+> 2026-10-04.** The example here was "ClickUp issues one webhook secret per workspace, so a
+> registration design that writes one subscription row per list, each carrying the workspace id
+> and that one secret, produces [an ambiguous owner] on the first delivery". It cannot: that
+> needs a delivery carrying a workspace id, and a ClickUp delivery carries only the webhook id
+> (decision 4 above, as corrected). **The same mistake produces the opposite failure instead**,
+> and it is just as permanent and just as quiet: rows that record a workspace and no webhook id
+> are selected by nothing, and every delivery of that workspace is parked as "no owner".
+>
+> The rule this decision asks for still holds, and ADR 15 meets it: a ClickUp subscription's
+> `Resource` is the workspace id, which is what `Subscriptions.Register` upserts on, so a second
+> registration replaces the row rather than adding one.
+>
+> **The ambiguous-owner park is reachable by another route, and the open index question is now
+> closed by closing it.** Two rows of ONE tenant on TWO workspaces carrying ONE webhook id are
+> both candidates for a delivery that names it, both verify, and the hub parks: the upsert key
+> does not reach them, because they are two resources, and `subscriptions_by_external` is a
+> plain index. Migration 00006 adds
+> `UNIQUE (tenant_id, provider, external_id) WHERE external_id <> ''`, which refuses that state
+> at the table. The column is the **registration id and not the workspace**: an index on the
+> workspace column would indeed move the failure to Microsoft Graph, which legitimately needs
+> several rows of one tenant on one workspace, and those rows each carry their own Graph
+> subscription id, so this one does not touch them. It is per tenant because two tenants naming
+> one registration id is designed behaviour that this decision's own tests cover.
 
 ## Consequences
 

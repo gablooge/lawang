@@ -1,0 +1,23 @@
+{
+  "comments": [
+    {
+      "id": "648893191",
+      "comment": [{ "text": "A placeholder comment. Ring the placeholder desk on +1 555 0100." }],
+      "comment_text": "A placeholder comment. Ring the placeholder desk on +1 555 0100.",
+      "user": {
+        "id": 184,
+        "username": "placeholder-commenter",
+        "initials": "PC",
+        "email": "commenter@example.invalid",
+        "color": "#4caf50",
+        "profilePicture": null
+      },
+      "resolved": false,
+      "assignee": null,
+      "assigned_by": null,
+      "reactions": [],
+      "date": "1791100600000",
+      "reply_count": "0"
+    }
+  ]
+}

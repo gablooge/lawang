@@ -155,10 +155,19 @@ const (
 	contentChars
 )
 
-// refuses reports whether the rule forbids c. It is for the three rules that read characters:
-// contentChars refuses one byte, and checkString looks for that byte without decoding the text.
+// refuses reports whether the rule forbids c, for every one of the four rules.
+//
+// checkString does not ask it for contentChars, because a text may be a megabyte and the one
+// character that rule forbids is a byte it can find without decoding. The arm is here all the
+// same, and it is first so that the control-character arm below cannot answer for contentChars
+// by accident: CleanText asks this question per character, and a rule that answered "every
+// control character" there would strip the newlines out of every text in the program.
+// TestTheCharacterRulesAgreeWithValidation holds this function and checkString to one verdict
+// over every code point, for all four rules, so the two cannot drift.
 func (rule charRule) refuses(c rune) bool {
 	switch {
+	case rule == contentChars:
+		return c == 0
 	case c < 0x20, c >= 0x7F && c <= 0x9F, c == 0x2028, c == 0x2029:
 		return true
 	case rule == oneLineChars:
