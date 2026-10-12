@@ -17,7 +17,10 @@ import (
 //
 //   - vaultToken is the credential the vault is given. It must be in no table, in any column.
 //   - plainSecret is the webhook verification secret of a subscription, which ADR 11 puts in a
-//     plain bytea column on purpose. It is the control for the bytea half of the scan.
+//     plain bytea column on purpose. It is the control for the bytea half of the scan. ADR 11
+//     also assigned encrypting that column to this item, which this item did not do: ADR 16
+//     decision 6 is the record of the deferral, and B14 owns the column. The control and the
+//     omission are the same fact, so this is where a reader of one meets the other.
 //   - plainName is a tenant's name, a plain text column. It is the control for the text half.
 //
 // The two controls are what makes a clean result mean something: a scan that found nothing
@@ -230,7 +233,8 @@ func TestNoTokenMaterialReachesAnyTable(t *testing.T) {
 
 	// Other tables are given rows too, so the scan has somewhere to look besides the vault's own
 	// table, and so the two controls exist. The subscription's secret is a different credential
-	// and is a plain column by design (ADR 11).
+	// and is a plain column by design (ADR 11 decision 1), and still plain after this item, by
+	// the deferral ADR 16 decision 6 records.
 	e.admin("INSERT INTO lawang.tenants (id, name) VALUES ($1, $2)", tenantA.String(), plainName)
 	e.admin(`INSERT INTO lawang.subscriptions (id, tenant_id, provider, resource, workspace_id, external_id, secret)
 	         VALUES ($1, $2, $3, 'a-workspace', 'ws_1', 'sub_1', $4)`,
