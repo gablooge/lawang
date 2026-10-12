@@ -106,6 +106,22 @@ func fixtureIDs(t testing.TB) {
 	if err := json.Unmarshal(fixture(t, "api_task.json"), &task); err != nil {
 		t.Fatalf("the task fixture is not readable: %v", err)
 	}
+	// The comment id of the API answer, which is the one id hydration has to match ACROSS two
+	// fixtures: the webhook names the comment and the comments endpoint is where it is read back.
+	// Held with its own minimal struct, on comments[].id specifically, because the file carries a
+	// numeric id on a nested user object as well.
+	var comments struct {
+		Comments []struct {
+			ID string `json:"id"`
+		} `json:"comments"`
+	}
+	if err := json.Unmarshal(fixture(t, "api_comments.json"), &comments); err != nil {
+		t.Fatalf("the comments fixture is not readable: %v", err)
+	}
+	var apiComment string
+	if len(comments.Comments) > 0 {
+		apiComment = comments.Comments[0].ID
+	}
 	var comment string
 	for _, h := range webhook.History {
 		if h.Comment != nil && h.Comment.ID != "" {
@@ -117,6 +133,7 @@ func fixtureIDs(t testing.TB) {
 		{"the webhook's task id", webhook.TaskID, wantTask},
 		{"the API task's id", task.ID, wantTask},
 		{"the webhook's comment id", comment, wantComment},
+		{"the API comments' comment id", apiComment, wantComment},
 		{"the API task's list id", task.List.ID, wantList},
 	} {
 		if c.got != c.want {
@@ -177,6 +194,17 @@ func (f *fakeClickUp) seen() (int, []string) {
 // Everything it does not break goes through to the stub, so no assertion in this suite is made
 // against a lenient double (architecture principle 5). A refusal by the strict stub fails the test
 // where it happens, rather than looking like a record that did not arrive.
+//
+// Sink, though, deliberately answers for EVERY tenant, including one with no subscription and the
+// sentinel, where the real factory halts instead (architecture section 8: "No sink can be built
+// for the tenant ... halt: nothing is delivered"). That is the one place this double is looser than
+// what it stands in for, and it is looser on purpose. Clause 5 proves "never routed" by showing
+// that tenant B's and the sentinel's sinks are empty. If this factory refused those tenants, a
+// delivery that crossed into one of them would be refused by the FACTORY, and the clause would see
+// an empty sink, which is exactly what it sees when nothing crossed at all: the one failure it
+// exists to catch would be hidden behind a halt. Answering for everybody is what makes a
+// wrong-tenant delivery land somewhere an assertion can see it. The fail-closed path is B14's,
+// where the per-tenant sink configuration arrives and can be refused on its own terms.
 type sinks struct {
 	t     testing.TB
 	inner *sink.Stub
@@ -520,11 +548,18 @@ func (e *env) apiCalls() int {
 }
 
 // outboxRow is what the suite asserts about a row.
+//
+// Attempts is read for two reasons. It is the only thing that tells a row which is simply slow
+// from one the drain keeps claiming and failing, which is a defect that never reaches a final
+// state and so can never satisfy a wait; and it shows up in wait's expiry dump, where it is the
+// first thing worth knowing.
 type outboxRow struct {
 	Tenant      string
 	Provider    string
 	State       string
 	IsHead      bool
+	Attempts    int
+	Leased      bool
 	DeadReason  string
 	OrderingKey string
 }
@@ -534,13 +569,75 @@ type outboxRow struct {
 func (e *env) outboxRows() []outboxRow {
 	e.t.Helper()
 	return adminQuery(e.ctx, e.adm,
-		`SELECT tenant_id, provider, state, is_head, dead_reason, ordering_key
+		`SELECT tenant_id, provider, state, is_head, attempts, lease_token IS NOT NULL, dead_reason, ordering_key
 		   FROM lawang.outbox ORDER BY seq`,
 		func(r pgx.CollectableRow) (outboxRow, error) {
 			var o outboxRow
-			err := r.Scan(&o.Tenant, &o.Provider, &o.State, &o.IsHead, &o.DeadReason, &o.OrderingKey)
+			err := r.Scan(&o.Tenant, &o.Provider, &o.State, &o.IsHead, &o.Attempts, &o.Leased,
+				&o.DeadReason, &o.OrderingKey)
 			return o, err
 		})
+}
+
+// settled is true of a state a row will not leave again: delivered, or dead-lettered.
+//
+// It exists so that a wait can end on the WRONG outcome as well as the right one. A wait that ends
+// only on the state the test wants can be satisfied by nothing but that state, so a defect which
+// parks or dead-letters the row instead leaves the wait to run out, and the assertions written to
+// name that defect never run at all: the test fails as a bare twenty second timeout. Clause 3's
+// second wait says the same thing at the line, and this is that lesson as a predicate rather than
+// as one fix in one place.
+func settled(r outboxRow) bool {
+	return r.State == outbox.StateDelivered || r.State == outbox.StateDead
+}
+
+// retrying is a row the drain has claimed and handed back without finishing: pending again, its
+// lease gone, waiting for its next attempt.
+//
+// This is the case a final state cannot cover, and it is the one the review of #62 found. A defect
+// that makes a claim fail leaves the row to be retried for as long as the test is willing to wait,
+// so it never settles at all and a wait watching only for a final state runs out. Reading it here,
+// rather than waiting for a second attempt to appear, is also what makes such a wait end at once
+// instead of sitting through the retry backoff first. Measured against the second spelling of the
+// ledger survivor (if false && known, which lets the re-insert run and violates the ledger's
+// primary key): the clause failed as a 23.3 second timeout before this change, as a 9.3 second
+// named failure when the condition was "attempted twice", and as a 2.4 second named failure once
+// it became this.
+//
+// In a correct run of this suite no row is ever in this state. A row the drain is working on holds
+// a lease, and one it has finished with is delivered or dead. The one deliberate retry is clause
+// 3's crash, which moves the lease along itself and has its own two-sided waits.
+func retrying(r outboxRow) bool {
+	return r.State == outbox.StatePending && r.Attempts > 0 && !r.Leased
+}
+
+// done is a row that has stopped: settled, or stuck in retry, or past a first attempt it should
+// not have needed. Any of the three is an outcome a wait may end on, and the last two are wrong.
+func done(r outboxRow) bool { return settled(r) || retrying(r) || r.Attempts > 1 }
+
+// oneRowDone is the wait condition of a test that has sent one delivery and expects its one row to
+// be delivered.
+//
+// More than one row is a wrong outcome too, and ending on it is what turns a defect that stores a
+// second row into a named assertion instead of a timeout.
+func (e *env) oneRowDone() bool {
+	rows := e.outboxRows()
+	if len(rows) != 1 {
+		return len(rows) > 1
+	}
+	return done(rows[0])
+}
+
+// doneFor is true when some row of this tenant is done. It is the form the parked test needs: a
+// dead row is the normal state of the row IT parked, so "any row is dead" says nothing there, and
+// the tenant whose delivery is being waited for is what has to be watched.
+func (e *env) doneFor(tenant tenancy.ID) bool {
+	for _, r := range e.outboxRows() {
+		if r.Tenant == tenant.String() && done(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // ledgerCount is how many records have been prepared, over every tenant. A re-drain that prepared

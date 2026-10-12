@@ -1008,13 +1008,19 @@ func postRaw(ctx context.Context, t *testing.T, endpoint string, body []byte, si
 	t.Helper()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		t.Fatalf("build the forged delivery: %v", err)
+		// Never the error itself, for the reason liveAPI.do gives: a *url.Error quotes the request
+		// URL, and this URL is the only one in the run that carries the tunnel hostname. The reason
+		// for the failure is lost, which is the same trade do makes deliberately.
+		t.Fatalf("the forged delivery to %s could not be built", shownEndpoint)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(clickup.SignatureHeader, signature)
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
-		t.Fatalf("post the forged delivery: %v", err)
+		// Never the error itself: a *url.Error quotes the hostname, twice. This is the one request
+		// of the run that crosses the public internet, so a timeout or a 502 from a tunnel that has
+		// just been stopped is an ordinary outcome and not an exotic one.
+		t.Fatalf("the forged delivery to %s did not complete (is the tunnel still running?)", shownEndpoint)
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, resp.Body)

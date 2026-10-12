@@ -40,11 +40,14 @@ func TestACommentOnATaskProducesExactlyTwoRecordsAtTheSink(t *testing.T) {
 	stop := e.run()
 	defer stop()
 	// The row reaching its final state is what makes "exactly two" a complete count rather than a
-	// count taken while the delivery was still in flight.
-	e.wait("the delivery to be delivered", func() bool {
-		rows := e.outboxRows()
-		return len(rows) == 1 && rows[0].State == outbox.StateDelivered
-	})
+	// count taken while the delivery was still in flight. The wait ends on either outcome, the
+	// right one or the wrong one, so that a delivery which dead-letters is named by the assertion
+	// below rather than being left to time out with nothing said about why.
+	e.wait("the delivery to reach a final state", e.oneRowDone)
+	if rows := e.outboxRows(); len(rows) != 1 || rows[0].State != outbox.StateDelivered {
+		t.Fatalf("the outbox holds %+v, want one delivered row: nothing reached the sink, so the counts below "+
+			"would be about a delivery that failed rather than about one that landed", rows)
+	}
 
 	docs := e.docsAt(tenantA)
 	if len(docs) != 2 {
@@ -122,10 +125,13 @@ func TestResendingTheSameWebhookProducesNoNewRecords(t *testing.T) {
 	}
 	stop := e.run()
 	defer stop()
-	e.wait("the first delivery to land", func() bool {
-		rows := e.outboxRows()
-		return len(rows) == 1 && rows[0].State == outbox.StateDelivered
-	})
+	// On either outcome, so that a first delivery which dead-letters is named here instead of
+	// timing out before the cases this clause is about have been reached.
+	e.wait("the first delivery to reach a final state", e.oneRowDone)
+	if rows := e.outboxRows(); len(rows) != 1 || rows[0].State != outbox.StateDelivered {
+		t.Fatalf("the outbox holds %+v, want one delivered row: there is no first delivery for a re-send to "+
+			"be a repeat of", rows)
+	}
 	callsAfterFirst := e.apiCalls()
 	sinkCallsAfterFirst := e.sinks.deliverCalls()
 	if got := e.preparedRecordCount(); got != 2 {
@@ -156,18 +162,36 @@ func TestResendingTheSameWebhookProducesNoNewRecords(t *testing.T) {
 	if got := e.deliverSigned(respelled, secretA); got != http.StatusAccepted {
 		t.Fatalf("the respelled delivery answered %d, want %d: it is a new row by construction", got, http.StatusAccepted)
 	}
+	// On either outcome. The wrong ones are listed first and on purpose: a defect that lets the
+	// respelled delivery prepare its own records, or offer them to a sink, or that stops its row
+	// reaching a final state at all, is what the assertions below are written to name, and a wait
+	// that could only be satisfied by the right outcome would time out before they run.
 	e.wait("the respelled delivery to be drained", func() bool {
+		if e.preparedRecordCount() > 2 || e.sinks.deliverCalls() > sinkCallsAfterFirst {
+			return true
+		}
 		rows := e.outboxRows()
 		if len(rows) != 2 {
-			return false
+			return len(rows) > 2
 		}
 		for _, r := range rows {
-			if r.State != outbox.StateDelivered {
+			if !done(r) {
 				return false
 			}
 		}
 		return true
 	})
+	// Which of the two outcomes it was. A respelled delivery the ledger refuses is still a
+	// delivered row: its records are skipped, nothing is left to offer, and the row is finished
+	// with. A row that is instead retried, or dead-lettered, means the re-send was refused
+	// somewhere that is not the ledger, and saying so here is what keeps the three assertions
+	// below from being read as the ledger's answer when they are not.
+	for i, r := range e.outboxRows() {
+		if r.State != outbox.StateDelivered || r.Attempts > 1 {
+			t.Errorf("outbox row %d is %+v, want a delivered row on its first attempt: the respelled delivery "+
+				"was not refused by the ledger and drained, so the counts below are about something else", i, r)
+		}
+	}
 	// It was hydrated and normalized, so the ledger and nothing earlier is what refused its
 	// records.
 	if got := e.apiCalls(); got <= callsAfterFirst {
@@ -243,7 +267,8 @@ func TestACrashBetweenPrepareAndDeliverReDrainsIntoAlreadyDelivered(t *testing.T
 	}
 
 	if got := len(e.documents(tenantA)); got != 2 {
-		t.Errorf("the sink holds %d documents, want 2: the re-drain duplicated the delivery", got)
+		t.Errorf("the sink holds %d documents, want 2, the two the first commit stored: more means the re-drain "+
+			"duplicated the delivery, fewer means it could not deliver what was stored", got)
 	}
 	if got := e.ledgerCount(); got != 2 {
 		t.Errorf("the ledger holds %d records, want 2: the re-drain prepared the delivery a second time", got)
@@ -387,9 +412,18 @@ func TestAWebhookForAnUnknownWorkspaceIsParkedAndNeverRouted(t *testing.T) {
 	if got := e.deliverSigned(registered, secretA); got != http.StatusAccepted {
 		t.Fatalf("the registered delivery answered %d, want %d", got, http.StatusAccepted)
 	}
+	// On either outcome. The parked row is dead from the moment it was stored, so "a dead row" is
+	// the normal state of affairs here and cannot be the signal: what is watched is the row of the
+	// tenant whose delivery this is, so that a legitimate delivery the drain fails to carry is
+	// named by the assertion below instead of timing out.
 	e.wait("the drain to carry a legitimate delivery past the parked row", func() bool {
-		return len(e.documents(tenantA)) == 2
+		return len(e.documents(tenantA)) >= 2 || e.doneFor(tenantA)
 	})
+	if got := len(e.documents(tenantA)); got != 2 {
+		t.Fatalf("the legitimate delivery put %d documents at the sink, want 2: the drain did not carry it past "+
+			"the parked row, so \"the parked row was left alone\" below would be what a drain that never ran "+
+			"looks like. outbox: %+v", got, e.outboxRows())
+	}
 	if got := len(e.documents(tenancy.Sentinel)); got != 0 {
 		t.Errorf("%d documents were delivered for the sentinel tenant, want 0: a parked delivery was drained", got)
 	}
@@ -415,9 +449,16 @@ func TestAWebhookForAnUnknownWorkspaceIsParkedAndNeverRouted(t *testing.T) {
 		t.Fatalf("the same delivery answered %d once its subscription existed, want %d: it had been parked for "+
 			"some other reason than having no owner", got, http.StatusAccepted)
 	}
+	// On either outcome, for the same reason: tenant B's row reaching a final state without two
+	// documents is the control failing, and the assertion below says so.
 	e.wait("the once-unowned delivery to be delivered to its owner", func() bool {
-		return len(e.documents(tenantB)) == 2
+		return len(e.documents(tenantB)) >= 2 || e.doneFor(tenantB)
 	})
+	if got := len(e.documents(tenantB)); got != 2 {
+		t.Fatalf("the once-owned delivery put %d documents at tenant B's sink, want 2: the control cannot tell "+
+			"\"parked because nobody owns it\" from \"parked for some other reason\". outbox: %+v",
+			got, e.outboxRows())
+	}
 	if got := len(e.documents(tenantA)); got != 2 {
 		t.Errorf("tenant A holds %d documents, want the 2 of its own delivery: a delivery crossed tenants", got)
 	}
