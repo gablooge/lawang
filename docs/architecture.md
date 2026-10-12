@@ -1119,6 +1119,9 @@ internal/
   tenancy/            tenant context and RLS binding
   store/              pgx pool, preflight, transaction helpers, migrate
   testdb/             a real Postgres for integration tests, as the application role
+  acceptance/         the milestone acceptance suites: the whole pipeline in one process, over a
+                      real Postgres and a real socket. Test files and a package comment, no code,
+                      and the live halves are behind the `live` build tag
   outbox/             accept insert, FIFO-head claim, retry ladder, the records of a delivery,
                       dead letters per row and per record, halt and replay
   ingress/            the /ingress/{provider} HTTP edge: raw body, size cap, handshake

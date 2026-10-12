@@ -36,8 +36,14 @@ func serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	defer db.Close()
 
 	// Every provider this binary serves, known at compile time and never changed afterwards.
-	// There is none yet: ClickUp is B11. Until then the edge answers 404 to every segment, which
-	// is the same answer a scanner gets, and /healthz is what serve is for.
+	//
+	// There is none yet, and ClickUp (B11) is written and not registered here. Building one needs
+	// a credential per tenant, which is the vault's (B13), and serving the drain needs a sink per
+	// tenant, which is the operator API's (B14): a registry with ClickUp in it and no vault behind
+	// it would accept deliveries and fail every hydration. Until those land the edge answers 404
+	// to every segment, which is the same answer a scanner gets, and /healthz is what serve is
+	// for. The whole composition exists today in internal/acceptance, which is where M1's
+	// acceptance criteria are demonstrated end to end.
 	reg, err := provider.NewRegistry()
 	if err != nil {
 		return err
