@@ -514,7 +514,10 @@ write of any kind, and nothing at all on any other table. It cannot read a subsc
 `resource` or when it was created, it cannot see the outbox, and it cannot see the tenants table.
 The `secret` is the webhook verification secret, which is the one credential the accept path needs
 and is deliberately not a vault entry: the vault is keyed by tenant, and this is the path that does
-not know the tenant yet ([ADR 11](adr/0011-hub-resolution.md)).
+not know the tenant yet ([ADR 11](adr/0011-hub-resolution.md)). It is also still in a plain column
+after B13: ADR 11 assigned encrypting it to that item, B13 did not do it, and
+[ADR 16](adr/0016-vault-key-source.md) decision 6 says why, what the plain column costs and which
+item owns it now (B14).
 
 **A helper-role transaction is cross-tenant until it ends.** Permissive policies are ORed together,
 so once a helper role's policy applies (`TO lawang_worker USING (true)`, for example), binding a
@@ -991,7 +994,10 @@ cannot be written without naming it, and no two providers' credentials have a fi
 `provider.Credential` is declared the way `Hydrated` is. **B13 gave it contents without touching a
 signature**: a `vault.Credential` is a set of named secret fields (`token`, `client_secret`,
 `access_token`), built by `vault.NewCredential`, which refuses a field name that is not one and a
-value that is empty or only whitespace. Where it may go was settled before it had contents, and the
+value that is empty, is only whitespace, or has whitespace at either end (a token pasted out of a
+file keeps the newline, and a header value carrying one is refused by `net/http` on the first
+request, which reads as "the provider could not be reached"). Where it may go was settled before
+it had contents, and the
 type now keeps that promise itself rather than leaving it to its callers: `String`, `GoString` and
 `LogValue` print the field names and never a value, and `MarshalJSON` returns an error, so a
 credential cannot be serialized into an HTTP body, a record or a JSON log line by accident. The one
@@ -1015,6 +1021,13 @@ uses one:
   registration's client secret, which lives in configuration, and what the vault hands out is an
   access token cached per tenant **and** provider. Its consumers (B16, B17) are deferred, so it has
   no v0.1.0 consumer; whether it ships is the maintainer's call (`docs/backlog.md`, the cut list).
+
+**One credential is deliberately outside all three.** The webhook verification secret stays in a
+plain `subscriptions.secret` column: the accept path needs it before it knows the tenant, and
+every `Vault` method takes one, so serving it is a second seam beside the vault rather than a
+caller of it. ADR 11 assigned the encryption to B13, B13 left the column as it is, and
+[ADR 16](adr/0016-vault-key-source.md) decision 6 records the deferral, what the plain column
+costs and which item owns it now (B14).
 
 Nothing in `cmd/lawang` builds a vault yet. `lawang connect` and the operator API (B14) are the
 items that do, which is also where the per-tenant sink configuration arrives, so the provider

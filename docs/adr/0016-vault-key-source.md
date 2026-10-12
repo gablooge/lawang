@@ -133,6 +133,67 @@ Writing half of it now (a previous-key list with nothing to re-seal with, or a r
 no second key) would leave a deployment that can start with the wrong key and read nothing, which
 is what the refusal above already does, with more code.
 
+### 6. The vault's key does not reach `subscriptions.secret`, and B14 owns that column now
+
+[ADR 11](0011-hub-resolution.md) decision 1 put the webhook verification secret in a plain `bytea`
+column of `subscriptions`, because the accept path has to verify a delivery before it knows whose
+delivery it is and `Vault.Fetch(ctx, tenant, provider)` is keyed by the tenant it does not have
+yet. That decision named this item as the one that pays the cost: "when the vault lands (B13),
+encrypting this column with the vault's key is a change to the two candidate queries and to
+`hub.candidates`". The maintainer's first comment on issue #13 then listed every reader and writer
+of the column and the two constraints such an interface has, "so that this item does not have to
+rediscover it".
+
+**B13 does not encrypt that column. This is the record of the choice, so that a later reader meets
+it instead of a ticked box.** Three reasons, in the order they carry weight:
+
+1. **It is not what this vault holds.** ADR 11's own first bullet is the argument: the
+   verification secret proves a delivery came from the provider. It authenticates nothing to the
+   provider, it reads nothing and it posts nothing. What the vault holds is the other kind, the
+   API tokens hydration (B11) and registration (B14) bear, and the two have different blast
+   radii. The scan test of this item uses `subscriptions.secret` as the known-positive control for
+   the bytea half of its search precisely because it is a plain column on purpose: the control and
+   the omission are the same fact, which is why saying it out loud here matters.
+2. **The seam it needs is not the one this item built.** Every method of `Vault` takes a tenant,
+   and the whole reason this column exists is a path that has none yet, so the decryption is a
+   second seam beside the vault rather than a caller of it. The three backends make that concrete:
+   `nango` and `azureapp` have no way to seal a value of Lawang's own, so only `local`'s `sealer`
+   could serve it, and a deployment that keeps provider credentials in Nango would then still need
+   `LAWANG_VAULT_KEY` for this one column. That is a statement about what a backend selector means
+   (decision 2 above), and it belongs to the item that adds one.
+3. **It runs on the accept path.** Issue #13 writes the budget down: once per delivery, inside the
+   resolver transaction, which targets 200 ms and must not be held across network I/O, over up to
+   `hub.DefaultMaxCandidates` (32) candidate rows. Designing that is work with a decision in it,
+   not a change of call site, and doing it badly is worse than not doing it: the column's
+   `subscriptions_secret_is_not_empty` CHECK and `hub.newCandidate`'s refusal of an empty secret
+   both still have to hold, and a half-done version parks every delivery as an unowned one.
+
+**What the plain column costs, in the open.** A database backup carries the verification secrets,
+and an operator or a role with `SELECT` on that table can read them. What reading one buys is
+forged deliveries for that subscription: the forgery resolves to a real owner and its bytes enter
+that tenant's outbox, to be normalized and delivered as if the provider had sent them. It does not
+read anything from a provider, it does not reach another tenant's rows, and `lawang_resolver`
+cannot write. The grant is already the narrowest that works (ADR 11 decision 1), and it is still
+the only grant on the column.
+
+**Who owns it now: B14.** It is the item that first constructs a vault inside the binary, it owns
+the column's only writer (`UpsertSubscription`, through `hub.Subscriptions.Register` and the
+ClickUp registrar it adds), and a backend selector, if one is wanted, arrives there too, which is
+the open question in reason 2. If B14 declines it, the work is an item of its own, before the
+hardening milestone rather than inside it, and which it is belongs to whoever holds the queue, not
+to this record.
+
+**And B13's box stays ticked, on purpose.** The item's own three "Done when" clauses are the ones
+in `docs/backlog.md` and on issue #13, and all three are met and evidenced. M2's "Done when" also
+says "no table contains token material", which is the milestone's gate and not this item's: M2 is
+not done while B14 is open, and whoever closes M2 reads this decision first. On the wording
+itself, `subscriptions.secret` is not token material in the sense that clause is about, by the
+same bullet that reason 1 rests on, and the alternative reading would have made the clause
+unsatisfiable the day B07 added the column rather than something B13 could deliver. The honest
+summary is one sentence: the vault keeps every credential that authenticates Lawang to somebody
+else, and one credential that only ever authenticates somebody else to Lawang is still in a plain
+column, by a decision that is now written down.
+
 ## Why not the other options
 
 - **A KMS now.** It puts a cloud dependency in the local setup, which is exactly what decision 7
@@ -162,3 +223,7 @@ is what the refusal above already does, with more code.
 - `ErrWrongKey`, `ErrNotSealed` and `ErrDecrypt` are three different answers on purpose: restore
   the key, look at what wrote that row, and the row is gone. An operator surface (B25) should keep
   them apart.
+- **One credential is outside the vault and stays there for now**: `subscriptions.secret`, which
+  ADR 11 decision 1 assigned to this item and decision 6 above defers to B14, with the cost of the
+  plain column stated rather than left in a sentence of ADR 11's that this item did not act on.
+  Anyone closing M2 against "no table contains token material" reads decision 6 first.

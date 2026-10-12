@@ -29,7 +29,8 @@ const MasterKeyLen = 32
 // credentials in the clear is not one (ADR 16).
 var ErrNoMasterKey = errors.New("vault: the local vault needs a master key")
 
-// LocalOptions configure a [Local]. Both members are required.
+// LocalOptions configure a [Local]. Its one member is required: the database is NewLocal's own
+// parameter, because a vault with no store is not a vault and an option can be left out.
 type LocalOptions struct {
 	// Key is the master key: exactly MasterKeyLen bytes, from the environment
 	// (config.Config.VaultKey, LAWANG_VAULT_KEY). NewLocal reads it and does not keep it: what a

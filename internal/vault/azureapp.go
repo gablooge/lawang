@@ -40,6 +40,24 @@ const maxAzureResponse = 256 << 10
 // cache gives it up well before the issuer does.
 const azureExpiryLeeway = 5 * time.Minute
 
+// maxAzureTokenLifetime bounds what the authority is allowed to say a token is good for. Entra
+// issues client-credentials tokens with an hour on them, so a day is generous and still a bound.
+//
+// Without a ceiling the authority chooses how long this process keeps a secret in memory, because
+// the leeway only ever subtracts five minutes from whatever the answer said: an expires_in of a
+// year would be a token handed out for a year, long after it had been revoked. The arithmetic is
+// the other half. time.Duration counts nanoseconds in an int64, so expires_in * time.Second wraps
+// above 9223372036 seconds (about 292 years), and the wrap is modulo 2^64, so the product can land
+// negative (math.MaxInt64 gives -1s) or positive again: neither the sign nor the size of what
+// would be cached follows from what was answered. Everything else this vault reads from a remote
+// system is bounded (the response size, the token type, the connection it is about), and this was
+// the one number that was not.
+const maxAzureTokenLifetime = 24 * time.Hour
+
+// maxAzureLifetimeSeconds is maxAzureTokenLifetime in the unit expires_in is written in, so the
+// comparison is against the same constant the documentation and the tests name.
+const maxAzureLifetimeSeconds = int64(maxAzureTokenLifetime / time.Second)
+
 // AzureRegistration is one tenant's app registration for one provider: the client credentials
 // Lawang authenticates to Microsoft Graph with on that tenant's behalf.
 //
@@ -394,10 +412,17 @@ func (a *AzureApp) issue(ctx context.Context, app AzureRegistration) (string, ti
 		// remote system's word.
 		return "", 0, fmt.Errorf("%w: it issued a token of type %q", ErrUnavailable, truncate(doc.TokenType, 32))
 	}
-	if doc.ExpiresIn <= 0 {
+	switch {
+	case doc.ExpiresIn <= 0:
 		// A lifetime of zero or less is an answer this vault cannot act on: it would cache
 		// nothing and could not say how long the token is good for.
 		return "", 0, fmt.Errorf("%w: it issued a token with no lifetime", ErrUnavailable)
+	case doc.ExpiresIn > maxAzureLifetimeSeconds:
+		// And bounded above, for the reasons on maxAzureTokenLifetime. The number is the
+		// authority's own and is not secret, so the message carries it: an operator who meets this
+		// is looking at an authority that is not the one they think it is.
+		return "", 0, fmt.Errorf("%w: it issued a token good for %d seconds, and this vault keeps one for at most %d",
+			ErrUnavailable, doc.ExpiresIn, maxAzureLifetimeSeconds)
 	}
 	return doc.AccessToken, time.Duration(doc.ExpiresIn) * time.Second, nil
 }

@@ -239,6 +239,11 @@ func TestNangoRefusesAnAnswerThatIsNotAUsableCredential(t *testing.T) {
 		"no access token at all":          `{"type":"OAUTH2"}`,
 		"a basic half":                    `{"type":"BASIC","username":"a-user"}`,
 		"an empty api key":                `{"type":"API_KEY","apiKey":""}`,
+		// A token with a newline on the end is a value a system in the middle really does hand
+		// over: Nango holds what an operator pasted into it. It is refused here rather than
+		// handed to a provider's client, where net/http would refuse it as a header value and
+		// the failure would read as a provider that could not be reached.
+		"an access token with a newline on the end": `{"type":"OAUTH2","access_token":"` + marker + `\n"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

@@ -34,6 +34,94 @@ type column struct {
 	table, name, dataType string
 }
 
+// searchMode is how a column's value is compared with the needle.
+type searchMode int
+
+const (
+	// asBytes compares the needle with the column's bytes.
+	asBytes searchMode = iota + 1
+	// asText compares the needle with the column's text rendering.
+	asText
+)
+
+// searchModes is every data_type the schema has and the way the scan can search it. A data_type
+// that is not in this map fails the scan instead of taking a branch.
+//
+// The dispatch used to be "bytea as bytes, everything else cast to text", which is right for
+// every type the schema has today and silently wrong for the first one it does not have. A
+// bytea[] column reports data_type = 'ARRAY' (udt_name '_bytea'), so it would take the text
+// branch, render as {"\\x6c61..."} and never match an ASCII needle: the scan would be clean for
+// every value such a column could ever hold. That is exactly the broken pattern the plainSecret
+// control exists to catch, reintroduced for a type neither control exercises.
+// TestTheScanRefusesAColumnTypeItCannotSearch builds that column and shows both halves of it.
+// jsonb is the same hazard by another route, because a value's text rendering escapes a quote and
+// a backslash.
+//
+// So the set is closed and a migration that adds a type makes the scan name the column it does
+// not know how to read, the way internal/store's TestEveryPolicySaysWhatTheDesignSaysItSays makes
+// a new policy announce itself. Adding a type here is one line, taken on purpose, and it needs a
+// control that proves the chosen way really matches a value of that type.
+var searchModes = map[string]searchMode{
+	"bytea": asBytes,
+	// Everything below renders its whole value in its text cast, unescaped and untruncated, so a
+	// needle that is in the value is in the rendering. The tenant_id domain is not listed because
+	// information_schema reports a domain's base type here, which is text.
+	"text":                        asText,
+	"integer":                     asText,
+	"bigint":                      asText,
+	"boolean":                     asText,
+	"timestamp with time zone":    asText,
+	"timestamp without time zone": asText, // goose_db_version.tstamp
+}
+
+// searchQuery is the statement that looks for the needle in one column, or a refusal naming the
+// column whose type this scan does not know how to search.
+//
+// It is a function of its own, and not a branch inside the loop, so that a test can hold a real
+// catalogue row against it without the scan's own t.Fatalf ending the test first.
+func searchQuery(c column) (string, error) {
+	table, name := pgx.Identifier{c.table}.Sanitize(), pgx.Identifier{c.name}.Sanitize()
+	switch searchModes[c.dataType] {
+	case asBytes:
+		return fmt.Sprintf("SELECT count(*)::int FROM lawang.%s WHERE position($1::bytea in %s) > 0", table, name), nil
+	case asText:
+		return fmt.Sprintf("SELECT count(*)::int FROM lawang.%s WHERE position($1 in %s::text) > 0", table, name), nil
+	default:
+		// A column the scan cannot search is one it would report clean whatever it holds, which is
+		// worse than not scanning it at all: the clean answer is what this file's whole evidence
+		// chain rests on. So the type is named, and so is what to do about it.
+		return "", fmt.Errorf(
+			"lawang.%s.%s is of type %q, which this scan does not know how to search: add it to searchModes, with a control that proves the way chosen really matches a value of that type",
+			c.table, c.name, c.dataType)
+	}
+}
+
+// schemasWithBaseTables returns every schema that holds a base table, outside the two catalogue
+// schemas.
+//
+// The column walk below is scoped to the lawang schema, so a table created outside it would not be
+// scanned at all and "every table" would quietly mean "every table of one schema". Asserting the
+// scope rather than widening it is deliberate: lawang.tenant_id, the grants and the policies all
+// name that schema, so a base table somewhere else is a thing to find out about rather than a thing
+// to scan.
+func (e *env) schemasWithBaseTables(conn *pgx.Conn) []string {
+	e.t.Helper()
+	rows, err := conn.Query(e.ctx, `
+		SELECT DISTINCT table_schema
+		  FROM information_schema.tables
+		 WHERE table_type = 'BASE TABLE'
+		   AND table_schema NOT IN ('pg_catalog', 'information_schema')
+		 ORDER BY table_schema`)
+	if err != nil {
+		e.t.Fatalf("read the catalogue: %v", err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		e.t.Fatalf("read the catalogue: %v", err)
+	}
+	return got
+}
+
 // columns lists every column of every base table in the schema, read from the catalogue rather
 // than from a list in this file: a table a later migration adds is scanned without anybody
 // remembering to add it here, which is what "every table" in item B13 asks for.
@@ -78,6 +166,9 @@ func (e *env) scan(needle string) (findings, map[string]int) {
 	}
 	defer func() { _ = conn.Close(e.ctx) }()
 
+	if got := e.schemasWithBaseTables(conn); !slices.Equal(got, []string{"lawang"}) {
+		e.t.Fatalf("the database has base tables in %v, and this scan only walks lawang: a table outside it is not scanned at all", got)
+	}
 	cols := e.columns(conn)
 	// A loop that ran fewer times than it should is the other way a scan reads as clean. Seven
 	// tables of three to nine columns each is what the migrations define today, so twenty is a
@@ -100,13 +191,12 @@ func (e *env) scan(needle string) (findings, map[string]int) {
 		// ("\x6c61..."), in which an ASCII needle never appears, so the bytea half of the scan
 		// would be clean for every value it could ever hold: that is the broken pattern this
 		// test's plainSecret control exists to catch.
-		var query string
-		if c.dataType == "bytea" {
-			query = fmt.Sprintf("SELECT count(*)::int FROM lawang.%s WHERE position($1::bytea in %s) > 0",
-				pgx.Identifier{c.table}.Sanitize(), pgx.Identifier{c.name}.Sanitize())
-		} else {
-			query = fmt.Sprintf("SELECT count(*)::int FROM lawang.%s WHERE position($1 in %s::text) > 0",
-				pgx.Identifier{c.table}.Sanitize(), pgx.Identifier{c.name}.Sanitize())
+		//
+		// A type this scan has never met is a failure and not a guess, for the same reason: see
+		// searchModes.
+		query, err := searchQuery(c)
+		if err != nil {
+			e.t.Fatalf("%v", err)
 		}
 		var hits int
 		if err := conn.QueryRow(e.ctx, query, needle).Scan(&hits); err != nil {
@@ -222,6 +312,108 @@ func tableNames(m map[string]int) func(func(string) bool) {
 			if !yield(k) {
 				return
 			}
+		}
+	}
+}
+
+// TestTheScanRefusesAColumnTypeItCannotSearch is the control for the scan's type dispatch, which
+// the controls above do not reach: they prove the two branches work, not that a column always
+// takes one that works.
+//
+// It builds the column a later migration plausibly adds, a bytea[], and shows both halves of the
+// problem on a real catalogue row and a real value:
+//
+//  1. the harm. The needle really is in the column, the bytes find it, and the text rendering
+//     this scan would have fallen back to does not, because an array of bytea renders as hex.
+//     So the old "everything that is not bytea, cast to text" branch would have reported that
+//     column clean for every value it could ever hold.
+//  2. the guard. searchQuery refuses the column by name instead of choosing that branch, and the
+//     columns around it are still searchable, so the refusal is about the type and not about
+//     everything.
+func TestTheScanRefusesAColumnTypeItCannotSearch(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	e.admin(`CREATE TABLE lawang.zz_future (id text PRIMARY KEY, secrets bytea[] NOT NULL)`)
+	e.admin(`INSERT INTO lawang.zz_future (id, secrets) VALUES ('one', ARRAY[$1::bytea])`, []byte(plainSecret))
+
+	// 1. The harm, measured rather than argued.
+	if got := queryAdmin[int](e,
+		`SELECT count(*)::int FROM lawang.zz_future WHERE position($1::bytea in secrets[1]) > 0`,
+		plainSecret); got != 1 {
+		t.Fatalf("the needle is not in the column (%d rows), so this test is not what it says", got)
+	}
+	if got := queryAdmin[int](e,
+		`SELECT count(*)::int FROM lawang.zz_future WHERE position($1 in secrets::text) > 0`,
+		plainSecret); got != 0 {
+		t.Fatalf("the text rendering of a bytea[] matched the needle (%d rows), so the fallback branch was not the hazard this guard is for", got)
+	}
+
+	// 2. The guard, over the catalogue as the scan itself reads it.
+	conn, err := pgx.Connect(e.ctx, e.tdb.AdminURL)
+	if err != nil {
+		t.Fatalf("connect as the superuser: %v", err)
+	}
+	defer func() { _ = conn.Close(e.ctx) }()
+	var refused, searchable int
+	for _, c := range e.columns(conn) {
+		if c.table != "zz_future" {
+			if _, err := searchQuery(c); err != nil {
+				t.Errorf("%s.%s: %v", c.table, c.name, err)
+			}
+			searchable++
+			continue
+		}
+		if c.name != "secrets" {
+			continue
+		}
+		if c.dataType != "ARRAY" {
+			t.Fatalf("the catalogue calls a bytea[] column %q, so this test no longer drives the case it was written for", c.dataType)
+		}
+		q, err := searchQuery(c)
+		if err == nil {
+			t.Fatalf("the scan would have searched a bytea[] with %q, which can never match an ASCII needle", q)
+		}
+		for _, want := range []string{"zz_future", "secrets", "ARRAY"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not name %q, so it does not say which column to go and look at: %v", want, err)
+			}
+		}
+		refused++
+	}
+	if refused != 1 {
+		t.Errorf("the walk refused %d columns, want the one it cannot search", refused)
+	}
+	if searchable < 20 {
+		t.Errorf("only %d columns were found searchable, so the refusal above may be the walk refusing everything", searchable)
+	}
+}
+
+// TestTheScanWouldSeeABaseTableOutsideTheSchemaItWalks is the control for the other half of
+// "every table": the column walk is scoped to the lawang schema, so a base table created outside
+// it is not scanned at all, and nothing in the scan would have said so.
+func TestTheScanWouldSeeABaseTableOutsideTheSchemaItWalks(t *testing.T) {
+	t.Parallel()
+	e := setup(t)
+	conn, err := pgx.Connect(e.ctx, e.tdb.AdminURL)
+	if err != nil {
+		t.Fatalf("connect as the superuser: %v", err)
+	}
+	defer func() { _ = conn.Close(e.ctx) }()
+
+	// The control first: as migrated, lawang is the only schema with base tables, which is what
+	// the scan asserts before it walks anything.
+	if got := e.schemasWithBaseTables(conn); !slices.Equal(got, []string{"lawang"}) {
+		t.Fatalf("a migrated database has base tables in %v, want only lawang", got)
+	}
+	e.admin(`CREATE SCHEMA zz_elsewhere`)
+	e.admin(`CREATE TABLE zz_elsewhere.tokens (id text PRIMARY KEY, secret bytea NOT NULL)`)
+	if got := e.schemasWithBaseTables(conn); !slices.Equal(got, []string{"lawang", "zz_elsewhere"}) {
+		t.Fatalf("the schemas with base tables are %v, want the new one among them: the scan's scope assertion would not fire", got)
+	}
+	// And the walk really does miss it, which is why the assertion is worth making.
+	for _, c := range e.columns(conn) {
+		if c.table == "tokens" {
+			t.Fatal("the column walk reached a table outside the lawang schema, so the assertion above guards nothing")
 		}
 	}
 }

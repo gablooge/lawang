@@ -46,6 +46,18 @@ return it, so `Subscriptions.Register` hands back the secret its own caller pass
 read out of the table. The interface the encryption would need is different from `Vault.Fetch`,
 since it must work before the tenant is known.
 
+> **Revised by [ADR 16](0016-vault-key-source.md) (B13), 2026-10-12.** The sentence above assigned
+> encrypting this column to B13 by name. **B13 built the vault and did not encrypt it: the column
+> is still plain, and the cost named above is still being paid.** The reasons are ADR 16 decision
+> 6, and the first of them is this decision's own first bullet, that the verification secret is a
+> different credential from the ones the vault holds. The other two are that every method of
+> `Vault` takes a tenant, so this is a second seam beside the vault rather than a caller of it and
+> only `local` could serve it, and that it runs inside the resolver transaction on a 200 ms path.
+> **B14 owns the column now**, being where a vault is first constructed, where the column's only
+> writer lives, and where a backend selector would arrive. ADR 16 decision 6 also writes out what
+> the plain column buys somebody who reads it, which this paragraph left as "an operator ... can
+> read it".
+
 ### 2. A delivery nobody can be shown to own is parked under a sentinel tenant, `_parked`
 
 `tenancy.Sentinel` is `_parked`, a tenant id that no tenant may have: the `tenants` table refuses
@@ -210,3 +222,6 @@ with any finer scoping carried inside that row. Two rows of one tenant on one wo
 - An operator who rotates a signing secret re-registers the subscription, which updates the row in
   place (architecture section 5) and takes effect on the next delivery.
 - B13 has a second thing to encrypt, and B25 has a column to sweep on.
+  (**Revised 2026-10-12**: B13 did not encrypt it. The second thing to encrypt is B14's, and
+  [ADR 16](0016-vault-key-source.md) decision 6 is the record of why and of what the plain column
+  costs in the meantime. B25's column is unaffected.)

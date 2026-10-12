@@ -56,6 +56,15 @@ func TestNewCredentialRefusesWhatCouldNotBeACredential(t *testing.T) {
 		"a value with a NUL":           {"token": "abc\x00def"},
 		"a value of one space":         {"token": " "},
 		"a value of whitespace":        {"token": " \n\t "},
+		// Whitespace around a real value. A token read out of a file keeps the newline, a token
+		// copied out of a console keeps the spaces, and either one is refused by net/http as a
+		// header value on the first request, which reaches an operator as "the provider could not
+		// be reached". The value is long enough for the echo check below to mean something.
+		"a value with a trailing newline":         {"token": marker + "\n"},
+		"a value with a trailing CRLF":            {"token": marker + "\r\n"},
+		"a value with a leading space":            {"token": " " + marker},
+		"a value with a trailing space":           {"token": marker + " "},
+		"a PEM key, which no v0.1 field can hold": {"private_key": "-----BEGIN-----\nabc\n-----END-----\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -87,13 +96,15 @@ func TestNewCredentialRefusesWhatCouldNotBeACredential(t *testing.T) {
 func TestNewCredentialAcceptsWhatACredentialHolds(t *testing.T) {
 	t.Parallel()
 	for name, fields := range map[string]map[string]string{
-		"one token":                         {"token": marker},
-		"client credentials":                {"client_id": "an-id", "client_secret": marker},
-		"a name with digits":                {"token2": marker},
-		"a value with newlines (a PEM key)": {"private_key": "-----BEGIN-----\nabc\n-----END-----\n"},
-		"a value in another script":         {"token": "鍵" + marker},
-		"the longest value":                 {"token": strings.Repeat("x", vault.MaxValueLen)},
-		"the longest name":                  {strings.Repeat("a", vault.MaxFieldNameLen): marker},
+		"one token":          {"token": marker},
+		"client credentials": {"client_id": "an-id", "client_secret": marker},
+		"a name with digits": {"token2": marker},
+		// The rule is about the ends of a value and not about what is inside it: a value whose
+		// own bytes include a newline is still a value, and nothing here reformats one.
+		"a value with newlines inside it": {"private_key": "-----BEGIN-----\nabc\n-----END-----"},
+		"a value in another script":       {"token": "鍵" + marker},
+		"the longest value":               {"token": strings.Repeat("x", vault.MaxValueLen)},
+		"the longest name":                {strings.Repeat("a", vault.MaxFieldNameLen): marker},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

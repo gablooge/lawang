@@ -47,4 +47,7 @@ const (
 	MaxNangoResponse   = maxNangoResponse
 	SealedConstraint   = sealedConstraint
 	AzureExpiryLeeway  = azureExpiryLeeway
+	// MaxAzureTokenLifetime is the ceiling on what the authority may say expires_in is, so the
+	// test that drives the boundary names the constant and not a number of its own.
+	MaxAzureTokenLifetime = maxAzureTokenLifetime
 )

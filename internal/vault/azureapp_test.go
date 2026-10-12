@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -382,6 +383,23 @@ func TestAzureAppRefusesAnAnswerThatIsNotAUsableToken(t *testing.T) {
 		"a token of another type": func(f *fakeAuthority) { f.tokenType = "mac" },
 		"no lifetime":             func(f *fakeAuthority) { f.lifetime = -1 },
 		"an empty access token":   func(f *fakeAuthority) { f.token = " " },
+		// A token with a newline on the end: NewCredential refuses it rather than letting it
+		// reach a request, where net/http would refuse the header value instead and the failure
+		// would read as a system that could not be reached.
+		"an access token with a newline on the end": func(f *fakeAuthority) { f.token = marker + "\n" },
+		// Bounded above as well as below. Without a ceiling the authority decides how long this
+		// process keeps a token, because the leeway only subtracts five minutes from whatever it
+		// said, and the arithmetic wraps as well: see maxAzureTokenLifetime.
+		"a lifetime past the ceiling": func(f *fakeAuthority) {
+			f.lifetime = int64(vault.MaxAzureTokenLifetime/time.Second) + 1
+		},
+		"a lifetime that wraps a Duration": func(f *fakeAuthority) { f.lifetime = math.MaxInt64 },
+		"a lifetime that wraps back to a positive one": func(f *fakeAuthority) {
+			// The product wraps modulo 2^64, so a refusal of a negative Duration is not a bound:
+			// two wraps past where it stops fitting, plus a billion seconds, is 19446744074
+			// seconds, which becomes a positive 277777h46m40s (about 31 years).
+			f.lifetime = 2*(math.MaxInt64/int64(time.Second)+1) + 1_000_000_000
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -407,6 +425,29 @@ func TestAzureAppRefusesAnAnswerThatIsNotAUsableToken(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAzureAppAcceptsALifetimeOfExactlyTheCeiling is the control beside the refusals above: the
+// bound is a bound, and not an off-by-one that refuses the number it names. Without this, a
+// ceiling written as ">=" would pass every refusal case in the table and quietly refuse the
+// longest lifetime this vault says it keeps.
+func TestAzureAppAcceptsALifetimeOfExactlyTheCeiling(t *testing.T) {
+	t.Parallel()
+	f := newFakeAuthority(t)
+	f.lifetime = int64(vault.MaxAzureTokenLifetime / time.Second)
+	v := f.serving(t, nil)
+
+	cred, err := v.Fetch(context.Background(), tenantA, graphProvider)
+	if err != nil {
+		t.Fatalf("a token good for exactly the ceiling (%v) was refused: %v", vault.MaxAzureTokenLifetime, err)
+	}
+	token, err := cred.Field("access_token")
+	if err != nil {
+		t.Fatalf("Field: %v", err)
+	}
+	if !strings.HasPrefix(token, marker) {
+		t.Errorf("the credential does not carry the issued token")
 	}
 }
 

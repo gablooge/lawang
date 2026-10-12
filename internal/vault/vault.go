@@ -140,7 +140,8 @@ type Credential struct {
 //
 // An empty value is refused rather than stored. A stored empty value comes back out as a token
 // that authenticates nothing, which is a request to a provider that is answered 401 and a retry
-// ladder spent on a credential that was never there.
+// ladder spent on a credential that was never there. So is a value with whitespace at either end,
+// which is the same mistake one character short of showing itself: see [validValue].
 func NewCredential(fields map[string]string) (Credential, error) {
 	if len(fields) == 0 {
 		return Credential{}, fmt.Errorf("%w: a credential needs at least one field", ErrInvalidCredential)
@@ -193,9 +194,28 @@ func validValue(value string) error {
 		// ladder spent on a credential that was never there. They are one case and not two
 		// because TrimSpace covers the empty string as well, and a separate case for it was a
 		// branch no input could reach on its own (the mutation run of item B13 found it
-		// surviving). Only an ALL-whitespace value is refused: a PEM-encoded key ends in a
-		// newline.
+		// surviving).
 		return errors.New("the value is empty or only whitespace, and such a credential authenticates nothing")
+	case value != strings.TrimSpace(value):
+		// Whitespace around a real value, refused for the reason config.ParseMasterKey gives for
+		// refusing it in the key: a value read out of a file keeps the newline at the end of it,
+		// and a value copied out of a console keeps the spaces around it. Such a token is not the
+		// token, and it fails late and in the wrong words. net/http refuses an invalid header
+		// value, so a token with a newline on it comes back from a provider's client as a
+		// transport failure, which this package's own vocabulary would render as ErrUnavailable,
+		// "could not be reached": an operator sent to look at the network for a credential they
+		// pasted with a newline on it. The round trip through the vault makes it worse, because
+		// the value is sealed by then and nobody can look at it.
+		//
+		// No v0.1 field needs the whitespace kept. The documented names are token, client_secret
+		// and access_token, nango produces access_token, api_key, username and password, and the
+		// one certificate-shaped credential (an app registration's client secret) is
+		// configuration and never a Credential. A field whose value really does end in a newline,
+		// a PEM-encoded key being the obvious one, is a field this rule has to be revisited for,
+		// and the item that adds one is where that is decided: this earlier read "only an
+		// ALL-whitespace value is refused: a PEM-encoded key ends in a newline", which exempted a
+		// byte every real credential refuses for a field no credential can hold.
+		return errors.New("the value has whitespace at the start or the end (a value read from a file keeps the newline at the end of it)")
 	case len(value) > maxValueLen:
 		return fmt.Errorf("the value is longer than %d bytes", maxValueLen)
 	case !utf8.ValidString(value):
