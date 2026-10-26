@@ -252,3 +252,11 @@ history, so when you find one, say that the fix is the orchestrator's (see `CLAU
 Your final message is read by the orchestrating session, not by a person. Give it: the verdict, the
 count of findings by severity, a one-line summary of each blocking finding, and the mutations you
 ran with their results.
+
+## Gatherlane status
+At the start, run:
+`python3 ~/gatherlane/tools/gatherlane.py report --agent lawang/pr-reviewer --status running --last-run-at now --task "#NN <issue title>" --task-url <issue url>`
+At the end, run one of:
+`... report --agent lawang/pr-reviewer --status idle --last-result success --task "" --pr <pr url>`
+`... report --agent lawang/pr-reviewer --status blocked --reason "<one line>"`
+`... report --agent lawang/pr-reviewer --status waiting --needs-human-kind review --reason "<one line>" --pr <pr url>`

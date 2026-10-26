@@ -148,3 +148,11 @@ Your final message is read by the orchestrating session, not by a person. Give i
 number, the commit hashes, the CI result, what differs from the design, and anything left undone.
 In Mode 2, list every finding as **fixed** or **disputed** (with the reason): the orchestrator
 stops the cycle when the same point is disputed twice, and it can only see that from this list.
+
+## Gatherlane status
+At the start, run:
+`python3 ~/gatherlane/tools/gatherlane.py report --agent lawang/implementer --status running --last-run-at now --task "#NN <issue title>" --task-url <issue url>`
+At the end, run one of:
+`... report --agent lawang/implementer --status idle --last-result success --task "" --pr <pr url>`
+`... report --agent lawang/implementer --status blocked --reason "<one line>"`
+`... report --agent lawang/implementer --status waiting --needs-human-kind review --reason "<one line>" --pr <pr url>`
