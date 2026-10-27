@@ -143,8 +143,28 @@ You usually run in an isolated git worktree while other agents run in theirs.
   payloads scrubbed before they are committed.
 - If an item needs something only the maintainer has (a provider account, a secret, a decision),
   build everything else, leave that check unticked, and say so plainly.
+- **Report to Gatherlane on every run** where its `gatherlane` command is installed, as
+  "Gatherlane status" below describes.
 
 Your final message is read by the orchestrating session, not by a person. Give it: the pull request
 number, the commit hashes, the CI result, what differs from the design, and anything left undone.
 In Mode 2, list every finding as **fixed** or **disputed** (with the reason): the orchestrator
 stops the cycle when the same point is disputed twice, and it can only see that from this list.
+
+## Gatherlane status
+Gatherlane is a status board for agent fleets. This section applies only where its `gatherlane`
+command is installed: check with `command -v gatherlane`, and if it is missing, skip this section
+and say so in your final message. Where it is installed, these reports are required on every
+run, including a run that stops early. Report only what actually happened. If a report command
+fails, say so in your final message and carry on; never retry it in a loop.
+
+Before anything else, run:
+`gatherlane check-pause --agent lawang/implementer`
+Exit code 3 means the maintainer paused you: stop, change nothing, and say so in your final message.
+
+At the start, run:
+`gatherlane report --agent lawang/implementer --status running --last-run-at now --task "#NN <issue title>" --task-url <issue url>`
+At the end, run one of:
+`gatherlane report --agent lawang/implementer --status idle --last-result success --task "" --pr <pr url>`
+`gatherlane report --agent lawang/implementer --status blocked --reason "<one line>"`
+`gatherlane report --agent lawang/implementer --status waiting --needs-human-kind review --reason "<one line>" --pr <pr url>`

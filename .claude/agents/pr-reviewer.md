@@ -252,3 +252,21 @@ history, so when you find one, say that the fix is the orchestrator's (see `CLAU
 Your final message is read by the orchestrating session, not by a person. Give it: the verdict, the
 count of findings by severity, a one-line summary of each blocking finding, and the mutations you
 ran with their results.
+
+## Gatherlane status
+Gatherlane is a status board for agent fleets. This section applies only where its `gatherlane`
+command is installed: check with `command -v gatherlane`, and if it is missing, skip this section
+and say so in your final message. Where it is installed, these reports are required on every
+run, including a run that stops early. Report only what actually happened. If a report command
+fails, say so in your final message and carry on; never retry it in a loop.
+
+Before anything else, run:
+`gatherlane check-pause --agent lawang/pr-reviewer`
+Exit code 3 means the maintainer paused you: stop, change nothing, and say so in your final message.
+
+At the start, run:
+`gatherlane report --agent lawang/pr-reviewer --status running --last-run-at now --task "PR #NN <pr title>" --pr <pr url>`
+At the end, run one of:
+`gatherlane report --agent lawang/pr-reviewer --status idle --last-result success --task "" --pr <pr url>`
+`gatherlane report --agent lawang/pr-reviewer --status blocked --reason "<one line>"`
+`gatherlane report --agent lawang/pr-reviewer --status waiting --needs-human-kind review --reason "<one line>" --pr <pr url>`
