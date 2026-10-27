@@ -254,17 +254,19 @@ count of findings by severity, a one-line summary of each blocking finding, and 
 ran with their results.
 
 ## Gatherlane status
-These reports are required on every run, including a run that stops early. Report only what
-actually happened. If a report command fails (for example, the token file is missing), say so in
-your final message and carry on; never retry it in a loop.
+Gatherlane is a status board for agent fleets. This section applies only where its `gatherlane`
+command is installed: check with `command -v gatherlane`, and if it is missing, skip this section
+and say so in your final message. Where it is installed, these reports are required on every
+run, including a run that stops early. Report only what actually happened. If a report command
+fails, say so in your final message and carry on; never retry it in a loop.
 
 Before anything else, run:
-`python3 ~/gatherlane/tools/gatherlane.py check-pause --agent lawang/pr-reviewer`
+`gatherlane check-pause --agent lawang/pr-reviewer`
 Exit code 3 means the maintainer paused you: stop, change nothing, and say so in your final message.
 
 At the start, run:
-`python3 ~/gatherlane/tools/gatherlane.py report --agent lawang/pr-reviewer --status running --last-run-at now --task "#NN <issue title>" --task-url <issue url>`
+`gatherlane report --agent lawang/pr-reviewer --status running --last-run-at now --task "PR #NN <pr title>" --pr <pr url>`
 At the end, run one of:
-`... report --agent lawang/pr-reviewer --status idle --last-result success --task "" --pr <pr url>`
-`... report --agent lawang/pr-reviewer --status blocked --reason "<one line>"`
-`... report --agent lawang/pr-reviewer --status waiting --needs-human-kind review --reason "<one line>" --pr <pr url>`
+`gatherlane report --agent lawang/pr-reviewer --status idle --last-result success --task "" --pr <pr url>`
+`gatherlane report --agent lawang/pr-reviewer --status blocked --reason "<one line>"`
+`gatherlane report --agent lawang/pr-reviewer --status waiting --needs-human-kind review --reason "<one line>" --pr <pr url>`

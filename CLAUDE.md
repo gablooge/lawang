@@ -19,10 +19,9 @@ and nothing that points at a machine of theirs.
   can read it, and the maintainer decides what stays. Write it for the people it describes.
 - `.claude/agents/`: the `implementer`, `pr-reviewer` and `bizdev` agents. Their files are the full rules
   for writing and for reviewing; the section below is only how they fit together.
-- Gatherlane: the maintainer's office view of every agent. Each agent reports its own status
-  there, and checks the pause flag, as the "Gatherlane status" section of its file says. The
-  reporter is `~/gatherlane/tools/gatherlane.py` and reads its token from
-  `~/.config/gatherlane/env`. Without that file the report fails; the agent says so and carries on.
+- Gatherlane: an optional status board for agent fleets. Where its `gatherlane` command is
+  installed, each agent reports its status and checks its pause flag, as the "Gatherlane status"
+  section of its file says. Where it is not, the agents skip that section and say so.
 
 ## "Continue" means
 
