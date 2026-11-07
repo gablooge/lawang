@@ -176,8 +176,9 @@ run, including a run that stops early. Report only what actually happened. If a 
 command fails (for example, the token file is missing), say so in your final message and carry
 on; never retry it in a loop. That rule is for `report` only, not for `check-pause`.
 
-Before anything else, run:
+Once `command -v gatherlane` has found it, and before anything else, run:
 `gatherlane check-pause --agent lawang/bizdev`
+A missing `gatherlane` command is not a `check-pause` failure: it means this section does not apply.
 `check-pause` is the stop button, not a report. Exit code 3 means the maintainer paused you: stop,
 change nothing, and say so in your final message. Any other nonzero exit means the pause state is
 unknown (for example, the token file is missing or `control/pause.json` is broken): stop as well,
