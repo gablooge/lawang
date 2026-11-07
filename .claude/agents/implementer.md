@@ -155,12 +155,18 @@ stops the cycle when the same point is disputed twice, and it can only see that 
 Gatherlane is a status board for agent fleets. This section applies only where its `gatherlane`
 command is installed: check with `command -v gatherlane`, and if it is missing, skip this section
 and say so in your final message. Where it is installed, these reports are required on every
-run, including a run that stops early. Report only what actually happened. If a report command
-fails, say so in your final message and carry on; never retry it in a loop.
+run, including a run that stops early. Report only what actually happened. If a `report`
+command fails (for example, the token file is missing), say so in your final message and carry
+on; never retry it in a loop. That rule is for `report` only, not for `check-pause`.
 
-Before anything else, run:
+Once `command -v gatherlane` has found it, and before anything else, run:
 `gatherlane check-pause --agent lawang/implementer`
-Exit code 3 means the maintainer paused you: stop, change nothing, and say so in your final message.
+A missing `gatherlane` command is not a `check-pause` failure: it means this section does not apply.
+`check-pause` is the stop button, not a report. Exit code 3 means the maintainer paused you: stop,
+change nothing, and say so in your final message. Any other nonzero exit means the pause state is
+unknown (for example, the token file is missing or `control/pause.json` is broken): stop as well,
+change nothing, and say why in your final message, quoting the reporter's message. Only exit code 0
+means you may go on.
 
 At the start, run:
 `gatherlane report --agent lawang/implementer --status running --last-run-at now --task "#NN <issue title>" --task-url <issue url>`
